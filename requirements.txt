@@ -1,1 +1,8 @@
-
+discord.py[voice]
+Flask
+aiohttp
+yt-dlp
+PyNaCl
+a2s
+aiohttp
+beautifulsoup4
