@@ -108,3 +108,18 @@ async def on_ready():
 async def on_app_command_error(interaction: discord.Interaction, error):
     print(f"Ошибка команды: {error}")
     traceback.print_exc()
+# --------------------------------------------------
+# RUN BOT WITH SAFE TOKEN CHECK
+# --------------------------------------------------
+raw_token = os.getenv("DISCORD_TOKEN")
+
+if not raw_token:
+    print("❌ КРИТИЧЕСКАЯ ОШИБКА: Переменная DISCORD_TOKEN не найдена в Environment на Render!")
+else:
+    token = raw_token.strip().strip('"').strip("'")
+    try:
+        bot.run(token)
+    except discord.errors.LoginFailure:
+        print("❌ ОШИБКА АВТОРИЗАЦИИ: Неверный DISCORD_TOKEN! Пересоздайте токен в Discord Developer Portal.")
+    except Exception as e:
+        print(f"❌ НЕИЗВЕСТНАЯ ОШИБКА ПРИ ЗАПУСКЕ: {e}")
