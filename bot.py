@@ -39,7 +39,7 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ================== ВСТАВЬ ID СВОЕГО СЕРВЕРА ==================
-GUILD_ID = 1548371779523837952  # замени на свой
+GUILD_ID = 123456789012345678  # замени на свой
 # =============================================================
 
 class JoinView(View):
@@ -76,38 +76,24 @@ class JoinView(View):
 
 @bot.tree.command(name="lobby", description="Создать очередь FreePick")
 async def lobby(interaction: discord.Interaction):
-    try:
-        view = JoinView()
-        embed = discord.Embed(title="Очередь — FreePick", color=0x2b2d31)
-        embed.add_field(name="Настройки", value=(
-            "**Формат:** 5x5 | BO1\n"
-            "**Капитаны:** Доброволец\n"
-            "**Карты:** Вето"
-        ), inline=False)
-        embed.add_field(name="Игроки", value="**0 из 10**", inline=False)
-        
-        await interaction.response.send_message(embed=embed, view=view)
-    except Exception as e:
-        print("Ошибка в /lobby:")
-        traceback.print_exc()
-        if not interaction.response.is_done():
-            await interaction.response.send_message("Произошла ошибка при создании лобби.", ephemeral=True)
+    view = JoinView()
+    embed = discord.Embed(title="Очередь — FreePick", color=0x2b2d31)
+    embed.add_field(name="Настройки", value=(
+        "**Формат:** 5x5 | BO1\n"
+        "**Капитаны:** Доброволец\n"
+        "**Карты:** Вето"
+    ), inline=False)
+    embed.add_field(name="Игроки", value="**0 из 10**", inline=False)
+    
+    await interaction.response.send_message(embed=embed, view=view)
 
 @bot.event
 async def on_ready():
     print(f"Бот запущен: {bot.user}")
-    try:
-        guild = discord.Object(id=GUILD_ID)
-        bot.tree.copy_global_to(guild=guild)
-        synced = await bot.tree.sync(guild=guild)
-        print(f"Синхронизировано {len(synced)} команд")
-    except Exception as e:
-        print(f"Ошибка синхронизации: {e}")
-
-@bot.event
-async def on_app_command_error(interaction: discord.Interaction, error):
-    print(f"Ошибка команды: {error}")
-    traceback.print_exc()
+    guild = discord.Object(id=GUILD_ID)
+    bot.tree.copy_global_to(guild=guild)
+    synced = await bot.tree.sync(guild=guild)
+    print(f"Синхронизировано {len(synced)} команд")
 # --------------------------------------------------
 # RUN BOT WITH SAFE TOKEN CHECK
 # --------------------------------------------------
