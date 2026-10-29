@@ -1,5 +1,5 @@
 """
-KZLP FreePick 5x5: очередь -> капитаны -> пики игроков -> вето карт -> запуск матча на CS2 (MatchZy).
+VIBE FreePick 5x5: очередь -> капитаны -> пики игроков -> вето карт -> запуск матча на CS2 (MatchZy).
 """
 import asyncio
 import logging
@@ -15,33 +15,38 @@ from discord import app_commands
 from discord.ext import commands
 from rcon.source import Client as Rcon
 
-try:  # локально читаем .env, на хостинге (Render) переменные задаются в панели
+try:  # локально читаем .env, на хостинге переменные задаются в панели
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("freepick")
 
 # ----------------------------- НАСТРОЙКИ -----------------------------
-TOKEN = os.environ["DISCORD_TOKEN"]
-SERVER_IP = os.getenv("SERVER_IP", "79.143.20.205")
-SERVER_PORT = int(os.getenv("SERVER_PORT", "27017"))
-RCON_PASSWORD = os.environ.get("RCON_PASSWORD", "ArniAlash22062008Nurlan")
-SERVER_PASSWORD = os.getenv("SERVER_PASSWORD", "ArniAlash22062008Nurlan")      # sv_password, если есть
+# CS2-сервер
+SERVER_IP = os.getenv("SERVER_IP", "45.86.81.37:55031")
+SERVER_PORT = int(os.getenv("SERVER_PORT", "55031"))
+RCON_PASSWORD = os.getenv("RCON_PASSWORD", "ArniAlash22062008Nurlan")
+SERVER_PASSWORD = os.getenv("SERVER_PASSWORD", "")
 
-# Публичный адрес веб-сервера бота (его должен видеть CS2-сервер), например http://1.2.3.4:8080
-WEB_BASE_URL = os.getenv("WEB_BASE_URL", "https://varq.net/servers/counter-strike-2/79.143.20.205:27017").rstrip("/")
-WEB_PORT = int(os.getenv("PORT") or os.getenv("WEB_PORT", "8080"))  # Render даёт PORT сам
-EVENT_TOKEN = os.getenv("EVENT_TOKEN", "change-me")     # секрет для событий MatchZy
+# Веб-сервер бота (его должен видеть CS2-сервер)
+WEB_PORT = int(os.getenv("PORT") or os.getenv("WEB_PORT", "55031"))
+WEB_BASE_URL = os.getenv("WEB_BASE_URL", "https://varq.net/servers/counter-strike-2/45.86.81.37:55031").rstrip("/")
+EVENT_TOKEN = os.getenv("EVENT_TOKEN", "1548371779523837952")  # секрет для событий MatchZy
 
-# Голосовые каналы команд (необязательно, 0 = выключено)
+# ID твоего Discord-сервера: команды появятся мгновенно (необязательно)
+GUILD_ID = int(os.getenv("GUILD_ID", "0"))
+
+# Голосовые каналы команд (0 = выключено)
 TEAM1_VC = int(os.getenv("TEAM1_VC_ID", "0"))
 TEAM2_VC = int(os.getenv("TEAM2_VC_ID", "0"))
 
 TEAM_SIZE = 5
 NEED = TEAM_SIZE * 2
-PICK_TIMEOUT = 30  # секунд на пик/бан, потом выбор случайный
+PICK_TIMEOUT = 30            # секунд на пик/бан, потом выбор случайный
+MATCH_MAX_SECONDS = 2 * 3600  # автосброс, если series_end не пришёл
 
 MAPS = ["de_anubis", "de_mirage", "de_inferno", "de_nuke",
         "de_ancient", "de_dust2", "de_overpass"]
@@ -52,6 +57,7 @@ db.execute("CREATE TABLE IF NOT EXISTS links ("
            "discord_id INTEGER PRIMARY KEY, steamid64 TEXT NOT NULL UNIQUE)")
 db.execute("CREATE TABLE IF NOT EXISTS bans ("
            "discord_id INTEGER PRIMARY KEY, reason TEXT)")
+db.execute("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)")
 db.commit()
 
 
@@ -62,6 +68,16 @@ def get_steam(discord_id: int):
 
 def is_banned(discord_id: int) -> bool:
     return db.execute("SELECT 1 FROM bans WHERE discord_id=?", (discord_id,)).fetchone() is not None
+
+
+def kv_set(key: str, value):
+    db.execute("INSERT OR REPLACE INTO kv VALUES (?, ?)", (key, str(value)))
+    db.commit()
+
+
+def kv_get(key: str):
+    row = db.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+    return row[0] if row else None
 
 
 # ----------------------------- СОСТОЯНИЕ -----------------------------
@@ -218,8 +234,6 @@ def build_match(match_id: int, teams: list[list[discord.Member]], map_name: str)
 
 def load_on_server(match_id: int):
     """Блокирующая функция: отправляет команды на CS2-сервер по RCON."""
-    if not WEB_BASE_URL:
-        raise RuntimeError("Не задан WEB_BASE_URL (публичный адрес веб-сервера бота)")
     cmds = [
         f'matchzy_remote_log_url "{WEB_BASE_URL}/events"',
         'matchzy_remote_log_header_key "Authorization"',
@@ -251,6 +265,14 @@ async def reset_to_queue():
         S.queue.clear()
         S.match_id = None
     await refresh_panel()
+
+
+async def auto_reset(match_id: int):
+    """Страховка: если series_end не пришёл, сбрасываем матч по таймеру."""
+    await asyncio.sleep(MATCH_MAX_SECONDS)
+    if S.phase == "playing" and S.match_id == match_id:
+        log.warning("Матч %s сброшен по таймеру", match_id)
+        await reset_to_queue()
 
 
 async def run_match(channel: discord.abc.Messageable, players: list[discord.Member]):
@@ -297,6 +319,7 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
         S.phase = "playing"
         S.queue.clear()
         await refresh_panel()
+        asyncio.create_task(auto_reset(match_id))
 
         connect = f"connect {SERVER_IP}:{SERVER_PORT}"
         if SERVER_PASSWORD:
@@ -352,9 +375,10 @@ async def h_events(req: web.Request):
 class FreePickBot(commands.Bot):
     async def setup_hook(self):
         self.add_view(QueueView())
+
         app = web.Application()
         app.add_routes([
-            web.get("/", lambda r: web.Response(text="ok")),  # health check хостинга
+            web.get("/", lambda r: web.Response(text="ok")),  # health check
             web.get(r"/match/{mid:\d+}.json", h_match),
             web.get("/connect", h_connect),
             web.post("/events", h_events),
@@ -362,10 +386,22 @@ class FreePickBot(commands.Bot):
         runner = web.AppRunner(app)
         await runner.setup()
         await web.TCPSite(runner, "0.0.0.0", WEB_PORT).start()
-        await self.tree.sync()
+        log.info("Веб-сервер слушает порт %s", WEB_PORT)
+
+        # Синхронизация слэш-команд
+        if GUILD_ID:
+            g = discord.Object(id=GUILD_ID)
+            self.tree.copy_global_to(guild=g)
+            await self.tree.sync(guild=g)
+            log.info("Команды синхронизированы с сервером %s", GUILD_ID)
+        else:
+            await self.tree.sync()
+            log.info("Команды синхронизированы глобально (может занять до часа)")
 
 
-bot = FreePickBot(command_prefix="!", intents=discord.Intents.default())
+intents = discord.Intents.default()
+intents.members = True  # включите Server Members Intent в Developer Portal
+bot = FreePickBot(command_prefix="!", intents=intents)
 admin = app_commands.checks.has_permissions(administrator=True)
 
 
@@ -375,6 +411,8 @@ admin = app_commands.checks.has_permissions(administrator=True)
 @admin
 async def setup_cmd(i: discord.Interaction):
     S.panel = await i.channel.send(embed=panel_embed(), view=QueueView())
+    kv_set("panel_channel", S.panel.channel.id)
+    kv_set("panel_message", S.panel.id)
     await i.response.send_message("Панель отправлена.", ephemeral=True)
 
 
@@ -384,11 +422,11 @@ async def link_cmd(i: discord.Interaction, steamid64: str):
     steamid64 = steamid64.strip()
     if not re.fullmatch(r"7656119\d{10}", steamid64):
         return await i.response.send_message("Неверный SteamID64. Пример: `76561198000000000`.", ephemeral=True)
-    try:
-        db.execute("INSERT OR REPLACE INTO links VALUES (?, ?)", (i.user.id, steamid64))
-        db.commit()
-    except sqlite3.IntegrityError:
+    row = db.execute("SELECT discord_id FROM links WHERE steamid64=?", (steamid64,)).fetchone()
+    if row and row[0] != i.user.id:
         return await i.response.send_message("Этот SteamID уже привязан к другому аккаунту.", ephemeral=True)
+    db.execute("INSERT OR REPLACE INTO links VALUES (?, ?)", (i.user.id, steamid64))
+    db.commit()
     await i.response.send_message(f"✅ Steam привязан: `{steamid64}`", ephemeral=True)
 
 
@@ -400,7 +438,8 @@ async def ban_cmd(i: discord.Interaction, member: discord.Member, reason: str = 
     db.execute("INSERT OR REPLACE INTO bans VALUES (?, ?)", (member.id, reason))
     db.commit()
     async with S.lock:
-        S.queue = [m for m in S.queue if m.id != member.id] if S.phase == "queue" else S.queue
+        if S.phase == "queue":
+            S.queue = [m for m in S.queue if m.id != member.id]
     await refresh_panel()
     await i.response.send_message(f"{member.mention} забанен: {reason}", ephemeral=True)
 
@@ -427,19 +466,32 @@ async def endmatch_cmd(i: discord.Interaction):
 @bot.event
 async def on_ready():
     log.info("Бот запущен как %s", bot.user)
+    # Восстанавливаем панель после перезапуска
+    ch_id, msg_id = kv_get("panel_channel"), kv_get("panel_message")
+    if ch_id and msg_id and not S.panel:
+        try:
+            ch = bot.get_channel(int(ch_id)) or await bot.fetch_channel(int(ch_id))
+            S.panel = await ch.fetch_message(int(msg_id))
+            await refresh_panel()
+        except discord.HTTPException:
+            log.warning("Не удалось восстановить панель, отправьте /setup заново")
 
-# --------------------------------------------------
-# RUN BOT WITH SAFE TOKEN CHECK
-# --------------------------------------------------
-raw_token = os.getenv("DISCORD_TOKEN")
 
-if not raw_token:
-    print("❌ КРИТИЧЕСКАЯ ОШИБКА: Переменная DISCORD_TOKEN не найдена в Environment на Render!")
-else:
+# ----------------------------- ЗАПУСК --------------------------------
+def main():
+    raw_token = os.getenv("DISCORD_TOKEN", "")
     token = raw_token.strip().strip('"').strip("'")
+    if not token:
+        raise SystemExit("❌ Не задана переменная DISCORD_TOKEN")
+    if not RCON_PASSWORD:
+        log.warning("RCON_PASSWORD не задан: запуск матчей на сервере не сработает")
+    if not EVENT_TOKEN:
+        log.warning("EVENT_TOKEN не задан: события MatchZy будут отклоняться")
     try:
         bot.run(token)
     except discord.errors.LoginFailure:
-        print("❌ ОШИБКА АВТОРИЗАЦИИ: Неверный DISCORD_TOKEN! Пересоздайте токен в Discord Developer Portal.")
-    except Exception as e:
-        print(f"❌ НЕИЗВЕСТНАЯ ОШИБКА ПРИ ЗАПУСКЕ: {e}")
+        raise SystemExit("❌ Неверный DISCORD_TOKEN. Пересоздайте токен в Discord Developer Portal.")
+
+
+if __name__ == "__main__":
+    main()
