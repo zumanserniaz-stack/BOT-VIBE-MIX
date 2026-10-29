@@ -1,3 +1,6 @@
+"""
+KZLP FreePick 5x5: очередь -> капитаны -> пики игроков -> вето карт -> запуск матча на CS2 (MatchZy).
+"""
 import asyncio
 import logging
 import os
@@ -5,12 +8,13 @@ import random
 import re
 import sqlite3
 import time
+
 import discord
 from aiohttp import web
 from discord import app_commands
 from discord.ext import commands
 from rcon.source import Client as Rcon
- 
+
 try:  # локально читаем .env, на хостинге (Render) переменные задаются в панели
     from dotenv import load_dotenv
     load_dotenv()
@@ -18,30 +22,30 @@ except ImportError:
     pass
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("freepick")
- 
+
 # ----------------------------- НАСТРОЙКИ -----------------------------
 TOKEN = os.environ["DISCORD_TOKEN"]
 SERVER_IP = os.getenv("SERVER_IP", "79.143.20.205")
 SERVER_PORT = int(os.getenv("SERVER_PORT", "27017"))
-RCON_PASSWORD = os.environ.get('RCON_PASSWORD', 'ArniAlash22062008Nurlan')
+RCON_PASSWORD = os.environ["RCON_PASSWORD"]
 SERVER_PASSWORD = os.getenv("SERVER_PASSWORD", "")      # sv_password, если есть
- 
+
 # Публичный адрес веб-сервера бота (его должен видеть CS2-сервер), например http://1.2.3.4:8080
-WEB_BASE_URL = os.getenv("https://varq.net/servers/counter-strike-2/79.143.20.205:27017", "").rstrip("/")
+WEB_BASE_URL = os.getenv("WEB_BASE_URL", "").rstrip("/")
 WEB_PORT = int(os.getenv("PORT") or os.getenv("WEB_PORT", "8080"))  # Render даёт PORT сам
 EVENT_TOKEN = os.getenv("EVENT_TOKEN", "change-me")     # секрет для событий MatchZy
- 
+
 # Голосовые каналы команд (необязательно, 0 = выключено)
 TEAM1_VC = int(os.getenv("TEAM1_VC_ID", "0"))
 TEAM2_VC = int(os.getenv("TEAM2_VC_ID", "0"))
- 
+
 TEAM_SIZE = 5
 NEED = TEAM_SIZE * 2
 PICK_TIMEOUT = 30  # секунд на пик/бан, потом выбор случайный
- 
+
 MAPS = ["de_anubis", "de_mirage", "de_inferno", "de_nuke",
         "de_ancient", "de_dust2", "de_overpass"]
- 
+
 # ----------------------------- БАЗА ДАННЫХ ---------------------------
 db = sqlite3.connect("freepick.db")
 db.execute("CREATE TABLE IF NOT EXISTS links ("
@@ -49,17 +53,17 @@ db.execute("CREATE TABLE IF NOT EXISTS links ("
 db.execute("CREATE TABLE IF NOT EXISTS bans ("
            "discord_id INTEGER PRIMARY KEY, reason TEXT)")
 db.commit()
- 
- 
+
+
 def get_steam(discord_id: int):
     row = db.execute("SELECT steamid64 FROM links WHERE discord_id=?", (discord_id,)).fetchone()
     return row[0] if row else None
- 
- 
+
+
 def is_banned(discord_id: int) -> bool:
     return db.execute("SELECT 1 FROM bans WHERE discord_id=?", (discord_id,)).fetchone() is not None
- 
- 
+
+
 # ----------------------------- СОСТОЯНИЕ -----------------------------
 class State:
     def __init__(self):
@@ -69,15 +73,15 @@ class State:
         self.match_id: int | None = None
         self.matches: dict[int, dict] = {}
         self.lock = asyncio.Lock()
- 
- 
+
+
 S = State()
- 
- 
+
+
 def pretty(map_name: str) -> str:
     return map_name.replace("de_", "").capitalize()
- 
- 
+
+
 def panel_embed() -> discord.Embed:
     e = discord.Embed(title="Очередь — FreePick", color=0x5865F2)
     e.add_field(
@@ -98,21 +102,21 @@ def panel_embed() -> discord.Embed:
                     value=f"Матч #{S.match_id} идёт. Очередь откроется после его окончания.",
                     inline=False)
     return e
- 
- 
+
+
 async def refresh_panel():
     if S.panel:
         try:
             await S.panel.edit(embed=panel_embed(), view=QueueView())
         except discord.HTTPException:
             log.exception("Не удалось обновить панель")
- 
- 
+
+
 # ----------------------------- ОЧЕРЕДЬ -------------------------------
 class QueueView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)  # кнопки живут постоянно
- 
+
     @discord.ui.button(label="Играть", emoji="✅", style=discord.ButtonStyle.success, custom_id="fp:join")
     async def join(self, i: discord.Interaction, b: discord.ui.Button):
         err = None
@@ -137,7 +141,7 @@ class QueueView(discord.ui.View):
         await i.response.edit_message(embed=panel_embed(), view=self)
         if full:
             asyncio.create_task(run_match(i.channel, list(S.queue)))
- 
+
     @discord.ui.button(label="Выйти", emoji="🚪", style=discord.ButtonStyle.danger, custom_id="fp:leave")
     async def leave(self, i: discord.Interaction, b: discord.ui.Button):
         err = None
@@ -152,8 +156,8 @@ class QueueView(discord.ui.View):
             return await i.response.send_message(err, ephemeral=True)
         S.panel = i.message
         await i.response.edit_message(embed=panel_embed(), view=self)
- 
- 
+
+
 # ----------------------------- ПИКИ И ВЕТО ---------------------------
 class PickView(discord.ui.View):
     def __init__(self, cap: discord.Member, pool: list[discord.Member]):
@@ -165,15 +169,15 @@ class PickView(discord.ui.View):
         )
         self.select.callback = self.on_pick
         self.add_item(self.select)
- 
+
     async def on_pick(self, i: discord.Interaction):
         if i.user.id != self.cap.id:
             return await i.response.send_message("Сейчас выбирает другой капитан.", ephemeral=True)
         self.picked = next(m for m in self.pool if str(m.id) == self.select.values[0])
         await i.response.defer()
         self.stop()
- 
- 
+
+
 class VetoView(discord.ui.View):
     def __init__(self, cap: discord.Member, maps: list[str]):
         super().__init__(timeout=PICK_TIMEOUT)
@@ -182,7 +186,7 @@ class VetoView(discord.ui.View):
             btn = discord.ui.Button(label=pretty(m), style=discord.ButtonStyle.secondary)
             btn.callback = self._make_cb(m)
             self.add_item(btn)
- 
+
     def _make_cb(self, map_name: str):
         async def cb(i: discord.Interaction):
             if i.user.id != self.cap.id:
@@ -191,14 +195,14 @@ class VetoView(discord.ui.View):
             await i.response.defer()
             self.stop()
         return cb
- 
- 
+
+
 # ----------------------------- МАТЧ ----------------------------------
 def build_match(match_id: int, teams: list[list[discord.Member]], map_name: str) -> dict:
     def team(t):
         return {"name": f"team_{t[0].display_name}",
                 "players": {get_steam(m.id): m.display_name for m in t}}
- 
+
     return {
         "matchid": match_id,
         "num_maps": 1,
@@ -210,8 +214,8 @@ def build_match(match_id: int, teams: list[list[discord.Member]], map_name: str)
         "team2": team(teams[1]),
         "cvars": {"hostname": "KZLP FreePick"},
     }
- 
- 
+
+
 def load_on_server(match_id: int):
     """Блокирующая функция: отправляет команды на CS2-сервер по RCON."""
     if not WEB_BASE_URL:
@@ -225,8 +229,8 @@ def load_on_server(match_id: int):
     with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
         for cmd in cmds:
             c.run(cmd)
- 
- 
+
+
 async def move_to_voice(guild: discord.Guild, teams):
     for vc_id, team in ((TEAM1_VC, teams[0]), (TEAM2_VC, teams[1])):
         if not vc_id:
@@ -239,23 +243,23 @@ async def move_to_voice(guild: discord.Guild, teams):
                     await member.move_to(ch)
                 except discord.HTTPException:
                     pass
- 
- 
+
+
 async def reset_to_queue():
     async with S.lock:
         S.phase = "queue"
         S.queue.clear()
         S.match_id = None
     await refresh_panel()
- 
- 
+
+
 async def run_match(channel: discord.abc.Messageable, players: list[discord.Member]):
     try:
         caps = players[:2]
         pool = players[2:]
         teams = [[caps[0]], [caps[1]]]
         await channel.send(f"🎯 Набрано {NEED} игроков! Капитаны: {caps[0].mention} и {caps[1].mention}")
- 
+
         # ---- пики игроков (по очереди) ----
         turn = 0
         while len(pool) > 1:
@@ -269,7 +273,7 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
             await msg.edit(content=f"{cap.mention} выбрал {picked.mention}", view=None)
             turn ^= 1
         teams[turn].append(pool[0])  # последний игрок достаётся автоматически
- 
+
         # ---- вето карт ----
         maps = MAPS.copy()
         turn = 0
@@ -283,17 +287,17 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
             await msg.edit(content=f"{cap.mention} забанил **{pretty(banned)}**", view=None)
             turn ^= 1
         map_name = maps[0]
- 
+
         # ---- запуск на сервере ----
         match_id = int(time.time())
         S.matches[match_id] = build_match(match_id, teams, map_name)
         S.match_id = match_id
         await asyncio.to_thread(load_on_server, match_id)
- 
+
         S.phase = "playing"
         S.queue.clear()
         await refresh_panel()
- 
+
         connect = f"connect {SERVER_IP}:{SERVER_PORT}"
         if SERVER_PASSWORD:
             connect += f"; password {SERVER_PASSWORD}"
@@ -306,22 +310,22 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
         link_view = discord.ui.View()
         link_view.add_item(discord.ui.Button(label="Подключиться", url=f"{WEB_BASE_URL}/connect"))
         await channel.send(embed=e, view=link_view)
- 
+
         if hasattr(channel, "guild") and channel.guild:
             await move_to_voice(channel.guild, teams)
- 
+
     except Exception as exc:  # любая ошибка: возвращаем систему в очередь
         log.exception("Ошибка при запуске матча")
         await channel.send(f"❌ Не удалось запустить матч: `{exc}`\nОчередь сброшена, нажмите «Играть» заново.")
         await reset_to_queue()
- 
- 
+
+
 # ----------------------------- ВЕБ-СЕРВЕР ----------------------------
 async def h_match(req: web.Request):
     cfg = S.matches.get(int(req.match_info["mid"]))
     return web.json_response(cfg) if cfg else web.Response(status=404)
- 
- 
+
+
 async def h_connect(req: web.Request):
     url = f"steam://connect/{SERVER_IP}:{SERVER_PORT}"
     if SERVER_PASSWORD:
@@ -329,8 +333,8 @@ async def h_connect(req: web.Request):
     html = (f'<meta http-equiv="refresh" content="0;url={url}">'
             f'<meta charset="utf-8"><a href="{url}">Подключиться к серверу</a>')
     return web.Response(text=html, content_type="text/html")
- 
- 
+
+
 async def h_events(req: web.Request):
     if req.headers.get("Authorization") != EVENT_TOKEN:
         return web.Response(status=401)
@@ -342,8 +346,8 @@ async def h_events(req: web.Request):
             and str(data.get("matchid")) == str(S.match_id)):
         asyncio.create_task(reset_to_queue())
     return web.Response(text="ok")
- 
- 
+
+
 # ----------------------------- БОТ -----------------------------------
 class FreePickBot(commands.Bot):
     async def setup_hook(self):
@@ -359,12 +363,12 @@ class FreePickBot(commands.Bot):
         await runner.setup()
         await web.TCPSite(runner, "0.0.0.0", WEB_PORT).start()
         await self.tree.sync()
- 
- 
+
+
 bot = FreePickBot(command_prefix="!", intents=discord.Intents.default())
 admin = app_commands.checks.has_permissions(administrator=True)
- 
- 
+
+
 @bot.tree.command(name="setup", description="Отправить панель очереди FreePick в этот канал")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
@@ -372,8 +376,8 @@ admin = app_commands.checks.has_permissions(administrator=True)
 async def setup_cmd(i: discord.Interaction):
     S.panel = await i.channel.send(embed=panel_embed(), view=QueueView())
     await i.response.send_message("Панель отправлена.", ephemeral=True)
- 
- 
+
+
 @bot.tree.command(name="link", description="Привязать свой SteamID64")
 @app_commands.describe(steamid64="17 цифр, начинается с 7656119")
 async def link_cmd(i: discord.Interaction, steamid64: str):
@@ -386,8 +390,8 @@ async def link_cmd(i: discord.Interaction, steamid64: str):
     except sqlite3.IntegrityError:
         return await i.response.send_message("Этот SteamID уже привязан к другому аккаунту.", ephemeral=True)
     await i.response.send_message(f"✅ Steam привязан: `{steamid64}`", ephemeral=True)
- 
- 
+
+
 @bot.tree.command(name="fp_ban", description="Забанить игрока в FreePick")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
@@ -399,8 +403,8 @@ async def ban_cmd(i: discord.Interaction, member: discord.Member, reason: str = 
         S.queue = [m for m in S.queue if m.id != member.id] if S.phase == "queue" else S.queue
     await refresh_panel()
     await i.response.send_message(f"{member.mention} забанен: {reason}", ephemeral=True)
- 
- 
+
+
 @bot.tree.command(name="fp_unban", description="Разбанить игрока в FreePick")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
@@ -409,8 +413,8 @@ async def unban_cmd(i: discord.Interaction, member: discord.Member):
     db.execute("DELETE FROM bans WHERE discord_id=?", (member.id,))
     db.commit()
     await i.response.send_message(f"{member.mention} разбанен.", ephemeral=True)
- 
- 
+
+
 @bot.tree.command(name="endmatch", description="Принудительно сбросить матч и очередь")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
@@ -418,11 +422,12 @@ async def unban_cmd(i: discord.Interaction, member: discord.Member):
 async def endmatch_cmd(i: discord.Interaction):
     await reset_to_queue()
     await i.response.send_message("Очередь сброшена.", ephemeral=True)
- 
- 
+
+
 @bot.event
 async def on_ready():
     log.info("Бот запущен как %s", bot.user)
+
 # --------------------------------------------------
 # RUN BOT WITH SAFE TOKEN CHECK
 # --------------------------------------------------
