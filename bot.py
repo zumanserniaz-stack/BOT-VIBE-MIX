@@ -38,15 +38,20 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-GUILD_ID = 123456789012345678  # замени
+GUILD_ID = 1548371779523837952  # замени
 SERVER_IP = "45.86.81.37:55031"
 CONNECT_LINK = f"steam://connect/{SERVER_IP}"
-MAX_PLAYERS = 1
+MAX_PLAYERS = 10
 
-class JoinView(View):
+MAPS = ["Mirage", "Inferno", "Dust 2", "Ancient", "Anubis", "Nuke", "Overpass", "Train", "Vertigo"]
+
+class LobbyView(View):
     def __init__(self):
         super().__init__(timeout=None)
         self.queue = []
+        self.captains = []
+        self.available_maps = MAPS.copy()
+        self.banned = []
 
     @discord.ui.button(label="Присоединиться", style=discord.ButtonStyle.green)
     async def join(self, interaction: discord.Interaction, button: Button):
@@ -55,45 +60,42 @@ class JoinView(View):
             await interaction.response.send_message("Ты уже в очереди", ephemeral=True)
             return
         if len(self.queue) >= MAX_PLAYERS:
-            await interaction.response.send_message("Лобби полное", ephemeral=True)
+            await interaction.response.send_message("Полное", ephemeral=True)
             return
 
         self.queue.append(user)
-        
-        embed = discord.Embed(title="Очередь — FreePick (тест)", color=0x2b2d31)
-        embed.add_field(name="Настройки", value=(
-            "**Формат:** 5x5 | BO1\n"
-            "**Капитаны:** Доброволец\n"
-            "**Карты:** Вето"
-        ), inline=False)
-        embed.add_field(name="Игроки", value=f"**{len(self.queue)} из {MAX_PLAYERS}**", inline=False)
-        
-        if self.queue:
-            players = "\n".join([p.mention for p in self.queue])
-            embed.add_field(name="В очереди", value=players, inline=False)
-
-        embed.add_field(name="Подключение", value=f"`connect {SERVER_IP}`", inline=False)
-
-        await interaction.message.edit(embed=embed, view=self)
-        await interaction.response.send_message(f"Ты зашёл в очередь ({len(self.queue)}/{MAX_PLAYERS})", ephemeral=True)
+        await self.update_embed(interaction)
 
         if len(self.queue) == MAX_PLAYERS:
-            connect_view = View()
-            connect_view.add_item(Button(label="Зайти на сервер", style=discord.ButtonStyle.green, url=CONNECT_LINK))
-            await interaction.channel.send("**Лобби готово!** Заходи на сервер:", view=connect_view)
+            await self.start_captains(interaction)
 
-@bot.tree.command(name="lobby", description="Создать очередь FreePick (тест)")
+    async def start_captains(self, interaction):
+        self.captains = [self.queue[0], self.queue[1]]
+        await interaction.channel.send(
+            f"**Капитаны:** {self.captains[0].mention} (CT) и {self.captains[1].mention} (T)\n"
+            f"Начинаем бан карт. {self.captains[0].mention} банит первым."
+        )
+        # Здесь можно добавить Select с картами для бана
+
+    async def update_embed(self, interaction):
+        embed = discord.Embed(title="Очередь — FreePick", color=0x2b2d31)
+        embed.add_field(name="Игроки", value=f"**{len(self.queue)} из {MAX_PLAYERS}**", inline=False)
+        if self.queue:
+            embed.add_field(name="В очереди", value="\n".join([p.mention for p in self.queue]), inline=False)
+        embed.add_field(name="Подключение", value=f"`connect {SERVER_IP}`", inline=False)
+        
+        try:
+            await interaction.message.edit(embed=embed, view=self)
+        except:
+            pass
+        await interaction.response.defer()
+
+@bot.tree.command(name="lobby", description="Создать FreePick")
 async def lobby(interaction: discord.Interaction):
-    view = JoinView()
-    embed = discord.Embed(title="Очередь — FreePick (тест)", color=0x2b2d31)
-    embed.add_field(name="Настройки", value=(
-        "**Формат:** 5x5 | BO1\n"
-        "**Капитаны:** Доброволец\n"
-        "**Карты:** Вето"
-    ), inline=False)
+    view = LobbyView()
+    embed = discord.Embed(title="Очередь — FreePick", color=0x2b2d31)
     embed.add_field(name="Игроки", value=f"**0 из {MAX_PLAYERS}**", inline=False)
     embed.add_field(name="Подключение", value=f"`connect {SERVER_IP}`", inline=False)
-    
     await interaction.response.send_message(embed=embed, view=view)
 
 @bot.event
@@ -101,8 +103,7 @@ async def on_ready():
     print(f"Бот запущен: {bot.user}")
     guild = discord.Object(id=GUILD_ID)
     bot.tree.copy_global_to(guild=guild)
-    synced = await bot.tree.sync(guild=guild)
-    print(f"Синхронизировано {len(synced)} команд")
+    await bot.tree.sync(guild=guild)
 # --------------------------------------------------
 # RUN BOT WITH SAFE TOKEN CHECK
 # --------------------------------------------------
