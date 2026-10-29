@@ -27,11 +27,11 @@ log = logging.getLogger("freepick")
 TOKEN = os.environ["DISCORD_TOKEN"]
 SERVER_IP = os.getenv("SERVER_IP", "79.143.20.205")
 SERVER_PORT = int(os.getenv("SERVER_PORT", "27017"))
-RCON_PASSWORD = os.environ["RCON_PASSWORD"]
-SERVER_PASSWORD = os.getenv("SERVER_PASSWORD", "")      # sv_password, если есть
+RCON_PASSWORD = os.environ("RCON_PASSWORD", "ArniAlash22062008Nurlan")
+SERVER_PASSWORD = os.getenv("SERVER_PASSWORD", "ArniAlash22062008Nurlan")      # sv_password, если есть
 
 # Публичный адрес веб-сервера бота (его должен видеть CS2-сервер), например http://1.2.3.4:8080
-WEB_BASE_URL = os.getenv("WEB_BASE_URL", "").rstrip("/")
+WEB_BASE_URL = os.getenv("WEB_BASE_URL", "https://varq.net/servers/counter-strike-2/79.143.20.205:27017").rstrip("/")
 WEB_PORT = int(os.getenv("PORT") or os.getenv("WEB_PORT", "8080"))  # Render даёт PORT сам
 EVENT_TOKEN = os.getenv("EVENT_TOKEN", "change-me")     # секрет для событий MatchZy
 
