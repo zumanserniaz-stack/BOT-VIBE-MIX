@@ -10,10 +10,13 @@ import discord
 from aiohttp import web
 from discord import app_commands
 from discord.ext import commands
-from dotenv import load_dotenv
 from rcon.source import Client as Rcon
  
-load_dotenv()
+try:  # локально читаем .env, на хостинге (Render) переменные задаются в панели
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("freepick")
  
@@ -25,8 +28,8 @@ RCON_PASSWORD = os.environ["ArniAlash22062008Nurlan"]
 SERVER_PASSWORD = os.getenv("SERVER_PASSWORD", "")      # sv_password, если есть
  
 # Публичный адрес веб-сервера бота (его должен видеть CS2-сервер), например http://1.2.3.4:8080
-WEB_BASE_URL = os.getenv("WEB_BASE_URL", "").rstrip("/")
-WEB_PORT = int(os.getenv("WEB_PORT", "8080"))
+WEB_BASE_URL = os.getenv("https://varq.net/servers/counter-strike-2/79.143.20.205:27017", "").rstrip("/")
+WEB_PORT = int(os.getenv("PORT") or os.getenv("WEB_PORT", "8080"))  # Render даёт PORT сам
 EVENT_TOKEN = os.getenv("EVENT_TOKEN", "change-me")     # секрет для событий MatchZy
  
 # Голосовые каналы команд (необязательно, 0 = выключено)
@@ -348,6 +351,7 @@ class FreePickBot(commands.Bot):
         self.add_view(QueueView())
         app = web.Application()
         app.add_routes([
+            web.get("/", lambda r: web.Response(text="ok")),  # health check хостинга
             web.get(r"/match/{mid:\d+}.json", h_match),
             web.get("/connect", h_connect),
             web.post("/events", h_events),
