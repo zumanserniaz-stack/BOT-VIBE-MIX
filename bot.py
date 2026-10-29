@@ -38,20 +38,18 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-GUILD_ID = 1548371779523837952  # замени
+# ================== ВСТАВЬ ID СВОЕГО СЕРВЕРА ==================
+GUILD_ID = 123456789012345678  # замени на свой
+# =============================================================
+
 SERVER_IP = "45.86.81.37:55031"
 CONNECT_LINK = f"steam://connect/{SERVER_IP}"
-MAX_PLAYERS = 10
+MAX_PLAYERS = 1
 
-MAPS = ["Mirage", "Inferno", "Dust 2", "Ancient", "Anubis", "Nuke", "Overpass", "Train", "Vertigo"]
-
-class LobbyView(View):
+class JoinView(View):
     def __init__(self):
         super().__init__(timeout=None)
         self.queue = []
-        self.captains = []
-        self.available_maps = MAPS.copy()
-        self.banned = []
 
     @discord.ui.button(label="Присоединиться", style=discord.ButtonStyle.green)
     async def join(self, interaction: discord.Interaction, button: Button):
@@ -60,67 +58,58 @@ class LobbyView(View):
             await interaction.response.send_message("Ты уже в очереди", ephemeral=True)
             return
         if len(self.queue) >= MAX_PLAYERS:
-            await interaction.response.send_message("Полное", ephemeral=True)
+            await interaction.response.send_message("Лобби полное", ephemeral=True)
             return
 
         self.queue.append(user)
-        await self.update_embed(interaction)
+        
+        embed = discord.Embed(title="Очередь — FreePick (тест)", color=0x2b2d31)
+        embed.add_field(name="Настройки", value=(
+            "**Формат:** 5x5 | BO1\n"
+            "**Капитаны:** Доброволец\n"
+            "**Карты:** Вето"
+        ), inline=False)
+        embed.add_field(name="Игроки", value=f"**{len(self.queue)} из {MAX_PLAYERS}**", inline=False)
+        
+        if self.queue:
+            players = "\n".join([p.mention for p in self.queue])
+            embed.add_field(name="В очереди", value=players, inline=False)
+
+        embed.add_field(name="Подключение", value=f"`connect {SERVER_IP}`", inline=False)
+
+        await interaction.message.edit(embed=embed, view=self)
+        await interaction.response.send_message(f"Ты зашёл в очередь ({len(self.queue)}/{MAX_PLAYERS})", ephemeral=True)
 
         if len(self.queue) == MAX_PLAYERS:
-            await self.start_captains(interaction)
+            connect_view = View()
+            connect_view.add_item(Button(label="Зайти на сервер", style=discord.ButtonStyle.green, url=CONNECT_LINK))
+            await interaction.channel.send("**Лобби готово!** Заходи на сервер:", view=connect_view)
 
-    async def start_captains(self, interaction):
-        self.captains = [self.queue[0], self.queue[1]]
-        await interaction.channel.send(
-            f"**Капитаны:** {self.captains[0].mention} (CT) и {self.captains[1].mention} (T)\n"
-            f"Начинаем бан карт. {self.captains[0].mention} банит первым."
-        )
-        # Здесь можно добавить Select с картами для бана
-
-    async def update_embed(self, interaction):
-        embed = discord.Embed(title="Очередь — FreePick", color=0x2b2d31)
-        embed.add_field(name="Игроки", value=f"**{len(self.queue)} из {MAX_PLAYERS}**", inline=False)
-        if self.queue:
-            embed.add_field(name="В очереди", value="\n".join([p.mention for p in self.queue]), inline=False)
-        embed.add_field(name="Подключение", value=f"`connect {SERVER_IP}`", inline=False)
-        
-        try:
-            await interaction.message.edit(embed=embed, view=self)
-        except:
-            pass
-        await interaction.response.defer()
-
-@bot.tree.command(name="lobby", description="Создать FreePick")
+@bot.tree.command(name="lobby", description="Создать очередь FreePick")
 async def lobby(interaction: discord.Interaction):
-    view = LobbyView()
-    embed = discord.Embed(title="Очередь — FreePick", color=0x2b2d31)
+    view = JoinView()
+    embed = discord.Embed(title="Очередь — FreePick (тест)", color=0x2b2d31)
+    embed.add_field(name="Настройки", value=(
+        "**Формат:** 5x5 | BO1\n"
+        "**Капитаны:** Доброволец\n"
+        "**Карты:** Вето"
+    ), inline=False)
     embed.add_field(name="Игроки", value=f"**0 из {MAX_PLAYERS}**", inline=False)
     embed.add_field(name="Подключение", value=f"`connect {SERVER_IP}`", inline=False)
+    
     await interaction.response.send_message(embed=embed, view=view)
 
-@bot.event
-async def on_ready():
-    print(f"Бот запущен: {bot.user}")
-    guild = discord.Object(id=GUILD_ID)
-    bot.tree.copy_global_to(guild=guild)
-    await bot.tree.sync(guild=guild
-@bot.tree.command(name="createvc", description="Создать категорию FreePick с каналами")
+@bot.tree.command(name="createvc", description="Создать категорию FreePick")
 @app_commands.describe(number="Номер FreePick")
 @app_commands.default_permissions(administrator=True)
 async def createvc(interaction: discord.Interaction, number: int = 13):
-    # Создаём категорию
     category = await interaction.guild.create_category(f"ПОИСК CS2 FreePick {number}")
-    
-    # Текстовый канал
     await category.create_text_channel("⚡ · очередь-freepick")
-    
-    # Голосовые каналы
     await category.create_voice_channel("FreePick", user_limit=10)
     await category.create_voice_channel("Болталка FreePick")
     
     await interaction.response.send_message(
-        f"Создана категория **ПОИСК CS2 FreePick {number}**\n"
-        f"Каналы: текстовый + FreePick + Болталка",
+        f"Создана категория **ПОИСК CS2 FreePick {number}**",
         ephemeral=True
     )
 
