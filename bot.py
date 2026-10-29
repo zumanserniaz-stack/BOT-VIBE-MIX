@@ -76,7 +76,6 @@ class JoinView(View):
         await interaction.message.edit(embed=embed, view=self)
         await interaction.response.send_message(f"Ты зашёл в очередь ({len(self.queue)}/{MAX_PLAYERS})", ephemeral=True)
 
-        # Когда набралось нужное количество — кидаем кнопку
         if len(self.queue) == MAX_PLAYERS:
             connect_view = View()
             connect_view.add_item(Button(label="Зайти на сервер", style=discord.ButtonStyle.green, url=CONNECT_LINK))
