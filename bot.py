@@ -47,7 +47,7 @@ TEAM2_VC = int(os.getenv("TEAM2_VC_ID", "1565429562848846005"))
 # Голосовой канал очереди: зашёл в него = встал в очередь, вышел = покинул (0 = только кнопки)
 QUEUE_VC = int(os.getenv("QUEUE_VC_ID", "1565428177655046144"))
 
-TEST_MODE = os.getenv("TEST_MODE", "0") == "1"  # 1 = тест: хватает одного игрока, без драфта
+TEST_MODE = os.getenv("TEST_MODE", "1") == "1"  # 1 = тест: хватает одного игрока, без драфта
 TEAM_SIZE = 1 if TEST_MODE else 5
 NEED = 1 if TEST_MODE else TEAM_SIZE * 2
 PICK_TIMEOUT = 30            # секунд на пик/бан, потом выбор случайный
