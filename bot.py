@@ -2,7 +2,7 @@
 KZLP FreePick 5x5: очередь -> капитаны -> пики игроков -> вето карт -> запуск матча на CS2 (MatchZy).
 После драфта игроки получают доступ в войс своей команды (Team 1 / Team 2) и перемещаются туда.
 """
-print("▶ bot.py v9 загружается...", flush=True)
+print("▶ bot.py v10 загружается...", flush=True)
 import asyncio
 import json
 import logging
@@ -40,7 +40,7 @@ SERVER_PASSWORD = os.getenv("SERVER_PASSWORD", "")
 # Веб-сервер бота (его должен видеть CS2-сервер)
 WEB_PORT = int(os.getenv("PORT") or os.getenv("WEB_PORT", "55031"))
 WEB_BASE_URL = os.getenv("WEB_BASE_URL", "https://bot-vibe-mix.onrender.com").rstrip("/")
-EVENT_TOKEN = os.getenv("EVENT_TOKEN", "")  # секрет для событий MatchZy
+EVENT_TOKEN = os.getenv("EVENT_TOKEN") or secrets.token_urlsafe(24)  # секрет для событий MatchZy (если не задан, генерируется сам)
 
 # ID твоего Discord-сервера: команды появятся мгновенно (необязательно)
 GUILD_ID = int(os.getenv("GUILD_ID", "1548371779523837952"))
@@ -305,6 +305,14 @@ def load_on_server(match_id: int):
             _rcon_run(c, cmd)
 
 
+def rcon_gamestate():
+    """Блокирующая функция: спрашивает у MatchZy состояние матча (get5_status)."""
+    with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
+        resp = _rcon_run(c, "get5_status") or ""
+    m = re.search(r'"gamestate"\s*:\s*"(\w+)"', resp)
+    return m.group(1) if m else None
+
+
 def rcon_pause(pause: bool):
     """Блокирующая функция: ставит матч на паузу или снимает её (админская пауза MatchZy)."""
     primary = "css_forcepause" if pause else "css_forceunpause"
@@ -429,6 +437,23 @@ class BreakView(discord.ui.View):
             return await i.response.send_message("Матч уже продолжается.", ephemeral=True)
         await i.response.defer()
         await resume_match(f"{i.user.mention} продолжил матч")
+
+
+class MatchView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(discord.ui.Button(label="Подключиться", url=f"{WEB_BASE_URL}/connect"))
+
+    @discord.ui.button(label="Матч закончен", emoji="🏁", style=discord.ButtonStyle.secondary)
+    async def finish(self, i: discord.Interaction, b: discord.ui.Button):
+        is_admin = isinstance(i.user, discord.Member) and i.user.guild_permissions.administrator
+        if i.user.id not in S.captain_ids and not is_admin:
+            return await i.response.send_message("Завершить матч могут только капитаны и администрация.",
+                                                 ephemeral=True)
+        if S.phase != "playing":
+            return await i.response.send_message("Матч уже сброшен.", ephemeral=True)
+        await i.response.send_message("🏁 Матч завершён, очередь открывается.", ephemeral=True)
+        await reset_to_queue()
 
 
 async def handle_disconnect(steamid: str):
@@ -606,6 +631,32 @@ async def sync_queue():
         asyncio.create_task(run_match(S.panel.channel, players))
 
 
+async def watch_match(match_id: int):
+    """Страховка: если событие series_end не дошло до бота, узнаём у сервера, что матч закончился."""
+    await asyncio.sleep(90)
+    active = {"warmup", "pre_veto", "veto", "knife", "waiting_for_knife_decision",
+              "going_live", "live", "pending_restore"}
+    seen_active = False
+    ended = 0
+    while S.phase == "playing" and S.match_id == match_id:
+        try:
+            state = await asyncio.to_thread(rcon_gamestate)
+        except Exception:
+            state = None
+        if state in active:
+            seen_active = True
+            ended = 0
+        elif state == "post_game" or (state == "none" and seen_active):
+            ended += 1
+        else:
+            ended = 0
+        if ended >= 3:  # три проверки подряд (около минуты)
+            log.warning("Матч %s завершён по данным get5_status (%s)", match_id, state)
+            await reset_to_queue()
+            return
+        await asyncio.sleep(20)
+
+
 async def auto_reset(match_id: int):
     """Страховка: если series_end не пришёл, сбрасываем матч по таймеру."""
     await asyncio.sleep(MATCH_MAX_SECONDS)
@@ -682,6 +733,7 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
         S.queue.clear()
         await refresh_panel()
         asyncio.create_task(auto_reset(match_id))
+        asyncio.create_task(watch_match(match_id))
 
         connect = f"connect {SERVER_IP}:{SERVER_PORT}"
         if SERVER_PASSWORD:
@@ -695,8 +747,7 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
                           "Подробности пришли вам в личные сообщения.",
                     inline=False)
         e.add_field(name="Подключение (консоль CS2)", value=f"```{connect}```", inline=False)
-        link_view = discord.ui.View()
-        link_view.add_item(discord.ui.Button(label="Подключиться", url=f"{WEB_BASE_URL}/connect"))
+        link_view = MatchView()
         await track_send(channel, embed=e, view=link_view)
         asyncio.create_task(notify_players(teams, map_name, match_id))
 
@@ -727,11 +778,13 @@ async def h_connect(req: web.Request):
 
 async def h_events(req: web.Request):
     if req.headers.get("Authorization") != EVENT_TOKEN:
+        log.warning("Событие MatchZy отклонено: неверный заголовок Authorization")
         return web.Response(status=401)
     try:
         data = await req.json()
     except Exception:
         return web.Response(status=400)
+    log.info("MatchZy event: %s (matchid=%s)", data.get("event"), data.get("matchid"))
     ev = data.get("event")
     same = S.phase == "playing" and str(data.get("matchid")) == str(S.match_id)
     if ev == "series_end" and same:
@@ -1140,8 +1193,8 @@ def main():
         raise SystemExit(1)
     if not RCON_PASSWORD:
         say("⚠ RCON_PASSWORD не задан: запуск матчей на сервере не сработает")
-    if not EVENT_TOKEN:
-        say("⚠ EVENT_TOKEN не задан: события MatchZy будут отклоняться")
+    if not os.getenv("EVENT_TOKEN"):
+        say("ℹ EVENT_TOKEN не задан в окружении: создан временный токен (бот сам передаёт его серверу при запуске матча)")
     try:
         bot.run(token)
     except discord.errors.LoginFailure:
