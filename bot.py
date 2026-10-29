@@ -412,18 +412,23 @@ async def draft(channel, players):
     teams[turn].append(pool[0])  # последний игрок достаётся автоматически
 
     # ---- вето карт ----
+      # ---- вето карт ----
     maps = MAPS.copy()
     turn = 0
     while len(maps) > 1:
         cap = caps[turn]
         view = VetoView(cap, maps)
-        msg = await channel.send(f"{cap.mention}, забаньте карту ({PICK_TIMEOUT} сек)", view=view)
+        left = ", ".join(pretty(m) for m in maps)
+        msg = await channel.send(
+            f"🗺 {cap.mention}, забаньте карту ({PICK_TIMEOUT} сек)\nОсталось: {left}",
+            view=view)
         await view.wait()
         banned = view.banned or random.choice(maps)
         maps.remove(banned)
-        await msg.edit(content=f"{cap.mention} забанил **{pretty(banned)}**", view=None)
+        await msg.edit(content=f"❌ {cap.mention} забанил **{pretty(banned)}**", view=None)
         turn ^= 1
     map_name = maps[0]
+    await channel.send(f"✅ Выбрана карта: **{pretty(map_name)}**")
     return teams, map_name
 
 
