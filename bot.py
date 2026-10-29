@@ -2,7 +2,7 @@
 KZLP FreePick 5x5: очередь -> капитаны -> пики игроков -> вето карт -> запуск матча на CS2 (MatchZy).
 После драфта игроки получают доступ в войс своей команды (Team 1 / Team 2) и перемещаются туда.
 """
-print("▶ bot.py v4 загружается...", flush=True)
+print("▶ bot.py v5 загружается...", flush=True)
 import asyncio
 import json
 import logging
@@ -102,6 +102,7 @@ class State:
         self.match_id: int | None = None
         self.matches: dict[int, dict] = {}
         self.team_access: list[tuple[int, int]] = []   # (id канала, id игрока) с выданным доступом
+        self.active_ids: set[int] = set()              # игроки текущего драфта/матча
         self.lock = asyncio.Lock()
 
 
@@ -353,6 +354,7 @@ async def reset_to_queue():
         S.phase = "queue"
         S.queue.clear()
         S.match_id = None
+        S.active_ids.clear()
     await sync_queue()
     await refresh_panel()
 
@@ -412,7 +414,6 @@ async def draft(channel, players):
     teams[turn].append(pool[0])  # последний игрок достаётся автоматически
 
     # ---- вето карт ----
-      # ---- вето карт ----
     maps = MAPS.copy()
     turn = 0
     while len(maps) > 1:
@@ -434,6 +435,7 @@ async def draft(channel, players):
 
 async def run_match(channel: discord.abc.Messageable, players: list[discord.Member]):
     try:
+        S.active_ids = {m.id for m in players}
         if TEST_MODE:
             teams = [players[:1], []]
             map_name = random.choice(MAPS)
@@ -537,7 +539,7 @@ class VerifyView(discord.ui.View):
     async def verify(self, i: discord.Interaction, b: discord.ui.Button):
         if get_steam(i.user.id):
             return await i.response.send_message(
-                "Вы уже верифицированы. Сменить привязку может только администрация (через тикет).",
+                "Вы уже верифицированы. Чтобы привязать другой Steam, нажмите «Отвязать Steam».",
                 ephemeral=True)
         if not WEB_BASE_URL:
             return await i.response.send_message("Не настроен WEB_BASE_URL бота.", ephemeral=True)
@@ -554,6 +556,61 @@ class VerifyView(discord.ui.View):
             return await i.response.send_message("Сначала пройдите верификацию.", ephemeral=True)
         await give_role(i.user)
         await i.response.send_message("✅ Роли обновлены.", ephemeral=True)
+
+
+    @discord.ui.button(label="Отвязать Steam", style=discord.ButtonStyle.danger, custom_id="fp:unlink")
+    async def unlink(self, i: discord.Interaction, b: discord.ui.Button):
+        if not get_steam(i.user.id):
+            return await i.response.send_message("У вас нет привязанного Steam.", ephemeral=True)
+        if i.user.id in S.active_ids or any(m.id == i.user.id for m in S.queue):
+            return await i.response.send_message(
+                "Сейчас отвязать нельзя: вы в очереди, драфте или матче. Выйдите из очереди и попробуйте снова.",
+                ephemeral=True)
+        await i.response.send_message(
+            f"Отвязать Steam `{get_steam(i.user.id)}`? Роль верификации будет снята, "
+            "и вы сможете пройти верификацию заново с другим аккаунтом.",
+            view=UnlinkConfirm(i.user.id), ephemeral=True)
+
+
+class UnlinkConfirm(discord.ui.View):
+    def __init__(self, user_id: int):
+        super().__init__(timeout=60)
+        self.user_id = user_id
+
+    @discord.ui.button(label="Да, отвязать", style=discord.ButtonStyle.danger)
+    async def yes(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.user_id:
+            return await i.response.send_message("Это не ваша кнопка.", ephemeral=True)
+        if i.user.id in S.active_ids:
+            return await i.response.edit_message(
+                content="Сейчас отвязать нельзя: вы в драфте или матче.", view=None)
+        async with S.lock:
+            S.queue = [m for m in S.queue if m.id != i.user.id]
+        db.execute("DELETE FROM links WHERE discord_id=?", (i.user.id,))
+        db.commit()
+        # снимаем роль верификации
+        if VERIFIED_ROLE and isinstance(i.user, discord.Member):
+            role = i.user.guild.get_role(VERIFIED_ROLE)
+            if role and role in i.user.roles:
+                try:
+                    await i.user.remove_roles(role, reason="Steam отвязан пользователем")
+                except discord.HTTPException:
+                    log.exception("Не удалось снять роль верификации")
+            # если сидит в голосе очереди, выкидываем оттуда
+            if QUEUE_VC and i.user.voice and i.user.voice.channel and i.user.voice.channel.id == QUEUE_VC:
+                try:
+                    await i.user.move_to(None)
+                except discord.HTTPException:
+                    pass
+        await i.response.edit_message(
+            content="✅ Steam отвязан. Нажмите «Верификация», чтобы привязать новый аккаунт.", view=None)
+        await refresh_panel()
+
+    @discord.ui.button(label="Отмена", style=discord.ButtonStyle.secondary)
+    async def no(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.user_id:
+            return await i.response.send_message("Это не ваша кнопка.", ephemeral=True)
+        await i.response.edit_message(content="Отменено.", view=None)
 
 
 def page(title: str, text: str, ok: bool = True) -> web.Response:
@@ -615,7 +672,7 @@ async def h_auth_callback(req: web.Request):
     old = get_steam(did)
     if old and old != steamid:
         return page("Уже привязан другой Steam",
-                    "Сменить привязку может только администрация (через тикет).", False)
+                    "Сначала нажмите «Отвязать Steam» на панели верификации в Discord.", False)
     db.execute("INSERT OR REPLACE INTO links VALUES (?, ?)", (did, steamid))
     db.commit()
 
@@ -691,9 +748,10 @@ async def verify_setup_cmd(i: discord.Interaction):
         "2. Войдите в Steam и подтвердите вход — роли выдадутся автоматически\n"
         "3. Подтверждение придёт в личные сообщения\n\n"
         "**Важно**\n"
-        "• Один Discord — один Steam. Сменить привязку может только администрация в тикете\n"
+        "• Один Discord — один Steam. Чтобы сменить Steam, нажмите «Отвязать Steam» и пройдите верификацию заново\n"
         "• Ссылка истекла или не пришла — просто нажмите «Верификация» ещё раз\n"
-        "• Если роли не выдались — нажмите «Обновить роли» или откройте тикет"
+        "• Если роли не выдались — нажмите «Обновить роли» или откройте тикет\n"
+        "• Отвязать Steam нельзя, пока вы в очереди, драфте или матче"
     )
     await i.channel.send(embed=e, view=VerifyView())
     await i.response.send_message("Панель верификации отправлена.", ephemeral=True)
@@ -799,8 +857,12 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
                 await member.move_to(None)  # выкидываем из канала очереди
             except discord.HTTPException:
                 pass
-            if S.panel:
-                await S.panel.channel.send(f"{member.mention} {err}", delete_after=20)
+            try:
+                await member.send(err)  # сообщение в личку
+            except discord.HTTPException:
+                # ЛС закрыты: пишем в канал, чтобы игрок всё равно узнал причину
+                if S.panel:
+                    await S.panel.channel.send(f"{member.mention} {err}", delete_after=20)
             return
     await sync_queue()
 
