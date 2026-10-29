@@ -37,8 +37,8 @@ EVENT_TOKEN = os.getenv("EVENT_TOKEN", "")  # секрет для событий
 GUILD_ID = int(os.getenv("GUILD_ID", "1548371779523837952"))
  
 # Голосовые каналы команд (0 = выключено)
-TEAM1_VC = int(os.getenv("TEAM1_VC_ID", "0"))
-TEAM2_VC = int(os.getenv("TEAM2_VC_ID", "0"))
+TEAM1_VC = int(os.getenv("TEAM1_VC_ID", "1565429499334754454"))
+TEAM2_VC = int(os.getenv("TEAM2_VC_ID", "1565429562848846005"))
  
 # Голосовой канал очереди: зашёл в него = встал в очередь, вышел = покинул (0 = только кнопки)
 QUEUE_VC = int(os.getenv("QUEUE_VC_ID", "1565428177655046144"))
