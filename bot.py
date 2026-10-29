@@ -27,7 +27,7 @@ log = logging.getLogger("freepick")
 TOKEN = os.environ["DISCORD_TOKEN"]
 SERVER_IP = os.getenv("SERVER_IP", "79.143.20.205")
 SERVER_PORT = int(os.getenv("SERVER_PORT", "27017"))
-RCON_PASSWORD = os.environ("RCON_PASSWORD", "ArniAlash22062008Nurlan")
+RCON_PASSWORD = os.environ.get("RCON_PASSWORD", "ArniAlash22062008Nurlan")
 SERVER_PASSWORD = os.getenv("SERVER_PASSWORD", "ArniAlash22062008Nurlan")      # sv_password, если есть
 
 # Публичный адрес веб-сервера бота (его должен видеть CS2-сервер), например http://1.2.3.4:8080
