@@ -1,9 +1,11 @@
 """
 KZLP FreePick 5x5: очередь -> капитаны -> пики игроков -> вето карт -> запуск матча на CS2 (MatchZy).
 После драфта игроки получают доступ в войс своей команды (Team 1 / Team 2) и перемещаются туда.
+Авто-старт: как только набралось нужное число игроков, драфт запускается сам.
 """
-print("▶ bot.py v10 загружается...", flush=True)
+print("▶ bot.py v15 загружается...", flush=True)
 import asyncio
+import io
 import json
 import logging
 import os
@@ -62,11 +64,20 @@ PICK_TIMEOUT = 30            # секунд на пик/бан, потом вы�
 MATCH_MAX_SECONDS = 600 if TEST_MODE else 2 * 3600  # автосброс, если series_end не пришёл
 BREAK_SECONDS = int(os.getenv("BREAK_SECONDS", "300"))  # сколько ждём вышедшего игрока, потом матч продолжается
 
+# Канал для результатов матчей (0 = бот сам найдёт канал, в названии которого есть "результаты")
+RESULTS_CHANNEL = int(os.getenv("RESULTS_CHANNEL_ID", "1565444339084038314"))
+
+# Бэкап привязок: приватный канал для админов, куда бот кладёт файл с привязками (0 = выключено).
+# Нужен, потому что на Render файл базы стирается при каждом обновлении.
+BACKUP_CHANNEL = int(os.getenv("BACKUP_CHANNEL_ID", "1565489828706000948"))
+# Если подключён Render Disk, укажи DB_PATH=/data/freepick.db
+DB_PATH = os.getenv("DB_PATH", "freepick.db")
+
 MAPS = ["de_anubis", "de_mirage", "de_inferno", "de_nuke",
         "de_ancient", "de_dust2", "de_overpass"]
 
 # ----------------------------- БАЗА ДАННЫХ ---------------------------
-db = sqlite3.connect("freepick.db")
+db = sqlite3.connect(DB_PATH)
 db.execute("CREATE TABLE IF NOT EXISTS links ("
            "discord_id INTEGER PRIMARY KEY, steamid64 TEXT NOT NULL UNIQUE)")
 db.execute("CREATE TABLE IF NOT EXISTS bans ("
@@ -92,6 +103,139 @@ def kv_set(key: str, value):
 def kv_get(key: str):
     row = db.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
     return row[0] if row else None
+
+
+# ----------------------------- БЭКАП В DISCORD -----------------------
+BACKUP_FILE = "freepick_backup.json"
+_backup_pending = False
+_restore_done = False  # пока бэкап не прочитан, новый не пишем (иначе можно затереть хороший пустой базой)
+
+
+def _dump() -> str:
+    keys = ("panel_channel", "panel_message", "team_access")
+    data = {
+        "links": db.execute("SELECT discord_id, steamid64 FROM links").fetchall(),
+        "bans": db.execute("SELECT discord_id, reason FROM bans").fetchall(),
+        "kv": {k: kv_get(k) for k in keys if kv_get(k) is not None},
+    }
+    return json.dumps(data, ensure_ascii=False)
+
+
+async def _get_backup_channel():
+    return bot.get_channel(BACKUP_CHANNEL) or await bot.fetch_channel(BACKUP_CHANNEL)
+
+
+async def _backup_task():
+    global _backup_pending
+    await asyncio.sleep(3)  # собираем несколько изменений в один бэкап
+    _backup_pending = False
+    if not _restore_done:
+        await restore_backup(schedule=False)
+        if not _restore_done:
+            log.error("Бэкап не прочитан: новый не записываем, чтобы не затереть старый")
+            return
+    try:
+        ch = await _get_backup_channel()
+        old = [m async for m in ch.history(limit=20)
+               if m.author.id == bot.user.id and m.attachments
+               and m.attachments[0].filename == BACKUP_FILE]
+        await ch.send("💾 Бэкап привязок (обновляется автоматически, не удаляйте)",
+                      file=discord.File(io.BytesIO(_dump().encode("utf-8")), filename=BACKUP_FILE))
+        for m in old:
+            try:
+                await m.delete()
+            except discord.HTTPException:
+                pass
+    except discord.HTTPException:
+        log.exception("Не удалось сохранить бэкап (проверь канал BACKUP_CHANNEL_ID и права бота)")
+
+
+def schedule_backup():
+    """Вызывать после любого изменения привязок/банов."""
+    global _backup_pending
+    if not BACKUP_CHANNEL or _backup_pending:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    _backup_pending = True
+    loop.create_task(_backup_task())
+
+
+async def restore_backup(schedule: bool = True):
+    """При старте: если база пустая (после обновления на Render), поднимаем привязки из Discord."""
+    global _restore_done
+    if not BACKUP_CHANNEL:
+        log.warning("BACKUP_CHANNEL_ID не задан: привязки пропадут при обновлении бота")
+        return
+    data = None
+    for attempt in range(3):  # несколько попыток на случай сбоя сети/лимитов
+        try:
+            ch = await _get_backup_channel()
+            async for m in ch.history(limit=50):
+                if m.author.id == bot.user.id and m.attachments and m.attachments[0].filename == BACKUP_FILE:
+                    data = json.loads(await m.attachments[0].read())
+                    break
+            break  # канал прочитан успешно (бэкап есть или его правда нет)
+        except (discord.HTTPException, ValueError):
+            log.exception("Не удалось прочитать бэкап (попытка %s из 3)", attempt + 1)
+            if attempt == 2:
+                return  # _restore_done остаётся False: бэкап не перезаписываем
+            await asyncio.sleep(5)
+    if data:
+        for did, sid in data.get("links", []):
+            db.execute("INSERT OR IGNORE INTO links VALUES (?, ?)", (int(did), str(sid)))
+        for did, reason in data.get("bans", []):
+            db.execute("INSERT OR IGNORE INTO bans VALUES (?, ?)", (int(did), reason))
+        for k, v in data.get("kv", {}).items():
+            if kv_get(k) is None:
+                kv_set(k, v)
+        db.commit()
+        log.info("Бэкап восстановлен: привязок %s, банов %s",
+                 len(data.get("links", [])), len(data.get("bans", [])))
+    else:
+        log.info("Бэкап в канале не найден, создаём первый")
+    _restore_done = True
+    if schedule:
+        schedule_backup()
+
+
+STEAM_DM_RE = re.compile(r"Steam привязан: `(\d{17})`")
+
+
+async def restore_from_dms():
+    """Запасной вариант: достаём привязки из личных сообщений бота ("✅ Steam привязан: `...`").
+    Работает для всех, у кого есть роль верификации, но нет привязки в базе
+    (например, после обновления на Render, когда база стёрлась)."""
+    if not VERIFIED_ROLE:
+        return
+    guild = get_guild()
+    role = guild.get_role(VERIFIED_ROLE) if guild else None
+    if not role:
+        return
+    restored = 0
+    for member in list(role.members):
+        if member.bot or get_steam(member.id):
+            continue
+        try:
+            dm = member.dm_channel or await member.create_dm()
+            async for m in dm.history(limit=200):
+                if m.author.id != bot.user.id:
+                    continue
+                found = STEAM_DM_RE.search(m.content or "")
+                if found:  # история идёт от новых к старым: берём последнюю привязку
+                    cur = db.execute("INSERT OR IGNORE INTO links VALUES (?, ?)",
+                                     (member.id, found.group(1)))
+                    restored += cur.rowcount
+                    break
+        except discord.HTTPException:
+            log.warning("Не удалось прочитать ЛС с %s", member)
+        await asyncio.sleep(0.5)  # не упираемся в лимиты Discord
+    db.commit()
+    log.info("Восстановлено привязок из ЛС: %s", restored)
+    if restored:
+        schedule_backup()
 
 
 # ----------------------------- СОСТОЯНИЕ -----------------------------
@@ -122,6 +266,7 @@ S = State()
 
 def save_access():
     kv_set("team_access", json.dumps(S.team_access))
+    schedule_backup()
 
 
 def load_access():
@@ -149,7 +294,8 @@ def panel_embed() -> discord.Embed:
     if S.phase == "queue":
         if QUEUE_VC:
             e.add_field(name="Как играть",
-                        value=f"Зайдите в голосовой канал <#{QUEUE_VC}> (нужна Steam-верификация).",
+                        value=f"Зайдите в голосовой канал <#{QUEUE_VC}> (нужна Steam-верификация).\n"
+                              f"Когда наберётся {NEED} игроков, матч стартует автоматически.",
                         inline=False)
         lines = [f"{n}. {m.mention}{' 👑' if n <= 2 else ''}" for n, m in enumerate(S.queue, 1)]
         e.add_field(name=f"Игроков {len(S.queue)} из {NEED}",
@@ -193,7 +339,7 @@ class QueueView(discord.ui.View):
                 S.queue.append(i.user)
                 if len(S.queue) >= NEED:
                     full = True
-                    S.phase = "draft"
+                    S.phase = "draft"  # АВТО-СТАРТ: очередь полная
         if err:
             return await i.response.send_message(err, ephemeral=True)
         S.panel = i.message
@@ -378,7 +524,8 @@ async def clear_voice_access():
 
 
 async def open_match_chat(origin, players: list[discord.Member]):
-    """Когда набрано 10 игроков: открывает отдельный чат только для них (драфт и матч идут там)."""
+    """Когда набрано 10 игроков: открывает отдельный чат только для них (драфт и матч идут там).
+    Уведомление о наборе уходит каждому игроку в личные сообщения."""
     guild = getattr(origin, "guild", None)
     if not guild:
         return None
@@ -400,7 +547,26 @@ async def open_match_chat(origin, players: list[discord.Member]):
         log.exception("Не удалось создать чат матча (нужно право Manage Channels), используем общий канал")
         return None
     S.match_channel = ch
-    await track_send(origin, f"🎯 Набрано {NEED} игроков! Драфт и матч проходят в отдельном чате: {ch.mention}")
+
+    # ---- уведомление в ЛС каждому игроку ----
+    text = (f"🎯 Набрано {NEED} игроков! Драфт и матч проходят в отдельном чате: "
+            f"{ch.jump_url}")
+    closed = []
+    for m in players:
+        try:
+            await m.send(text)
+        except discord.HTTPException:
+            closed.append(m)  # ЛС закрыты
+    # у кого ЛС закрыты — предупреждаем в общем канале на 30 секунд
+    if closed:
+        try:
+            await origin.send(
+                " ".join(m.mention for m in closed) +
+                f" ваши ЛС закрыты. Драфт проходит здесь: {ch.mention}",
+                delete_after=30)
+        except discord.HTTPException:
+            pass
+
     await track_send(ch, "🎮 " + " ".join(m.mention for m in players) +
                      "\nЭтот чат только для игроков матча. Он удалится, когда матч закончится.")
     return ch
@@ -606,7 +772,7 @@ async def reset_to_queue():
 
 
 async def sync_queue():
-    """Очередь = те, кто сидит в голосовом канале очереди."""
+    """Очередь = те, кто сидит в голосовом канале очереди. Когда набралось NEED игроков — авто-старт."""
     if not QUEUE_VC:
         return
     ch = bot.get_channel(QUEUE_VC)
@@ -624,7 +790,7 @@ async def sync_queue():
         S.queue = keep + [m for m in present if m.id not in kept]
         if len(S.queue) >= NEED and S.panel:
             S.queue = S.queue[:NEED]
-            S.phase = "draft"
+            S.phase = "draft"  # АВТО-СТАРТ: очередь полная
             players = list(S.queue)
     await refresh_panel()
     if players:
@@ -669,7 +835,7 @@ async def draft(channel, players):
     caps = players[:2]
     pool = players[2:]
     teams = [[caps[0]], [caps[1]]]
-    await track_send(channel, f"🎯 Набрано {NEED} игроков! Капитаны: {caps[0].mention} и {caps[1].mention}")
+    await track_send(channel, f"🎯 Капитаны: {caps[0].mention} и {caps[1].mention}")
 
     # ---- пики игроков (по очереди) ----
     turn = 0
@@ -713,6 +879,10 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
         chat = await open_match_chat(channel, players)
         if chat:
             channel = chat  # драфт, вето и карточка матча идут в отдельный чат
+        else:
+            # чат создать не удалось: сообщаем о наборе в общем канале и в ЛС
+            await track_send(channel, f"🎯 Набрано {NEED} игроков! " +
+                             " ".join(m.mention for m in players))
         if TEST_MODE:
             teams = [players[:1], []]
             map_name = random.choice(MAPS)
@@ -761,6 +931,57 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
         await reset_to_queue()
 
 
+# ----------------------------- РЕЗУЛЬТАТЫ МАТЧА ----------------------
+def find_results_channel():
+    g = get_guild()
+    if not g:
+        return None
+    if RESULTS_CHANNEL:
+        ch = g.get_channel(RESULTS_CHANNEL)
+        if ch:
+            return ch
+    for ch in g.text_channels:
+        if "результаты" in ch.name.lower():
+            return ch
+    return None
+
+
+async def post_result(data: dict, players: dict, match_id):
+    """Публикует итог карты (счёт и статистику игроков) в канал результатов."""
+    ch = find_results_channel()
+    if not ch:
+        log.warning("Канал результатов не найден (задай RESULTS_CHANNEL_ID)")
+        return
+    t1, t2 = data.get("team1") or {}, data.get("team2") or {}
+    s1, s2 = t1.get("score", 0), t2.get("score", 0)
+    win = (data.get("winner") or {}).get("team")
+    winner = "Team 1" if win == "team1" else "Team 2" if win == "team2" else "ничья"
+    try:
+        map_name = pretty((S.matches.get(int(match_id)) or {}).get("maplist", ["?"])[0])
+    except (TypeError, ValueError):
+        map_name = "?"
+    e = discord.Embed(title=f"Результат матча #{match_id} — {map_name}", color=0x57F287)
+    e.description = f"**Team 1  {s1} : {s2}  Team 2**\n🏆 Победитель: **{winner}**"
+    for n, t in ((1, t1), (2, t2)):
+        rows = []
+        for p in t.get("players") or []:
+            st = p.get("stats") or {}
+            info = players.get(str(p.get("steamid", "")))
+            name = info[0].mention if info else p.get("name", "?")
+            k, d, a = st.get("kills", 0), st.get("deaths", 0), st.get("assists", 0)
+            rounds = st.get("rounds_played") or (s1 + s2) or 1
+            adr = round(st.get("damage", 0) / rounds)
+            rows.append((k, f"{name}: **{k}/{d}/{a}** · ADR {adr}"))
+        rows.sort(key=lambda r: -r[0])
+        e.add_field(name=f"Team {n} ({t.get('score', 0)})",
+                    value="\n".join(r[1] for r in rows) or "—", inline=False)
+    e.set_footer(text="K/D/A · ADR")
+    try:
+        await ch.send(embed=e)
+    except discord.HTTPException:
+        log.exception("Не удалось отправить результат (проверь права бота в канале результатов)")
+
+
 # ----------------------------- ВЕБ-СЕРВЕР ----------------------------
 async def h_match(req: web.Request):
     cfg = S.matches.get(int(req.match_info["mid"]))
@@ -793,6 +1014,8 @@ async def h_events(req: web.Request):
         S.live = True            # матч пошёл (после ножей): теперь выход игрока = перерыв
     elif same and ev == "map_result":
         S.live = False           # карта закончилась: выходы игроков больше не считаем
+        # снимок игроков берём сразу: series_end может сбросить матч раньше, чем отправится результат
+        asyncio.create_task(post_result(data, dict(S.match_players), S.match_id))
     elif same and ev == "player_disconnect":
         player = data.get("player") or {}
         if not player.get("is_bot"):
@@ -853,7 +1076,6 @@ class VerifyView(discord.ui.View):
         await give_role(i.user)
         await i.response.send_message("✅ Роли обновлены.", ephemeral=True)
 
-
     @discord.ui.button(label="Отвязать Steam", style=discord.ButtonStyle.danger, custom_id="fp:unlink")
     async def unlink(self, i: discord.Interaction, b: discord.ui.Button):
         if not get_steam(i.user.id):
@@ -884,6 +1106,7 @@ class UnlinkConfirm(discord.ui.View):
             S.queue = [m for m in S.queue if m.id != i.user.id]
         db.execute("DELETE FROM links WHERE discord_id=?", (i.user.id,))
         db.commit()
+        schedule_backup()
         # снимаем роль верификации
         if VERIFIED_ROLE and isinstance(i.user, discord.Member):
             role = i.user.guild.get_role(VERIFIED_ROLE)
@@ -971,6 +1194,7 @@ async def h_auth_callback(req: web.Request):
                     "Сначала нажмите «Отвязать Steam» на панели верификации в Discord.", False)
     db.execute("INSERT OR REPLACE INTO links VALUES (?, ?)", (did, steamid))
     db.commit()
+    schedule_backup()
 
     guild = bot.get_guild(rec["guild_id"])
     member = guild.get_member(did) if guild else None
@@ -1028,6 +1252,7 @@ async def setup_cmd(i: discord.Interaction):
     S.panel = await i.channel.send(embed=panel_embed(), view=None if QUEUE_VC else QueueView())
     kv_set("panel_channel", S.panel.channel.id)
     kv_set("panel_message", S.panel.id)
+    schedule_backup()
     await sync_queue()
     await i.response.send_message("Панель отправлена.", ephemeral=True)
 
@@ -1079,6 +1304,7 @@ async def fp_link_cmd(i: discord.Interaction, member: discord.Member, steamid64:
         return await i.response.send_message("Этот SteamID уже привязан к другому аккаунту.", ephemeral=True)
     db.execute("INSERT OR REPLACE INTO links VALUES (?, ?)", (member.id, steamid64))
     db.commit()
+    schedule_backup()
     await give_role(member)
     await i.response.send_message(f"✅ {member.mention}: Steam `{steamid64}` привязан.", ephemeral=True)
 
@@ -1090,6 +1316,7 @@ async def fp_link_cmd(i: discord.Interaction, member: discord.Member, steamid64:
 async def fp_unlink_cmd(i: discord.Interaction, member: discord.Member):
     db.execute("DELETE FROM links WHERE discord_id=?", (member.id,))
     db.commit()
+    schedule_backup()
     await i.response.send_message(f"Привязка {member.mention} сброшена, он может пройти верификацию заново.",
                                   ephemeral=True)
 
@@ -1101,6 +1328,7 @@ async def fp_unlink_cmd(i: discord.Interaction, member: discord.Member):
 async def ban_cmd(i: discord.Interaction, member: discord.Member, reason: str = "—"):
     db.execute("INSERT OR REPLACE INTO bans VALUES (?, ?)", (member.id, reason))
     db.commit()
+    schedule_backup()
     async with S.lock:
         if S.phase == "queue":
             S.queue = [m for m in S.queue if m.id != member.id]
@@ -1115,6 +1343,7 @@ async def ban_cmd(i: discord.Interaction, member: discord.Member, reason: str = 
 async def unban_cmd(i: discord.Interaction, member: discord.Member):
     db.execute("DELETE FROM bans WHERE discord_id=?", (member.id,))
     db.commit()
+    schedule_backup()
     await i.response.send_message(f"{member.mention} разбанен.", ephemeral=True)
 
 
@@ -1131,6 +1360,8 @@ async def endmatch_cmd(i: discord.Interaction):
 @bot.event
 async def on_ready():
     log.info("Бот запущен как %s", bot.user)
+    await restore_backup()  # привязки не должны пропадать при обновлении бота
+    asyncio.create_task(restore_from_dms())  # доберём тех, кого нет в бэкапе (из ЛС бота)
     load_access()
     # Если бот перезапустился во время матча, а матча уже нет — снимаем старые доступы
     if S.team_access and S.phase != "playing":
@@ -1191,8 +1422,10 @@ def main():
     if not token:
         say("❌ Не задана переменная DISCORD_TOKEN (Render -> Environment)")
         raise SystemExit(1)
+    if not BACKUP_CHANNEL:
+        say("⚠ BACKUP_CHANNEL_ID не задан: привязки Steam пропадут при обновлении бота на Render")
     if not RCON_PASSWORD:
-        say("⚠ RCON_PASSWORD не задан: запуск матчей на сервере не сработает")
+        say("⚠ RCON_PASSWORD не задан: запуск матчей на сервере не сработает (задай в Render -> Environment)")
     if not os.getenv("EVENT_TOKEN"):
         say("ℹ EVENT_TOKEN не задан в окружении: создан временный токен (бот сам передаёт его серверу при запуске матча)")
     try:
