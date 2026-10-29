@@ -37,7 +37,7 @@ WEB_BASE_URL = os.getenv("WEB_BASE_URL", "https://varq.net/servers/counter-strik
 EVENT_TOKEN = os.getenv("EVENT_TOKEN", "1548371779523837952")  # секрет для событий MatchZy
 
 # ID твоего Discord-сервера: команды появятся мгновенно (необязательно)
-GUILD_ID = int(os.getenv("GUILD_ID", "0"))
+GUILD_ID = int(os.getenv("GUILD_ID", "1548371779523837952"))
 
 # Голосовые каналы команд (0 = выключено)
 TEAM1_VC = int(os.getenv("TEAM1_VC_ID", "0"))
