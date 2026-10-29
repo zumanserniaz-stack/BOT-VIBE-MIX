@@ -3,7 +3,7 @@ KZLP FreePick 5x5: очередь -> капитаны -> пики игроков
 После драфта игроки получают доступ в войс своей команды (Team 1 / Team 2) и перемещаются туда.
 Авто-старт: как только набралось нужное число игроков, драфт запускается сам.
 """
-print("▶ bot.py v15 загружается...", flush=True)
+print("▶ bot.py v16 загружается...", flush=True)
 import asyncio
 import io
 import json
@@ -61,6 +61,7 @@ TEST_MODE = os.getenv("TEST_MODE", "0") == "1"  # 1 = тест: хватает �
 TEAM_SIZE = 1 if TEST_MODE else 5
 NEED = 1 if TEST_MODE else TEAM_SIZE * 2
 PICK_TIMEOUT = 30            # секунд на пик/бан, потом выбор случайный
+CAPTAIN_TIMEOUT = 30         # секунд на выбор капитанов (кто не вызвался, назначается случайно)
 MATCH_MAX_SECONDS = 600 if TEST_MODE else 2 * 3600  # автосброс, если series_end не пришёл
 BREAK_SECONDS = int(os.getenv("BREAK_SECONDS", "300"))  # сколько ждём вышедшего игрока, потом матч продолжается
 
@@ -287,7 +288,7 @@ def panel_embed() -> discord.Embed:
     e.add_field(
         name="Настройки матча",
         value=("Режим: Соревновательный\nВыбор игроков: Капитаны\n"
-               "Выбор капитанов: Добровольно (первые двое в очереди)\n"
+               "Выбор капитанов: Добровольно (кнопка «Стать капитаном»)\n"
                "Выбор карт: Вето\nФормат: BO1"),
         inline=False,
     )
@@ -297,7 +298,7 @@ def panel_embed() -> discord.Embed:
                         value=f"Зайдите в голосовой канал <#{QUEUE_VC}> (нужна Steam-верификация).\n"
                               f"Когда наберётся {NEED} игроков, матч стартует автоматически.",
                         inline=False)
-        lines = [f"{n}. {m.mention}{' 👑' if n <= 2 else ''}" for n, m in enumerate(S.queue, 1)]
+        lines = [f"{n}. {m.mention}" for n, m in enumerate(S.queue, 1)]
         e.add_field(name=f"Игроков {len(S.queue)} из {NEED}",
                     value="\n".join(lines) or "Ожидаем игроков...", inline=False)
     elif S.phase == "draft":
@@ -364,6 +365,49 @@ class QueueView(discord.ui.View):
 
 
 # ----------------------------- ПИКИ И ВЕТО ---------------------------
+class CaptainView(discord.ui.View):
+    """Игроки сами вызываются в капитаны: первые двое нажавших становятся капитанами."""
+
+    def __init__(self, players: list[discord.Member]):
+        super().__init__(timeout=CAPTAIN_TIMEOUT)
+        self.players = players
+        self.caps: list[discord.Member] = []
+
+    def text(self) -> str:
+        have = ", ".join(m.mention for m in self.caps) or "пока никого"
+        return (f"👑 **Выбор капитанов.** Нажмите кнопку, чтобы стать капитаном "
+                f"({CAPTAIN_TIMEOUT} сек). Нужно двое.\nКапитаны: {have}")
+
+    @discord.ui.button(label="Стать капитаном", emoji="👑", style=discord.ButtonStyle.success)
+    async def take(self, i: discord.Interaction, b: discord.ui.Button):
+        member = next((m for m in self.players if m.id == i.user.id), None)
+        if not member:
+            return await i.response.send_message("Вы не участвуете в этом матче.", ephemeral=True)
+        if member in self.caps:
+            return await i.response.send_message("Вы уже вызвались капитаном.", ephemeral=True)
+        self.caps.append(member)
+        if len(self.caps) >= 2:
+            await i.response.edit_message(content=self.text(), view=None)
+            self.stop()
+        else:
+            await i.response.edit_message(content=self.text(), view=self)
+
+
+async def choose_captains(channel, players: list[discord.Member]) -> list[discord.Member]:
+    view = CaptainView(players)
+    msg = await track_send(channel, view.text(), view=view)
+    await view.wait()
+    caps = view.caps[:2]
+    if len(caps) < 2:  # не хватило добровольцев: добираем случайно
+        rest = [m for m in players if m not in caps]
+        caps += random.sample(rest, 2 - len(caps))
+    try:
+        await msg.edit(content=f"👑 Капитаны: {caps[0].mention} и {caps[1].mention}", view=None)
+    except discord.HTTPException:
+        pass
+    return caps
+
+
 class PickView(discord.ui.View):
     def __init__(self, cap: discord.Member, pool: list[discord.Member]):
         super().__init__(timeout=PICK_TIMEOUT)
@@ -832,10 +876,9 @@ async def auto_reset(match_id: int):
 
 
 async def draft(channel, players):
-    caps = players[:2]
-    pool = players[2:]
+    caps = await choose_captains(channel, players)  # капитаны вызываются сами
+    pool = [m for m in players if m not in caps]
     teams = [[caps[0]], [caps[1]]]
-    await track_send(channel, f"🎯 Капитаны: {caps[0].mention} и {caps[1].mention}")
 
     # ---- пики игроков (по очереди) ----
     turn = 0
