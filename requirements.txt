@@ -1,3 +1,5 @@
 discord.py>=2.4
+aiohttp>=3.9
 rcon>=2.4
 python-dotenv>=1.0
+PyNaCl>=1.5
