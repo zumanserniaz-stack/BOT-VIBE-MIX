@@ -7,9 +7,12 @@ import logging
 import os
 import random
 import re
+import secrets
 import sqlite3
 import time
+from urllib.parse import urlencode
 
+import aiohttp
 import discord
 from aiohttp import web
 from discord import app_commands
@@ -27,7 +30,7 @@ log = logging.getLogger("freepick")
 
 # ----------------------------- НАСТРОЙКИ -----------------------------
 # CS2-сервер
-SERVER_IP = os.getenv("SERVER_IP", "45.86.81.37")
+SERVER_IP = os.getenv("SERVER_IP", " 45.86.81.37")
 SERVER_PORT = int(os.getenv("SERVER_PORT", "55031"))
 RCON_PASSWORD = os.getenv("RCON_PASSWORD", "ArniAlash22062008Nurlan")
 SERVER_PASSWORD = os.getenv("SERVER_PASSWORD", "")
@@ -41,17 +44,20 @@ EVENT_TOKEN = os.getenv("EVENT_TOKEN", "")  # секрет для событий
 GUILD_ID = int(os.getenv("GUILD_ID", "1548371779523837952"))
 
 # Голосовые каналы команд (0 = выключено)
-TEAM1_VC = int(os.getenv("TEAM1_VC_ID", "1565429499334754454"))
-TEAM2_VC = int(os.getenv("TEAM2_VC_ID", "1565429562848846005"))
+TEAM1_VC = int(os.getenv("TEAM1_VC_ID", "1565442747450659038"))
+TEAM2_VC = int(os.getenv("TEAM2_VC_ID", "1565442482425041016"))
 
 # Голосовой канал очереди: зашёл в него = встал в очередь, вышел = покинул (0 = только кнопки)
-QUEUE_VC = int(os.getenv("QUEUE_VC_ID", "1565428177655046144"))
+QUEUE_VC = int(os.getenv("QUEUE_VC_ID", "1565440992574705734"))
 
-TEST_MODE = os.getenv("TEST_MODE", "1") == "1"  # 1 = тест: хватает одного игрока, без драфта
+# Роль, которая выдаётся после Steam-верификации (0 = не выдавать)
+VERIFIED_ROLE = int(os.getenv("VERIFIED_ROLE_ID", "1565117832251965653"))
+
+TEST_MODE = os.getenv("TEST_MODE", "0") == "1"  # 1 = тест: хватает одного игрока, без драфта
 TEAM_SIZE = 1 if TEST_MODE else 5
 NEED = 1 if TEST_MODE else TEAM_SIZE * 2
 PICK_TIMEOUT = 30            # секунд на пик/бан, потом выбор случайный
-MATCH_MAX_SECONDS = 2 * 3600  # автосброс, если series_end не пришёл
+MATCH_MAX_SECONDS = 600 if TEST_MODE else 2 * 3600  # автосброс, если series_end не пришёл
 
 MAPS = ["de_anubis", "de_mirage", "de_inferno", "de_nuke",
         "de_ancient", "de_dust2", "de_overpass"]
@@ -115,7 +121,7 @@ def panel_embed() -> discord.Embed:
     if S.phase == "queue":
         if QUEUE_VC:
             e.add_field(name="Как играть",
-                        value=f"Зайдите в голосовой канал <#{QUEUE_VC}> (нужна привязка Steam: `/link`).",
+                        value=f"Зайдите в голосовой канал <#{QUEUE_VC}> (нужна Steam-верификация).",
                         inline=False)
         lines = [f"{n}. {m.mention}{' 👑' if n <= 2 else ''}" for n, m in enumerate(S.queue, 1)]
         e.add_field(name=f"Игроков {len(S.queue)} из {NEED}",
@@ -150,7 +156,7 @@ class QueueView(discord.ui.View):
             if is_banned(i.user.id):
                 err = "⛔ Вам запрещено играть в FreePick."
             elif not get_steam(i.user.id):
-                err = "Сначала привяжите Steam: `/link <SteamID64>`"
+                err = "Сначала пройдите Steam-верификацию (кнопка «Верификация»)"
             elif S.phase != "queue":
                 err = "Сейчас идёт набор/матч, дождитесь окончания."
             elif any(m.id == i.user.id for m in S.queue):
@@ -433,10 +439,139 @@ async def h_events(req: web.Request):
     return web.Response(text="ok")
 
 
+# ----------------------------- STEAM-ВЕРИФИКАЦИЯ ---------------------
+VERIFY_TTL = 300  # ссылка живёт 5 минут
+STEAM_OPENID = "https://steamcommunity.com/openid/login"
+CLAIMED_RE = re.compile(r"^https://steamcommunity\.com/openid/id/(\d{17})$")
+pending: dict[str, dict] = {}
+
+
+def new_token(discord_id: int, guild_id: int) -> str:
+    now = time.time()
+    for t in [t for t, v in pending.items() if v["exp"] < now]:
+        pending.pop(t, None)
+    token = secrets.token_urlsafe(24)
+    pending[token] = {"discord_id": discord_id, "guild_id": guild_id, "exp": now + VERIFY_TTL}
+    return token
+
+
+async def give_role(member):
+    if not VERIFIED_ROLE or not member:
+        return
+    role = member.guild.get_role(VERIFIED_ROLE)
+    if role and role not in member.roles:
+        try:
+            await member.add_roles(role, reason="Steam verified")
+        except discord.HTTPException:
+            log.exception("Не удалось выдать роль (роль бота должна быть выше выдаваемой)")
+
+
+class VerifyView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Верификация", style=discord.ButtonStyle.success, custom_id="fp:verify")
+    async def verify(self, i: discord.Interaction, b: discord.ui.Button):
+        if get_steam(i.user.id):
+            return await i.response.send_message(
+                "Вы уже верифицированы. Сменить привязку может только администрация (через тикет).",
+                ephemeral=True)
+        if not WEB_BASE_URL:
+            return await i.response.send_message("Не настроен WEB_BASE_URL бота.", ephemeral=True)
+        token = new_token(i.user.id, i.guild_id or 0)
+        link = discord.ui.View()
+        link.add_item(discord.ui.Button(label="Войти через Steam",
+                                        url=f"{WEB_BASE_URL}/auth/steam?t={token}"))
+        await i.response.send_message("Ваша персональная ссылка (действует 5 минут):",
+                                      view=link, ephemeral=True)
+
+    @discord.ui.button(label="Обновить роли", style=discord.ButtonStyle.secondary, custom_id="fp:roles")
+    async def roles(self, i: discord.Interaction, b: discord.ui.Button):
+        if not get_steam(i.user.id):
+            return await i.response.send_message("Сначала пройдите верификацию.", ephemeral=True)
+        await give_role(i.user)
+        await i.response.send_message("✅ Роли обновлены.", ephemeral=True)
+
+
+def page(title: str, text: str, ok: bool = True) -> web.Response:
+    color = "#57F287" if ok else "#ED4245"
+    html = ('<!doctype html><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
+            f'<title>{title}</title>'
+            '<body style="background:#0b0b0d;color:#eee;font-family:sans-serif;display:flex;'
+            'align-items:center;justify-content:center;height:100vh;margin:0">'
+            f'<div style="text-align:center;max-width:420px;padding:24px"><h1 style="color:{color}">{title}</h1>'
+            f'<p>{text}</p></div></body>')
+    return web.Response(text=html, content_type="text/html")
+
+
+async def h_auth(req: web.Request):
+    token = req.query.get("t", "")
+    rec = pending.get(token)
+    if not rec or rec["exp"] < time.time():
+        return page("Ссылка истекла", "Вернитесь в Discord и нажмите «Верификация» ещё раз.", False)
+    params = {
+        "openid.ns": "http://specs.openid.net/auth/2.0",
+        "openid.mode": "checkid_setup",
+        "openid.return_to": f"{WEB_BASE_URL}/auth/steam/callback?t={token}",
+        "openid.realm": WEB_BASE_URL,
+        "openid.identity": "http://specs.openid.net/auth/2.0/identifier_select",
+        "openid.claimed_id": "http://specs.openid.net/auth/2.0/identifier_select",
+    }
+    raise web.HTTPFound(f"{STEAM_OPENID}?{urlencode(params)}")
+
+
+async def h_auth_callback(req: web.Request):
+    token = req.query.get("t", "")
+    rec = pending.get(token)
+    if not rec or rec["exp"] < time.time():
+        return page("Ссылка истекла", "Вернитесь в Discord и нажмите «Верификация» ещё раз.", False)
+    q = dict(req.query)
+    m = CLAIMED_RE.match(q.get("openid.claimed_id", ""))
+    expected = f"{WEB_BASE_URL}/auth/steam/callback?t={token}"
+    if not m or q.get("openid.mode") != "id_res" or q.get("openid.return_to") != expected:
+        return page("Ошибка", "Steam не подтвердил вход. Попробуйте ещё раз.", False)
+
+    data = {k: v for k, v in q.items() if k.startswith("openid.")}
+    data["openid.mode"] = "check_authentication"
+    try:
+        async with aiohttp.ClientSession() as ses:
+            async with ses.post(STEAM_OPENID, data=data, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                body = await r.text()
+    except Exception:
+        log.exception("Steam OpenID недоступен")
+        return page("Ошибка Steam", "Steam сейчас недоступен, попробуйте позже.", False)
+    if "is_valid:true" not in body:
+        return page("Ошибка", "Не удалось проверить ответ Steam.", False)
+
+    steamid, did = m.group(1), rec["discord_id"]
+    pending.pop(token, None)
+    row = db.execute("SELECT discord_id FROM links WHERE steamid64=?", (steamid,)).fetchone()
+    if row and row[0] != did:
+        return page("Steam уже привязан", "Этот Steam-аккаунт привязан к другому Discord.", False)
+    old = get_steam(did)
+    if old and old != steamid:
+        return page("Уже привязан другой Steam",
+                    "Сменить привязку может только администрация (через тикет).", False)
+    db.execute("INSERT OR REPLACE INTO links VALUES (?, ?)", (did, steamid))
+    db.commit()
+
+    guild = bot.get_guild(rec["guild_id"])
+    member = guild.get_member(did) if guild else None
+    await give_role(member)
+    try:
+        user = member or await bot.fetch_user(did)
+        await user.send(f"✅ Steam привязан: `{steamid}`. Роли выданы, можно заходить в очередь FreePick.")
+    except discord.HTTPException:
+        pass
+    return page("Готово", "Steam привязан. Закройте страницу и вернитесь в Discord.")
+
+
 # ----------------------------- БОТ -----------------------------------
 class FreePickBot(commands.Bot):
     async def setup_hook(self):
         self.add_view(QueueView())
+        self.add_view(VerifyView())
 
         app = web.Application()
         app.add_routes([
@@ -444,6 +579,8 @@ class FreePickBot(commands.Bot):
             web.get(r"/match/{mid:\d+}.json", h_match),
             web.get("/connect", h_connect),
             web.post("/events", h_events),
+            web.get("/auth/steam", h_auth),
+            web.get("/auth/steam/callback", h_auth_callback),
         ])
         runner = web.AppRunner(app)
         await runner.setup()
@@ -479,18 +616,52 @@ async def setup_cmd(i: discord.Interaction):
     await i.response.send_message("Панель отправлена.", ephemeral=True)
 
 
-@bot.tree.command(name="link", description="Привязать свой SteamID64")
-@app_commands.describe(steamid64="17 цифр, начинается с 7656119")
-async def link_cmd(i: discord.Interaction, steamid64: str):
+@bot.tree.command(name="verify_setup", description="Отправить панель Steam-верификации в этот канал")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@admin
+async def verify_setup_cmd(i: discord.Interaction):
+    e = discord.Embed(title="Верификация", color=0xE8D44D)
+    e.description = (
+        "**Как пройти верификацию**\n"
+        "1. Нажмите «Верификация» — бот пришлёт персональную ссылку, она действует 5 минут\n"
+        "2. Войдите в Steam и подтвердите вход — роли выдадутся автоматически\n"
+        "3. Подтверждение придёт в личные сообщения\n\n"
+        "**Важно**\n"
+        "• Один Discord — один Steam. Сменить привязку может только администрация в тикете\n"
+        "• Ссылка истекла или не пришла — просто нажмите «Верификация» ещё раз\n"
+        "• Если роли не выдались — нажмите «Обновить роли» или откройте тикет"
+    )
+    await i.channel.send(embed=e, view=VerifyView())
+    await i.response.send_message("Панель верификации отправлена.", ephemeral=True)
+
+
+@bot.tree.command(name="fp_link", description="(админ) Привязать SteamID64 игроку вручную")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@admin
+async def fp_link_cmd(i: discord.Interaction, member: discord.Member, steamid64: str):
     steamid64 = steamid64.strip()
     if not re.fullmatch(r"7656119\d{10}", steamid64):
-        return await i.response.send_message("Неверный SteamID64. Пример: `76561198000000000`.", ephemeral=True)
+        return await i.response.send_message("Неверный SteamID64.", ephemeral=True)
     row = db.execute("SELECT discord_id FROM links WHERE steamid64=?", (steamid64,)).fetchone()
-    if row and row[0] != i.user.id:
+    if row and row[0] != member.id:
         return await i.response.send_message("Этот SteamID уже привязан к другому аккаунту.", ephemeral=True)
-    db.execute("INSERT OR REPLACE INTO links VALUES (?, ?)", (i.user.id, steamid64))
+    db.execute("INSERT OR REPLACE INTO links VALUES (?, ?)", (member.id, steamid64))
     db.commit()
-    await i.response.send_message(f"✅ Steam привязан: `{steamid64}`", ephemeral=True)
+    await give_role(member)
+    await i.response.send_message(f"✅ {member.mention}: Steam `{steamid64}` привязан.", ephemeral=True)
+
+
+@bot.tree.command(name="fp_unlink", description="(админ) Сбросить привязку Steam игрока")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@admin
+async def fp_unlink_cmd(i: discord.Interaction, member: discord.Member):
+    db.execute("DELETE FROM links WHERE discord_id=?", (member.id,))
+    db.commit()
+    await i.response.send_message(f"Привязка {member.mention} сброшена, он может пройти верификацию заново.",
+                                  ephemeral=True)
 
 
 @bot.tree.command(name="fp_ban", description="Забанить игрока в FreePick")
@@ -554,7 +725,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         if is_banned(member.id):
             err = "⛔ Вам запрещено играть в FreePick."
         elif not get_steam(member.id):
-            err = "Сначала привяжите Steam: `/link <SteamID64>`, затем зайдите снова."
+            err = "Сначала пройдите Steam-верификацию (кнопка «Верификация»), затем зайдите снова."
         if err:
             try:
                 await member.move_to(None)  # выкидываем из канала очереди
