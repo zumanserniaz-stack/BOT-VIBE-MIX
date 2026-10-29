@@ -2,7 +2,7 @@
 KZLP FreePick 5x5: очередь -> капитаны -> пики игроков -> вето карт -> запуск матча на CS2 (MatchZy).
 После драфта игроки получают доступ в войс своей команды (Team 1 / Team 2) и перемещаются туда.
 """
-print("▶ bot.py v7 загружается...", flush=True)
+print("▶ bot.py v9 загружается...", flush=True)
 import asyncio
 import json
 import logging
@@ -60,6 +60,7 @@ TEAM_SIZE = 1 if TEST_MODE else 5
 NEED = 1 if TEST_MODE else TEAM_SIZE * 2
 PICK_TIMEOUT = 30            # секунд на пик/бан, потом выбор случайный
 MATCH_MAX_SECONDS = 600 if TEST_MODE else 2 * 3600  # автосброс, если series_end не пришёл
+BREAK_SECONDS = int(os.getenv("BREAK_SECONDS", "300"))  # сколько ждём вышедшего игрока, потом матч продолжается
 
 MAPS = ["de_anubis", "de_mirage", "de_inferno", "de_nuke",
         "de_ancient", "de_dust2", "de_overpass"]
@@ -104,6 +105,15 @@ class State:
         self.team_access: list[tuple[int, int]] = []   # (id канала, id игрока) с выданным доступом
         self.active_ids: set[int] = set()              # игроки текущего драфта/матча
         self.chat_msgs: list[discord.Message] = []     # сообщения драфта/матча, удаляются при сбросе
+        self.match_players: dict[str, tuple[discord.Member, int]] = {}  # steamid64 -> (игрок, номер команды)
+        self.captain_ids: set[int] = set()
+        self.live = False                              # матч в живой фазе (после ножей)
+        self.paused = False                            # матч на паузе из-за вышедшего игрока
+        self.absent: set[int] = set()                  # игроки, которые вышли с сервера
+        self.break_channel: discord.TextChannel | None = None
+        self.break_task: asyncio.Task | None = None
+        self.break_lock = asyncio.Lock()
+        self.match_channel: discord.TextChannel | None = None   # отдельный чат матча
         self.lock = asyncio.Lock()
 
 
@@ -295,6 +305,16 @@ def load_on_server(match_id: int):
             _rcon_run(c, cmd)
 
 
+def rcon_pause(pause: bool):
+    """Блокирующая функция: ставит матч на паузу или снимает её (админская пауза MatchZy)."""
+    primary = "css_forcepause" if pause else "css_forceunpause"
+    fallback = "mp_pause_match" if pause else "mp_unpause_match"
+    with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
+        resp = _rcon_run(c, primary) or ""
+        if "unknown command" in resp.lower():
+            _rcon_run(c, fallback)
+
+
 # ----------------------------- ВОЙСЫ КОМАНД --------------------------
 async def move_to_voice(guild: discord.Guild, teams):
     """Выдаёт игрокам доступ в войс их команды (Team 1 / Team 2) и перекидывает их туда."""
@@ -349,6 +369,162 @@ async def clear_voice_access():
     save_access()
 
 
+async def open_match_chat(origin, players: list[discord.Member]):
+    """Когда набрано 10 игроков: открывает отдельный чат только для них (драфт и матч идут там)."""
+    guild = getattr(origin, "guild", None)
+    if not guild:
+        return None
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True,
+                                              read_message_history=True),
+    }
+    for m in players:
+        overwrites[m] = discord.PermissionOverwrite(
+            view_channel=True, send_messages=True, read_message_history=True)
+    try:
+        ch = await guild.create_text_channel(
+            "матч-freepick",
+            overwrites=overwrites,
+            category=getattr(origin, "category", None),
+            reason="FreePick: набрано полное количество игроков")
+    except discord.HTTPException:
+        log.exception("Не удалось создать чат матча (нужно право Manage Channels), используем общий канал")
+        return None
+    S.match_channel = ch
+    await track_send(origin, f"🎯 Набрано {NEED} игроков! Драфт и матч проходят в отдельном чате: {ch.mention}")
+    await track_send(ch, "🎮 " + " ".join(m.mention for m in players) +
+                     "\nЭтот чат только для игроков матча. Он удалится, когда матч закончится.")
+    return ch
+
+
+async def close_match_chat():
+    ch, S.match_channel = S.match_channel, None
+    if ch:
+        try:
+            await ch.delete(reason="FreePick: матч окончен")
+        except discord.HTTPException:
+            pass
+
+
+def get_guild() -> discord.Guild | None:
+    if GUILD_ID:
+        g = bot.get_guild(GUILD_ID)
+        if g:
+            return g
+    return S.panel.guild if S.panel and S.panel.guild else None
+
+
+class BreakView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Продолжить матч", emoji="▶️", style=discord.ButtonStyle.success)
+    async def resume(self, i: discord.Interaction, b: discord.ui.Button):
+        is_admin = isinstance(i.user, discord.Member) and i.user.guild_permissions.administrator
+        if i.user.id not in S.captain_ids and not is_admin:
+            return await i.response.send_message("Продолжить матч могут только капитаны и администрация.",
+                                                 ephemeral=True)
+        if not S.paused:
+            return await i.response.send_message("Матч уже продолжается.", ephemeral=True)
+        await i.response.defer()
+        await resume_match(f"{i.user.mention} продолжил матч")
+
+
+async def handle_disconnect(steamid: str):
+    """Игрок вышел с сервера во время матча: пауза + отдельный чат для перерыва."""
+    info = S.match_players.get(steamid)
+    if not info or not S.live or S.phase != "playing":
+        return
+    member, team_n = info
+    S.absent.add(member.id)
+    first = not S.paused
+    if first:
+        S.paused = True  # ставим флаг сразу, чтобы второй выход не запускал паузу повторно
+        try:
+            await asyncio.to_thread(rcon_pause, True)
+        except Exception:
+            log.exception("Не удалось поставить матч на паузу")
+        S.break_task = asyncio.create_task(break_timer())
+
+    guild = get_guild()
+    async with S.break_lock:
+        if S.break_channel is None and guild:
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+            }
+            for m, _ in S.match_players.values():
+                overwrites[m] = discord.PermissionOverwrite(
+                    view_channel=True, send_messages=True, read_message_history=True)
+            try:
+                S.break_channel = await guild.create_text_channel(
+                    f"перерыв-матч-{S.match_id}",
+                    overwrites=overwrites,
+                    category=S.panel.channel.category if S.panel else None,
+                    reason="FreePick: перерыв из-за вышедшего игрока")
+            except discord.HTTPException:
+                log.exception("Не удалось создать чат перерыва (нужно право Manage Channels)")
+        target = S.break_channel or (S.panel.channel if S.panel else None)
+
+    if target:
+        names = ", ".join(m.mention for m, _ in S.match_players.values() if m.id in S.absent)
+        await target.send(
+            f"⏸ **Матч #{S.match_id} на паузе.** Вышел с сервера: {names} (Team {team_n}).\n"
+            f"Игрок, вернитесь на сервер: {WEB_BASE_URL}/connect\n"
+            f"Если игрок не вернётся за {BREAK_SECONDS // 60} мин, матч продолжится автоматически. "
+            "Капитаны и администрация могут продолжить раньше кнопкой ниже.",
+            view=BreakView())
+    try:
+        await member.send(f"⏸ Вы вышли с сервера, матч #{S.match_id} стоит на паузе. "
+                          f"Возвращайтесь: {WEB_BASE_URL}/connect")
+    except discord.HTTPException:
+        pass
+
+
+async def break_timer():
+    await asyncio.sleep(BREAK_SECONDS)
+    if S.paused:
+        await resume_match("Время ожидания вышло, матч продолжается")
+
+
+async def resume_match(reason: str):
+    """Снимает паузу и закрывает чат перерыва."""
+    if not S.paused:
+        return
+    S.paused = False
+    S.absent.clear()
+    if S.break_task and S.break_task is not asyncio.current_task():
+        S.break_task.cancel()
+    S.break_task = None
+    try:
+        await asyncio.to_thread(rcon_pause, False)
+    except Exception:
+        log.exception("Не удалось снять паузу")
+    ch = S.break_channel or (S.panel.channel if S.panel else None)
+    if ch:
+        try:
+            await ch.send(f"▶️ {reason}. Пауза снята. Этот чат закроется через 30 секунд.")
+        except discord.HTTPException:
+            pass
+    asyncio.create_task(close_break(delay=30))
+
+
+async def close_break(delay: int = 0):
+    """Удаляет отдельный чат перерыва."""
+    if delay:
+        await asyncio.sleep(delay)
+    if S.break_task and S.break_task is not asyncio.current_task():
+        S.break_task.cancel()
+        S.break_task = None
+    ch, S.break_channel = S.break_channel, None
+    if ch:
+        try:
+            await ch.delete(reason="FreePick: перерыв закончен")
+        except discord.HTTPException:
+            pass
+
+
 async def notify_players(teams, map_name: str, match_id: int):
     """Личное сообщение каждому игроку: его команда и Steam-аккаунт, с которого нужно зайти."""
     for n, team in enumerate(teams, 1):
@@ -388,6 +564,13 @@ async def clear_chat():
 async def reset_to_queue():
     await clear_voice_access()
     await clear_chat()
+    await close_match_chat()
+    await close_break()
+    S.live = False
+    S.paused = False
+    S.absent.clear()
+    S.match_players = {}
+    S.captain_ids = set()
     async with S.lock:
         S.phase = "queue"
         S.queue.clear()
@@ -473,8 +656,12 @@ async def draft(channel, players):
 
 
 async def run_match(channel: discord.abc.Messageable, players: list[discord.Member]):
+    origin = channel  # общий канал очереди: туда пишем ошибки
     try:
         S.active_ids = {m.id for m in players}
+        chat = await open_match_chat(channel, players)
+        if chat:
+            channel = chat  # драфт, вето и карточка матча идут в отдельный чат
         if TEST_MODE:
             teams = [players[:1], []]
             map_name = random.choice(MAPS)
@@ -485,6 +672,9 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
         # ---- запуск на сервере ----
         match_id = int(time.time())
         S.matches[match_id] = build_match(match_id, teams, map_name)
+        S.match_players = {get_steam(m.id): (m, n) for n, t in enumerate(teams, 1) for m in t}
+        S.captain_ids = {t[0].id for t in teams if t}
+        S.live = False
         S.match_id = match_id
         await asyncio.to_thread(load_on_server, match_id)
 
@@ -516,7 +706,7 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
 
     except Exception as exc:  # любая ошибка: возвращаем систему в очередь
         log.exception("Ошибка при запуске матча")
-        await channel.send(f"❌ Не удалось запустить матч: `{exc}`\nОчередь сброшена, нажмите «Играть» заново.")
+        await origin.send(f"❌ Не удалось запустить матч: `{exc}`\nОчередь сброшена, нажмите «Играть» заново.")
         await reset_to_queue()
 
 
@@ -542,9 +732,18 @@ async def h_events(req: web.Request):
         data = await req.json()
     except Exception:
         return web.Response(status=400)
-    if (data.get("event") == "series_end" and S.phase == "playing"
-            and str(data.get("matchid")) == str(S.match_id)):
+    ev = data.get("event")
+    same = S.phase == "playing" and str(data.get("matchid")) == str(S.match_id)
+    if ev == "series_end" and same:
         asyncio.create_task(reset_to_queue())
+    elif same and ev == "going_live":
+        S.live = True            # матч пошёл (после ножей): теперь выход игрока = перерыв
+    elif same and ev == "map_result":
+        S.live = False           # карта закончилась: выходы игроков больше не считаем
+    elif same and ev == "player_disconnect":
+        player = data.get("player") or {}
+        if not player.get("is_bot"):
+            asyncio.create_task(handle_disconnect(str(player.get("steamid", ""))))
     return web.Response(text="ok")
 
 
