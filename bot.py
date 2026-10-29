@@ -5,14 +5,10 @@ import io
 import random
 import collections
 import discord
-from discord.ext import commands
-from discord import app_commands
-from discord.ui import Button, View
-from discord.ui import View, Button, Modal, TextInput, UserSelect
-from flask import Flask
-from threading import Thread
-import yt_dlp
 import traceback
+from discord import app_commands
+from discord.ext import commands
+from discord.ui import Button, View
 # --------------------------------------------------
 # WEB SERVER FOR RENDER 24/7
 # --------------------------------------------------
@@ -39,8 +35,12 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ================== ВСТАВЬ ID СВОЕГО СЕРВЕРА ==================
-GUILD_ID = 1548371779523837952 # замени на свой
+GUILD_ID = 1548371779523837952  # замени на свой
 # =============================================================
+
+SERVER_IP = "45.86.81.37:55031"
+CONNECT_LINK = f"steam://connect/{SERVER_IP}"
+MAX_PLAYERS = 1  # для проверки
 
 class JoinView(View):
     def __init__(self):
@@ -53,37 +53,46 @@ class JoinView(View):
         if user in self.queue:
             await interaction.response.send_message("Ты уже в очереди", ephemeral=True)
             return
-        if len(self.queue) >= 10:
-            await interaction.response.send_message("Лобби полное (10/10)", ephemeral=True)
+        if len(self.queue) >= MAX_PLAYERS:
+            await interaction.response.send_message("Лобби полное", ephemeral=True)
             return
 
         self.queue.append(user)
         
-        embed = discord.Embed(title="Очередь — FreePick", color=0x2b2d31)
+        embed = discord.Embed(title="Очередь — FreePick (тест)", color=0x2b2d31)
         embed.add_field(name="Настройки", value=(
             "**Формат:** 5x5 | BO1\n"
             "**Капитаны:** Доброволец\n"
             "**Карты:** Вето"
         ), inline=False)
-        embed.add_field(name="Игроки", value=f"**{len(self.queue)} из 10**", inline=False)
+        embed.add_field(name="Игроки", value=f"**{len(self.queue)} из {MAX_PLAYERS}**", inline=False)
         
         if self.queue:
             players = "\n".join([p.mention for p in self.queue])
             embed.add_field(name="В очереди", value=players, inline=False)
 
-        await interaction.message.edit(embed=embed, view=self)
-        await interaction.response.send_message(f"Ты зашёл в очередь ({len(self.queue)}/10)", ephemeral=True)
+        embed.add_field(name="Подключение", value=f"`connect {SERVER_IP}`", inline=False)
 
-@bot.tree.command(name="lobby", description="Создать очередь FreePick")
+        await interaction.message.edit(embed=embed, view=self)
+        await interaction.response.send_message(f"Ты зашёл в очередь ({len(self.queue)}/{MAX_PLAYERS})", ephemeral=True)
+
+        # Когда набралось нужное количество — кидаем кнопку
+        if len(self.queue) == MAX_PLAYERS:
+            connect_view = View()
+            connect_view.add_item(Button(label="Зайти на сервер", style=discord.ButtonStyle.green, url=CONNECT_LINK))
+            await interaction.channel.send("**Лобби готово!** Заходи на сервер:", view=connect_view)
+
+@bot.tree.command(name="lobby", description="Создать очередь FreePick (тест)")
 async def lobby(interaction: discord.Interaction):
     view = JoinView()
-    embed = discord.Embed(title="Очередь — FreePick", color=0x2b2d31)
+    embed = discord.Embed(title="Очередь — FreePick (тест)", color=0x2b2d31)
     embed.add_field(name="Настройки", value=(
         "**Формат:** 5x5 | BO1\n"
         "**Капитаны:** Доброволец\n"
         "**Карты:** Вето"
     ), inline=False)
-    embed.add_field(name="Игроки", value="**0 из 10**", inline=False)
+    embed.add_field(name="Игроки", value=f"**0 из {MAX_PLAYERS}**", inline=False)
+    embed.add_field(name="Подключение", value=f"`connect {SERVER_IP}`", inline=False)
     
     await interaction.response.send_message(embed=embed, view=view)
 
