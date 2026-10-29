@@ -2,7 +2,7 @@
 KZLP FreePick 5x5: очередь -> капитаны -> пики игроков -> вето карт -> запуск матча на CS2 (MatchZy).
 После драфта игроки получают доступ в войс своей команды (Team 1 / Team 2) и перемещаются туда.
 """
-print("▶ bot.py v5 загружается...", flush=True)
+print("▶ bot.py v7 загружается...", flush=True)
 import asyncio
 import json
 import logging
@@ -103,6 +103,7 @@ class State:
         self.matches: dict[int, dict] = {}
         self.team_access: list[tuple[int, int]] = []   # (id канала, id игрока) с выданным доступом
         self.active_ids: set[int] = set()              # игроки текущего драфта/матча
+        self.chat_msgs: list[discord.Message] = []     # сообщения драфта/матча, удаляются при сбросе
         self.lock = asyncio.Lock()
 
 
@@ -348,8 +349,45 @@ async def clear_voice_access():
     save_access()
 
 
+async def notify_players(teams, map_name: str, match_id: int):
+    """Личное сообщение каждому игроку: его команда и Steam-аккаунт, с которого нужно зайти."""
+    for n, team in enumerate(teams, 1):
+        for m in team:
+            sid = get_steam(m.id)
+            text = (
+                f"🎮 **Матч #{match_id}** ({pretty(map_name)}). Вы в **Team {n}**.\n"
+                f"Заходите на сервер **только с Steam-аккаунта, который привязан к вам**: "
+                f"https://steamcommunity.com/profiles/{sid}\n"
+                "Команда и сторона выдаются автоматически именно по этому аккаунту. "
+                "С другого аккаунта вы не попадёте в свою команду.\n"
+                f"Подключиться: {WEB_BASE_URL}/connect"
+            )
+            try:
+                await m.send(text)
+            except discord.HTTPException:
+                pass  # ЛС закрыты
+
+
+async def track_send(channel, *args, **kwargs) -> discord.Message:
+    """Отправляет сообщение и запоминает его, чтобы удалить при сбросе матча."""
+    msg = await channel.send(*args, **kwargs)
+    S.chat_msgs.append(msg)
+    return msg
+
+
+async def clear_chat():
+    """Удаляет сообщения драфта и матча из чата."""
+    msgs, S.chat_msgs = S.chat_msgs, []
+    for msg in msgs:
+        try:
+            await msg.delete()
+        except discord.HTTPException:
+            pass  # уже удалено или нет прав
+
+
 async def reset_to_queue():
     await clear_voice_access()
+    await clear_chat()
     async with S.lock:
         S.phase = "queue"
         S.queue.clear()
@@ -397,14 +435,14 @@ async def draft(channel, players):
     caps = players[:2]
     pool = players[2:]
     teams = [[caps[0]], [caps[1]]]
-    await channel.send(f"🎯 Набрано {NEED} игроков! Капитаны: {caps[0].mention} и {caps[1].mention}")
+    await track_send(channel, f"🎯 Набрано {NEED} игроков! Капитаны: {caps[0].mention} и {caps[1].mention}")
 
     # ---- пики игроков (по очереди) ----
     turn = 0
     while len(pool) > 1:
         cap = caps[turn]
         view = PickView(cap, pool)
-        msg = await channel.send(f"{cap.mention}, выберите игрока ({PICK_TIMEOUT} сек)", view=view)
+        msg = await track_send(channel, f"{cap.mention}, выберите игрока ({PICK_TIMEOUT} сек)", view=view)
         await view.wait()
         picked = view.picked or random.choice(pool)
         pool.remove(picked)
@@ -420,7 +458,8 @@ async def draft(channel, players):
         cap = caps[turn]
         view = VetoView(cap, maps)
         left = ", ".join(pretty(m) for m in maps)
-        msg = await channel.send(
+        msg = await track_send(
+            channel,
             f"🗺 {cap.mention}, забаньте карту ({PICK_TIMEOUT} сек)\nОсталось: {left}",
             view=view)
         await view.wait()
@@ -429,7 +468,7 @@ async def draft(channel, players):
         await msg.edit(content=f"❌ {cap.mention} забанил **{pretty(banned)}**", view=None)
         turn ^= 1
     map_name = maps[0]
-    await channel.send(f"✅ Выбрана карта: **{pretty(map_name)}**")
+    await track_send(channel, f"✅ Выбрана карта: **{pretty(map_name)}**")
     return teams, map_name
 
 
@@ -439,7 +478,7 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
         if TEST_MODE:
             teams = [players[:1], []]
             map_name = random.choice(MAPS)
-            await channel.send(f"🧪 Тестовый режим: {players[0].mention}, карта {pretty(map_name)}")
+            await track_send(channel, f"🧪 Тестовый режим: {players[0].mention}, карта {pretty(map_name)}")
         else:
             teams, map_name = await draft(channel, players)
 
@@ -461,10 +500,15 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
         for n, t in enumerate(teams, 1):
             e.add_field(name=f"Team {n}" + (f" ({t[0].display_name})" if t else ""),
                         value="\n".join(m.mention for m in t) or "—")
+        e.add_field(name="Важно",
+                    value="Заходите с **привязанного Steam-аккаунта**: команда выдаётся автоматически по SteamID. "
+                          "Подробности пришли вам в личные сообщения.",
+                    inline=False)
         e.add_field(name="Подключение (консоль CS2)", value=f"```{connect}```", inline=False)
         link_view = discord.ui.View()
         link_view.add_item(discord.ui.Button(label="Подключиться", url=f"{WEB_BASE_URL}/connect"))
-        await channel.send(embed=e, view=link_view)
+        await track_send(channel, embed=e, view=link_view)
+        asyncio.create_task(notify_players(teams, map_name, match_id))
 
         # ---- доступ в войсы Team 1 / Team 2 и перемещение ----
         if hasattr(channel, "guild") and channel.guild:
@@ -755,6 +799,19 @@ async def verify_setup_cmd(i: discord.Interaction):
     )
     await i.channel.send(embed=e, view=VerifyView())
     await i.response.send_message("Панель верификации отправлена.", ephemeral=True)
+
+
+@bot.tree.command(name="fp_steam", description="Показать, какой Steam-аккаунт привязан к вам")
+@app_commands.guild_only()
+async def fp_steam_cmd(i: discord.Interaction):
+    sid = get_steam(i.user.id)
+    if not sid:
+        return await i.response.send_message("У вас нет привязанного Steam. Нажмите «Верификация».", ephemeral=True)
+    await i.response.send_message(
+        f"Ваш Steam: `{sid}`\nhttps://steamcommunity.com/profiles/{sid}\n"
+        "В CS2 нужно заходить именно с этого аккаунта. Если это не тот аккаунт, нажмите «Отвязать Steam» "
+        "на панели верификации и привяжите нужный.",
+        ephemeral=True)
 
 
 @bot.tree.command(name="fp_link", description="(админ) Привязать SteamID64 игроку вручную")
