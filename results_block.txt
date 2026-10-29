@@ -1,0 +1,190 @@
+# ----------------------------- РЕЗУЛЬТАТЫ МАТЧА ----------------------
+RESULTS_CH = int(os.getenv("RESULTS_CHANNEL_ID", "1565444339084038314"))  # канал «результаты» (0 = канал панели очереди)
+DEMO_DIR = "demos"
+
+
+def _font(size: int):
+    for path in ("DejaVuSans-Bold.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                 "arialbd.ttf", "Arial.ttf"):
+        try:
+            return ImageFont.truetype(path, size)
+        except OSError:
+            continue
+    try:
+        return ImageFont.load_default(size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def parse_team(data: dict, n: int):
+    """Достаём счёт и статистику игроков из события MatchZy (формат читаем с запасом)."""
+    stats_t = data.get(f"stats_team{n}") or {}
+    base = data.get(f"team{n}") or {}
+    score = stats_t.get("score", base.get("score", base.get("series_score", 0)))
+    raw = stats_t.get("players") or base.get("players") or []
+    if isinstance(raw, dict):
+        raw = [{**(v if isinstance(v, dict) else {}), "steamid": k} for k, v in raw.items()]
+    players = []
+    for p in raw:
+        if not isinstance(p, dict):
+            continue
+        st = p.get("stats") if isinstance(p.get("stats"), dict) else p
+        players.append({
+            "steam": str(p.get("steamid") or p.get("steamid64") or ""),
+            "name": str(p.get("name") or "?"),
+            "k": int(st.get("kills", 0) or 0),
+            "d": int(st.get("deaths", 0) or 0),
+            "a": int(st.get("assists", 0) or 0),
+            "dmg": int(st.get("damage", 0) or 0),
+            "hs": int(st.get("headshot_kills", st.get("headshotkills", 0)) or 0),
+        })
+    try:
+        score = int(score or 0)
+    except (TypeError, ValueError):
+        score = 0
+    return score, players
+
+
+def render_image(map_name: str, s1: int, s2: int, t1: list, t2: list, mvp, avatar) -> bytes:
+    W, H = 900, 520
+    BLUE, GOLD = (86, 140, 255), (245, 184, 40)
+    img = Image.new("RGB", (W, H), (16, 17, 22))
+    d = ImageDraw.Draw(img)
+    f_big, f_mid, f_sm, f_xs = _font(52), _font(22), _font(17), _font(14)
+
+    def center(text, cx, y, font, fill):
+        w = d.textlength(text, font=font)
+        d.text((cx - w / 2, y), text, font=font, fill=fill)
+
+    def panel(x, title, color, players):
+        d.rounded_rectangle((x, 30, x + 330, 470), 14, fill=(27, 29, 38), outline=color, width=2)
+        d.rounded_rectangle((x + 55, 44, x + 275, 80), 8, outline=color, width=2)
+        center(title, x + 165, 50, f_mid, color)
+        y = 104
+        for p in players[:5]:
+            d.ellipse((x + 16, y + 5, x + 28, y + 17), fill=color)
+            d.text((x + 38, y), p["name"][:13], font=f_sm, fill=(235, 235, 235))
+            d.text((x + 170, y + 2), f'{p["k"]}-{p["d"]}', font=f_xs, fill=(190, 190, 200))
+            d.text((x + 225, y + 2), f'{p["adr"]:.2f}', font=f_xs, fill=(190, 190, 200))
+            d.text((x + 285, y + 2), f'{p["hs"]}%', font=f_xs, fill=(190, 190, 200))
+            y += 68
+
+    panel(20, "TEAM A", BLUE, t1)
+    panel(550, "TEAM B", GOLD, t2)
+
+    if avatar:
+        av = Image.open(io.BytesIO(avatar)).convert("RGB").resize((100, 100))
+        mask = Image.new("L", (100, 100), 0)
+        ImageDraw.Draw(mask).ellipse((0, 0, 99, 99), fill=255)
+        img.paste(av, (400, 55), mask)
+    else:
+        d.ellipse((400, 55, 500, 155), outline=GOLD, width=3)
+    center("MVP", 450, 170, f_big, GOLD)
+    if mvp:
+        center(mvp["name"][:14], 450, 238, f_sm, (235, 235, 235))
+    center(str(s1), 395, 295, f_big, BLUE)
+    center(str(s2), 505, 295, f_big, GOLD)
+    center(f"КАРТА: {map_name.replace('de_', '').upper()}", 450, 485, f_xs, (200, 200, 210))
+
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return buf.getvalue()
+
+
+def demo_view(match_id: int):
+    url = S.demos.get(match_id)
+    if not url:
+        return None
+    v = discord.ui.View()
+    v.add_item(discord.ui.Button(label="Скачать демку", url=url))
+    return v
+
+
+async def post_results(data: dict):
+    try:
+        mid = int(data.get("matchid") or 0)
+        cfg = S.matches.get(mid)
+        if not cfg or mid in S.reported:
+            return
+        S.reported.add(mid)
+        meta = S.meta.get(mid, {})
+        map_name = meta.get("map") or (cfg.get("maplist") or ["de_unknown"])[0]
+
+        s1, t1 = parse_team(data, 1)
+        s2, t2 = parse_team(data, 2)
+        names = {**cfg["team1"]["players"], **cfg["team2"]["players"]}
+        rounds = max(1, s1 + s2)
+        for p in t1 + t2:
+            p["name"] = names.get(p["steam"]) or p["name"]
+            p["adr"] = p["dmg"] / rounds
+        t1.sort(key=lambda p: p["k"], reverse=True)
+        t2.sort(key=lambda p: p["k"], reverse=True)
+
+        if s1 != s2:
+            win_n = 1 if s1 > s2 else 2
+        else:
+            win_n = 1 if str((data.get("winner") or {}).get("team", "team1")) == "team1" else 2
+        winner = cfg[f"team{win_n}"]["name"]
+        mvp = max(t1 + t2, key=lambda p: (p["k"], p["adr"]), default=None)
+
+        avatar = None
+        if mvp:
+            uid = (meta.get("discord") or {}).get(mvp["steam"])
+            user = bot.get_user(uid) if uid else None
+            if user:
+                try:
+                    avatar = await user.display_avatar.replace(size=128, format="png").read()
+                except discord.HTTPException:
+                    avatar = None
+
+        png = await asyncio.to_thread(render_image, map_name, s1, s2, t1, t2, mvp, avatar)
+
+        text = f"**Победитель:** 🏆 {winner} (Счёт: {max(s1, s2)} - {min(s1, s2)})"
+        if mvp:
+            hs_pct = round(100 * mvp["hs"] / mvp["k"]) if mvp["k"] else 0
+            text += (f"\n\n🏅 **MVP — {mvp['name']}** · {mvp['k']}/{mvp['d']}/{mvp['a']}"
+                     f" · {round(mvp['adr'])} ADR · {hs_pct}% HS")
+        e = discord.Embed(title=f"Match #{mid} — РЕЗУЛЬТАТЫ", description=text, color=0xE8D44D)
+        e.set_image(url="attachment://result.png")
+        e.set_footer(text=f"Карта: {map_name} · Сыграно раундов: {s1 + s2}")
+
+        ch = bot.get_channel(RESULTS_CH) if RESULTS_CH else (S.panel.channel if S.panel else None)
+        if not ch:
+            log.warning("Нет канала для результатов (RESULTS_CHANNEL_ID)")
+            return
+        msg = await ch.send(embed=e, file=discord.File(io.BytesIO(png), "result.png"), view=demo_view(mid))
+        S.result_msgs[mid] = msg
+    except Exception:
+        log.exception("Не удалось отправить результаты матча")
+
+
+async def h_demo_upload(req: web.Request):
+    """MatchZy присылает записанную демку POST-запросом."""
+    if req.headers.get("Authorization") != EVENT_TOKEN:
+        return web.Response(status=401)
+    try:
+        mid = int(req.headers.get("MatchZy-MatchId", "0"))
+    except ValueError:
+        mid = 0
+    name = re.sub(r"[^A-Za-z0-9_.-]", "_", os.path.basename(req.headers.get("MatchZy-FileName", f"{mid}.dem")))
+    os.makedirs(DEMO_DIR, exist_ok=True)
+    with open(os.path.join(DEMO_DIR, name), "wb") as f:
+        async for chunk in req.content.iter_chunked(1 << 20):
+            f.write(chunk)
+    S.demos[mid] = f"{WEB_BASE_URL}/demos/{name}"
+    msg = S.result_msgs.get(mid)
+    if msg:
+        try:
+            await msg.edit(view=demo_view(mid))
+        except discord.HTTPException:
+            log.exception("Не удалось добавить кнопку демки")
+    log.info("Демка сохранена: %s", name)
+    return web.Response(text="ok")
+
+
+async def h_demo_get(req: web.Request):
+    name = re.sub(r"[^A-Za-z0-9_.-]", "_", req.match_info["name"])
+    path = os.path.join(DEMO_DIR, name)
+    if not os.path.isfile(path):
+        return web.Response(status=404)
+    return web.FileResponse(path, headers={"Content-Disposition": f'attachment; filename="{name}"'})
