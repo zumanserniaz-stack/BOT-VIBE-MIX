@@ -6,6 +6,9 @@ import random
 import collections
 import discord
 import traceback
+from flask import Flask
+from threading import Thread
+import discord
 from discord import app_commands
 from discord.ext import commands
 from discord.ui import Button, View
@@ -28,19 +31,17 @@ def keep_alive():
 
 keep_alive()
 
+# ===== Discord Bot =====
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ================== ВСТАВЬ ID СВОЕГО СЕРВЕРА ==================
-GUILD_ID = 1548371779523837952  # замени на свой
-# =============================================================
-
+GUILD_ID = 123456789012345678  # замени
 SERVER_IP = "45.86.81.37:55031"
 CONNECT_LINK = f"steam://connect/{SERVER_IP}"
-MAX_PLAYERS = 1  # для проверки
+MAX_PLAYERS = 1
 
 class JoinView(View):
     def __init__(self):
