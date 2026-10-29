@@ -3,7 +3,7 @@ KZLP FreePick 5x5: очередь -> капитаны -> пики игроков
 После драфта игроки получают доступ в войс своей команды (Team 1 / Team 2) и перемещаются туда.
 Авто-старт: как только набралось нужное число игроков, драфт запускается сам.
 """
-print("▶ bot.py v18 загружается...", flush=True)
+print("▶ bot.py v19 загружается...", flush=True)
 import asyncio
 import io
 import json
@@ -797,6 +797,10 @@ async def clear_chat():
 
 
 async def reset_to_queue():
+    # если сервер не прислал результат (ручной сброс, таймер), всё равно пишем итог в канал результатов
+    if S.match_id and S.phase == "playing" and S.match_id not in posted_results:
+        await post_result({}, dict(S.match_players), S.match_id,
+                          note="ℹ️ Статистика с сервера не получена (матч завершён вручную или по таймеру).")
     await clear_voice_access()
     await clear_chat()
     await close_match_chat()
@@ -993,22 +997,38 @@ def find_results_channel():
     return None
 
 
-async def post_result(data: dict, players: dict, match_id):
-    """Публикует итог карты (счёт и статистику игроков) в канал результатов."""
+posted_results: set[int] = set()  # матчи, результат которых уже опубликован
+
+
+async def post_result(data: dict, players: dict, match_id, note: str = ""):
+    """Публикует итог матча в канал результатов. Работает и без статистики сервера
+    (тогда просто пишет составы и что матч завершён)."""
+    try:
+        mid = int(match_id)
+    except (TypeError, ValueError):
+        return
+    if mid in posted_results:
+        return
+    posted_results.add(mid)  # ставим сразу, чтобы результат не ушёл дважды
     ch = find_results_channel()
     if not ch:
         log.warning("Канал результатов не найден (задай RESULTS_CHANNEL_ID)")
+        posted_results.discard(mid)
         return
     t1, t2 = data.get("team1") or {}, data.get("team2") or {}
-    s1, s2 = t1.get("score", 0), t2.get("score", 0)
+    s1, s2 = t1.get("score"), t2.get("score")
     win = (data.get("winner") or {}).get("team")
-    winner = "Team 1" if win == "team1" else "Team 2" if win == "team2" else "ничья"
-    try:
-        map_name = pretty((S.matches.get(int(match_id)) or {}).get("maplist", ["?"])[0])
-    except (TypeError, ValueError):
-        map_name = "?"
-    e = discord.Embed(title=f"Результат матча #{match_id} — {map_name}", color=0x57F287)
-    e.description = f"**Team 1  {s1} : {s2}  Team 2**\n🏆 Победитель: **{winner}**"
+    map_name = pretty(((S.matches.get(mid) or {}).get("maplist") or ["?"])[0])
+
+    lines = []
+    if s1 is not None and s2 is not None:
+        lines.append(f"**Team 1  {s1} : {s2}  Team 2**")
+    if win in ("team1", "team2"):
+        lines.append("🏆 Победитель: **" + ("Team 1" if win == "team1" else "Team 2") + "**")
+    if note:
+        lines.append(note)
+    e = discord.Embed(title=f"Результат матча #{mid} — {map_name}", color=0x57F287)
+    e.description = "\n".join(lines) or "Матч завершён."
     for n, t in ((1, t1), (2, t2)):
         rows = []
         for p in t.get("players") or []:
@@ -1016,16 +1036,21 @@ async def post_result(data: dict, players: dict, match_id):
             info = players.get(str(p.get("steamid", "")))
             name = info[0].mention if info else p.get("name", "?")
             k, d, a = st.get("kills", 0), st.get("deaths", 0), st.get("assists", 0)
-            rounds = st.get("rounds_played") or (s1 + s2) or 1
+            rounds = st.get("rounds_played") or ((s1 or 0) + (s2 or 0)) or 1
             adr = round(st.get("damage", 0) / rounds)
             rows.append((k, f"{name}: **{k}/{d}/{a}** · ADR {adr}"))
         rows.sort(key=lambda r: -r[0])
-        e.add_field(name=f"Team {n} ({t.get('score', 0)})",
-                    value="\n".join(r[1] for r in rows) or "—", inline=False)
-    e.set_footer(text="K/D/A · ADR")
+        if not rows:  # статистики нет: показываем хотя бы состав команды
+            rows = [(0, m.mention) for m, tn in players.values() if tn == n]
+        title = f"Team {n}" + (f" ({t.get('score')})" if t.get("score") is not None else "")
+        e.add_field(name=title, value="\n".join(r[1] for r in rows) or "—", inline=False)
+    if any((t.get("players") for t in (t1, t2))):
+        e.set_footer(text="K/D/A · ADR")
     try:
         await ch.send(embed=e)
+        log.info("Результат матча %s опубликован в #%s", mid, ch.name)
     except discord.HTTPException:
+        posted_results.discard(mid)
         log.exception("Не удалось отправить результат (проверь права бота в канале результатов)")
 
 
