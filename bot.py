@@ -34,7 +34,7 @@ SERVER_PASSWORD = os.getenv("SERVER_PASSWORD", "")
 
 # Веб-сервер бота (его должен видеть CS2-сервер)
 WEB_PORT = int(os.getenv("PORT") or os.getenv("WEB_PORT", "55031"))
-WEB_BASE_URL = (os.getenv("WEB_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or "https://bot-vibe-mix.onrender.com").rstrip("/")
+WEB_BASE_URL = os.getenv("WEB_BASE_URL", "https://bot-vibe-mix.onrender.com").rstrip("/")
 EVENT_TOKEN = os.getenv("EVENT_TOKEN", "")  # секрет для событий MatchZy
 
 # ID твоего Discord-сервера: команды появятся мгновенно (необязательно)
@@ -243,6 +243,19 @@ def build_match(match_id: int, teams: list[list[discord.Member]], map_name: str)
     }
 
 
+def _rcon_run(c, cmd: str):
+    """Ответ CS2 иногда содержит не-UTF-8 байты: команда при этом уже выполнена, ошибку игнорируем."""
+    try:
+        return c.run(cmd, encoding="latin-1")
+    except TypeError:  # старая версия библиотеки без параметра encoding
+        try:
+            return c.run(cmd)
+        except UnicodeDecodeError:
+            return ""
+    except UnicodeDecodeError:
+        return ""
+
+
 def load_on_server(match_id: int):
     """Блокирующая функция: отправляет команды на CS2-сервер по RCON."""
     cmds = [
@@ -252,8 +265,10 @@ def load_on_server(match_id: int):
         f'matchzy_loadmatch_url "{WEB_BASE_URL}/match/{match_id}.json"',
     ]
     with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
+        _rcon_run(c, "get5_endmatch")  # сбросить прошлый матч, иначе MatchZy не загрузит новый
+        time.sleep(1)
         for cmd in cmds:
-            c.run(cmd)
+            _rcon_run(c, cmd)
 
 
 async def move_to_voice(guild: discord.Guild, teams):
