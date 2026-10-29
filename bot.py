@@ -3,7 +3,7 @@ KZLP FreePick 5x5: очередь -> капитаны -> пики игроков
 После драфта игроки получают доступ в войс своей команды (Team 1 / Team 2) и перемещаются туда.
 Авто-старт: как только набралось нужное число игроков, драфт запускается сам.
 """
-print("▶ bot.py v16 загружается...", flush=True)
+print("▶ bot.py v18 загружается...", flush=True)
 import asyncio
 import io
 import json
@@ -823,6 +823,8 @@ async def sync_queue():
     if not ch:
         return
     players = None
+    # куда писать, если панели нет (например, после обновления бота): в текстовый чат самого войса очереди
+    origin = S.panel.channel if S.panel else ch
     async with S.lock:
         if S.phase != "queue":
             return
@@ -832,13 +834,15 @@ async def sync_queue():
         keep = [m for m in S.queue if m.id in ids]
         kept = {m.id for m in keep}
         S.queue = keep + [m for m in present if m.id not in kept]
-        if len(S.queue) >= NEED and S.panel:
+        log.info("Очередь: %s из %s (в войсе %s)", len(S.queue), NEED, len(ch.members))
+        if len(S.queue) >= NEED:
             S.queue = S.queue[:NEED]
             S.phase = "draft"  # АВТО-СТАРТ: очередь полная
             players = list(S.queue)
     await refresh_panel()
     if players:
-        asyncio.create_task(run_match(S.panel.channel, players))
+        log.info("Авто-старт: набрано %s игроков", len(players))
+        asyncio.create_task(run_match(origin, players))
 
 
 async def watch_match(match_id: int):
@@ -1400,6 +1404,24 @@ async def endmatch_cmd(i: discord.Interaction):
     await i.followup.send("Очередь сброшена, доступы в войсы команд забраны.", ephemeral=True)
 
 
+async def find_panel():
+    """Если панель потерялась (стёрлась база), ищем в канале очереди сообщение бота с панелью."""
+    g = get_guild()
+    if not g:
+        return None
+    for ch in g.text_channels:
+        if "очередь" not in ch.name.lower():
+            continue
+        try:
+            async for m in ch.history(limit=30):
+                if (m.author.id == bot.user.id and m.embeds
+                        and (m.embeds[0].title or "").startswith("Очередь")):
+                    return m
+        except discord.HTTPException:
+            continue
+    return None
+
+
 @bot.event
 async def on_ready():
     log.info("Бот запущен как %s", bot.user)
@@ -1418,12 +1440,35 @@ async def on_ready():
             await refresh_panel()
         except discord.HTTPException:
             log.warning("Не удалось восстановить панель, отправьте /setup заново")
+    if not S.panel:
+        S.panel = await find_panel()
+        if S.panel:
+            kv_set("panel_channel", S.panel.channel.id)
+            kv_set("panel_message", S.panel.id)
+            await refresh_panel()
+            log.info("Панель найдена автоматически")
     await sync_queue()
 
 
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-    if not QUEUE_VC or member.bot:
+    if member.bot:
+        return
+
+    # Во время матча игрока, зашедшего в любой войс, сразу перекидываем в войс его команды
+    if after.channel and S.phase == "playing":
+        team_n = next((n for m, n in S.match_players.values() if m.id == member.id), None)
+        vc_id = (TEAM1_VC if team_n == 1 else TEAM2_VC) if team_n else 0
+        if vc_id and after.channel.id != vc_id:
+            target = member.guild.get_channel(vc_id)
+            if target:
+                try:
+                    await member.move_to(target, reason="FreePick: игрок матча")
+                except discord.HTTPException:
+                    log.exception("Не удалось переместить %s в войс команды", member)
+            return
+
+    if not QUEUE_VC:
         return
     was = bool(before.channel and before.channel.id == QUEUE_VC)
     now = bool(after.channel and after.channel.id == QUEUE_VC)
