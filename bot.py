@@ -5,7 +5,6 @@ import random
 import re
 import sqlite3
 import time
- 
 import discord
 from aiohttp import web
 from discord import app_commands
