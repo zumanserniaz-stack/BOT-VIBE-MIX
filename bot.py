@@ -1,8 +1,10 @@
 """
 KZLP FreePick 5x5: очередь -> капитаны -> пики игроков -> вето карт -> запуск матча на CS2 (MatchZy).
+После драфта игроки получают доступ в войс своей команды (Team 1 / Team 2) и перемещаются туда.
 """
-print("▶ bot.py v3 загружается...", flush=True)
+print("▶ bot.py v4 загружается...", flush=True)
 import asyncio
+import json
 import logging
 import os
 import random
@@ -29,8 +31,8 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("freepick")
 
 # ----------------------------- НАСТРОЙКИ -----------------------------
-# CS2-сервер
-SERVER_IP = os.getenv("SERVER_IP", " 45.86.81.37")
+# CS2-сервер (RCON_PASSWORD обязательно задай в Render -> Environment)
+SERVER_IP = os.getenv("SERVER_IP", "45.86.81.37").strip()
 SERVER_PORT = int(os.getenv("SERVER_PORT", "55031"))
 RCON_PASSWORD = os.getenv("RCON_PASSWORD", "ArniAlash22062008Nurlan")
 SERVER_PASSWORD = os.getenv("SERVER_PASSWORD", "")
@@ -99,10 +101,24 @@ class State:
         self.panel: discord.Message | None = None
         self.match_id: int | None = None
         self.matches: dict[int, dict] = {}
+        self.team_access: list[tuple[int, int]] = []   # (id канала, id игрока) с выданным доступом
         self.lock = asyncio.Lock()
 
 
 S = State()
+
+
+def save_access():
+    kv_set("team_access", json.dumps(S.team_access))
+
+
+def load_access():
+    raw = kv_get("team_access")
+    if raw:
+        try:
+            S.team_access = [tuple(x) for x in json.loads(raw)]
+        except (ValueError, TypeError):
+            S.team_access = []
 
 
 def pretty(map_name: str) -> str:
@@ -277,21 +293,62 @@ def load_on_server(match_id: int):
             _rcon_run(c, cmd)
 
 
+# ----------------------------- ВОЙСЫ КОМАНД --------------------------
 async def move_to_voice(guild: discord.Guild, teams):
+    """Выдаёт игрокам доступ в войс их команды (Team 1 / Team 2) и перекидывает их туда."""
+    await clear_voice_access()  # на случай, если остались доступы от прошлого матча
     for vc_id, team in ((TEAM1_VC, teams[0]), (TEAM2_VC, teams[1])):
         if not vc_id:
             continue
         ch = guild.get_channel(vc_id)
+        if not ch:
+            log.warning("Голосовой канал %s не найден", vc_id)
+            continue
         for m in team:
             member = guild.get_member(m.id)
-            if ch and member and member.voice:
+            if not member:
+                continue
+            # 1) доступ в канал
+            try:
+                await ch.set_permissions(member, view_channel=True, connect=True, speak=True,
+                                         reason="FreePick: игрок матча")
+                S.team_access.append((vc_id, member.id))
+            except discord.HTTPException:
+                log.exception("Не удалось выдать доступ %s в войс %s", member, vc_id)
+                continue
+            # 2) перекидываем, если он сейчас в любом войсе
+            if member.voice:
                 try:
                     await member.move_to(ch)
                 except discord.HTTPException:
-                    pass
+                    log.exception("Не удалось переместить %s", member)
+    save_access()
+
+
+async def clear_voice_access():
+    """Забирает доступ в командные войсы после матча."""
+    if not S.team_access:
+        return
+    for vc_id, member_id in list(S.team_access):
+        ch = bot.get_channel(vc_id)
+        if not ch:
+            continue
+        member = ch.guild.get_member(member_id)
+        if not member:
+            try:
+                member = await ch.guild.fetch_member(member_id)
+            except discord.HTTPException:
+                continue  # игрока уже нет на сервере
+        try:
+            await ch.set_permissions(member, overwrite=None, reason="FreePick: матч окончен")
+        except discord.HTTPException:
+            log.exception("Не удалось забрать доступ в войс")
+    S.team_access.clear()
+    save_access()
 
 
 async def reset_to_queue():
+    await clear_voice_access()
     async with S.lock:
         S.phase = "queue"
         S.queue.clear()
@@ -394,14 +451,15 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
         if SERVER_PASSWORD:
             connect += f"; password {SERVER_PASSWORD}"
         e = discord.Embed(title=f"Матч #{match_id} готов — {pretty(map_name)}", color=0x57F287)
-        for t in teams:
-            e.add_field(name=f"Команда {t[0].display_name if t else 'test'}",
+        for n, t in enumerate(teams, 1):
+            e.add_field(name=f"Team {n}" + (f" ({t[0].display_name})" if t else ""),
                         value="\n".join(m.mention for m in t) or "—")
         e.add_field(name="Подключение (консоль CS2)", value=f"```{connect}```", inline=False)
         link_view = discord.ui.View()
         link_view.add_item(discord.ui.Button(label="Подключиться", url=f"{WEB_BASE_URL}/connect"))
         await channel.send(embed=e, view=link_view)
 
+        # ---- доступ в войсы Team 1 / Team 2 и перемещение ----
         if hasattr(channel, "guild") and channel.guild:
             await move_to_voice(channel.guild, teams)
 
@@ -693,13 +751,18 @@ async def unban_cmd(i: discord.Interaction, member: discord.Member):
 @app_commands.default_permissions(administrator=True)
 @admin
 async def endmatch_cmd(i: discord.Interaction):
+    await i.response.defer(ephemeral=True)
     await reset_to_queue()
-    await i.response.send_message("Очередь сброшена.", ephemeral=True)
+    await i.followup.send("Очередь сброшена, доступы в войсы команд забраны.", ephemeral=True)
 
 
 @bot.event
 async def on_ready():
     log.info("Бот запущен как %s", bot.user)
+    load_access()
+    # Если бот перезапустился во время матча, а матча уже нет — снимаем старые доступы
+    if S.team_access and S.phase != "playing":
+        await clear_voice_access()
     # Восстанавливаем панель после перезапуска
     ch_id, msg_id = kv_get("panel_channel"), kv_get("panel_message")
     if ch_id and msg_id and not S.panel:
