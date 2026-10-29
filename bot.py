@@ -103,7 +103,34 @@ async def on_ready():
     print(f"Бот запущен: {bot.user}")
     guild = discord.Object(id=GUILD_ID)
     bot.tree.copy_global_to(guild=guild)
-    await bot.tree.sync(guild=guild)
+    await bot.tree.sync(guild=guild
+@bot.tree.command(name="createvc", description="Создать категорию FreePick с каналами")
+@app_commands.describe(number="Номер FreePick")
+@app_commands.default_permissions(administrator=True)
+async def createvc(interaction: discord.Interaction, number: int = 13):
+    # Создаём категорию
+    category = await interaction.guild.create_category(f"ПОИСК CS2 FreePick {number}")
+    
+    # Текстовый канал
+    await category.create_text_channel("⚡ · очередь-freepick")
+    
+    # Голосовые каналы
+    await category.create_voice_channel("FreePick", user_limit=10)
+    await category.create_voice_channel("Болталка FreePick")
+    
+    await interaction.response.send_message(
+        f"Создана категория **ПОИСК CS2 FreePick {number}**\n"
+        f"Каналы: текстовый + FreePick + Болталка",
+        ephemeral=True
+    )
+
+@bot.event
+async def on_ready():
+    print(f"Бот запущен: {bot.user}")
+    guild = discord.Object(id=GUILD_ID)
+    bot.tree.copy_global_to(guild=guild)
+    synced = await bot.tree.sync(guild=guild)
+    print(f"Синхронизировано {len(synced)} команд")
 # --------------------------------------------------
 # RUN BOT WITH SAFE TOKEN CHECK
 # --------------------------------------------------
