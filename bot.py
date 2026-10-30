@@ -2,10 +2,11 @@
 KZLP FreePick 5x5: очередь -> капитаны -> пики игроков -> вето карт -> запуск матча на CS2 (MatchZy).
 После драфта игроки получают доступ в войс своей команды (Team 1 / Team 2) и перемещаются туда.
 Авто-старт: как только набралось нужное число игроков, драфт запускается сам.
+Если во время драфта все игроки вышли из войса очереди, драфт отменяется и очередь сбрасывается.
 При Steam-верификации бот определяет FACEIT-уровень игрока и выдаёт роль «FACEIT LVL n».
 Результат матча: табло + MVP + ELO + кнопка «Скачать демо».
 """
-print("▶ bot.py v26 загружается...", flush=True)
+print("▶ bot.py v27 загружается...", flush=True)
 import asyncio
 import io
 import json
@@ -304,6 +305,8 @@ class State:
         self.break_task: asyncio.Task | None = None
         self.break_lock = asyncio.Lock()
         self.match_channel: discord.TextChannel | None = None   # отдельный чат матча
+        self.draft_task: asyncio.Task | None = None    # задача драфта (чтобы отменить, если все вышли из войса)
+        self.draft_check = False                       # идёт проверка «все ли вышли из войса»
         self.lock = asyncio.Lock()
 
 
@@ -900,6 +903,7 @@ async def reset_to_queue():
         S.queue.clear()
         S.match_id = None
         S.active_ids.clear()
+        S.draft_task = None
     await sync_queue()
     await refresh_panel()
 
@@ -932,6 +936,33 @@ async def sync_queue():
     if players:
         log.info("Авто-старт: набрано %s игроков", len(players))
         asyncio.create_task(run_match(origin, players))
+
+
+async def check_draft_empty():
+    """Во время драфта: если все игроки вышли из войса очереди, драфт отменяется и очередь сбрасывается."""
+    if S.draft_check:
+        return
+    S.draft_check = True
+    try:
+        await asyncio.sleep(5)  # даём шанс переподключиться
+        if S.phase != "draft" or not QUEUE_VC:
+            return
+        ch = bot.get_channel(QUEUE_VC)
+        if not ch or any(m.id in S.active_ids for m in ch.members):
+            return
+        log.warning("Все игроки вышли из войса очереди во время драфта: сброс")
+        task = S.draft_task
+        if task and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+        if S.panel:
+            try:
+                await S.panel.channel.send("⚠ Все игроки вышли из войса, драфт отменён. Очередь сброшена.",
+                                           delete_after=30)
+            except discord.HTTPException:
+                pass
+        await reset_to_queue()
+    finally:
+        S.draft_check = False
 
 
 async def watch_match(match_id: int):
@@ -1010,6 +1041,7 @@ async def draft(channel, players):
 
 async def run_match(channel: discord.abc.Messageable, players: list[discord.Member]):
     origin = channel  # общий канал очереди: туда пишем ошибки
+    S.draft_task = asyncio.current_task()  # чтобы драфт можно было отменить, если все вышли из войса
     try:
         S.active_ids = {m.id for m in players}
         chat = await open_match_chat(channel, players)
@@ -2284,6 +2316,9 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     now = bool(after.channel and after.channel.id == QUEUE_VC)
     if was == now:
         return
+    # Во время драфта: если все игроки вышли из войса очереди, драфт отменяется (проверка с задержкой)
+    if was and not now and S.phase == "draft":
+        asyncio.create_task(check_draft_empty())
     if now:
         err = None
         if is_banned(member.id):
