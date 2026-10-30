@@ -6,7 +6,7 @@ KZLP FreePick 5x5: очередь -> капитаны -> пики игроков
 При Steam-верификации бот определяет FACEIT-уровень игрока и выдаёт роль «FACEIT LVL n».
 Результат матча: табло + MVP + ELO + кнопка «Скачать демо».
 """
-print("▶ bot.py v27 загружается...", flush=True)
+print("▶ bot.py v28 загружается...", flush=True)
 import asyncio
 import io
 import json
