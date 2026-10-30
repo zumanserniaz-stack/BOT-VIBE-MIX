@@ -1,12 +1,12 @@
 """
-KZLP FreePick 5x5: очередь -> готовность -> капитаны -> пики игроков -> вето карт -> запуск матча на CS2 (MatchZy).
+VIBE FreePick 5x5: очередь -> готовность -> капитаны -> пики игроков -> вето карт -> запуск матча на CS2 (MatchZy).
 После драфта бот САМ создаёт войсы Team 1 / Team 2 и перекидывает туда игроков (после матча войсы удаляются).
 Авто-старт матча: как только все игроки зашли на сервер, матч стартует сам; иначе после разминки (4 мин).
 Если во время драфта все игроки вышли из войса очереди, драфт отменяется и очередь сбрасывается.
 При Steam-верификации бот определяет FACEIT-уровень игрока и выдаёт роль «FACEIT LVL n».
 Результат матча: табло + MVP + ELO (+30 / -20) + кнопка «Скачать демо».
 """
-print("▶ bot.py v29 загружается...", flush=True)
+print("▶ bot.py v30 загружается...", flush=True)
 import asyncio
 import io
 import json
@@ -39,7 +39,7 @@ log = logging.getLogger("freepick")
 # CS2-сервер (RCON_PASSWORD обязательно задай в Render -> Environment)
 SERVER_IP = os.getenv("SERVER_IP", "45.86.81.37").strip()
 SERVER_PORT = int(os.getenv("SERVER_PORT", "55031"))
-RCON_PASSWORD = os.getenv("RCON_PASSWORD", "ArniAlash22062008Nurlan")
+RCON_PASSWORD = os.getenv("RCON_PASSWORD", "")
 SERVER_PASSWORD = os.getenv("SERVER_PASSWORD", "")
 
 # Веб-сервер бота (его должен видеть CS2-сервер)
@@ -58,9 +58,9 @@ VERIFIED_ROLE = int(os.getenv("VERIFIED_ROLE_ID", "1565117832251965653"))
 
 # FACEIT: ключ с https://developers.faceit.com (Server side API key). Пусто = FACEIT-роли выключены.
 # Ключ задаётся ТОЛЬКО в Render -> Environment (FACEIT_API_KEY), в коде его не храним.
-FACEIT_API_KEY = os.getenv("FACEIT_API_KEY", "590b7ce5-2812-4f48-9628-938aff17dff2").strip()
+FACEIT_API_KEY = os.getenv("FACEIT_API_KEY", "").strip()
 # 1 = стартовый ELO в FreePick берётся из FACEIT ELO (только для тех, у кого ещё нет рейтинга)
-FACEIT_START_ELO = os.getenv("FACEIT_START_ELO", "1:1548371779523837955,2:1548371779523837956,3:1548371779523837957,4;1548371779523837958,5:1548371779523837959,6:1548371779523837960,7:1548371779523837961,8:1548371779528040610,9:1548371779528040611,10:1548371779528040612") == "1"
+FACEIT_START_ELO = os.getenv("FACEIT_START_ELO", "0") == "1"
 
 TEST_MODE = os.getenv("TEST_MODE", "0") == "1"  # 1 = тест: хватает одного игрока, без драфта
 TEAM_SIZE = 1 if TEST_MODE else 5
@@ -75,7 +75,7 @@ BREAK_SECONDS = int(os.getenv("BREAK_SECONDS", "300"))  # сколько ждё�
 AUTO_START = os.getenv("AUTO_START", "1") == "1"            # 0 = выключить автостарт
 AUTO_START_DELAY = int(os.getenv("AUTO_START_DELAY", "15"))  # сек. ждём, пока все прогрузятся
 WARMUP_SECONDS = int(os.getenv("WARMUP_SECONDS", "240"))     # разминка 4 минуты, потом матч стартует принудительно
-CHAT_PREFIX = os.getenv("CHAT_PREFIX", "[{Green}KZLP{Default}] ")
+CHAT_PREFIX = os.getenv("CHAT_PREFIX", "[{PURPLE}VIBE MIX{Default}] ")
 
 # Канал для результатов матчей (0 = бот сам найдёт канал, в названии которого есть "результаты")
 RESULTS_CHANNEL = int(os.getenv("RESULTS_CHANNEL_ID", "1565444339084038314"))
@@ -317,6 +317,7 @@ class State:
 
 
 S = State()
+snapshots: dict[int, dict] = {}  # match_id -> {steamid64: (игрок, команда)}: чтобы результат пришёл даже после сброса
 
 
 def save_access():
@@ -541,19 +542,41 @@ def next_match_no() -> int:
     return n
 
 
-def draft_embed(no: int, teams, pool, cap=None, done: bool = False) -> discord.Embed:
+def draft_embed(no: int, teams, pool, cap=None, done: bool = False, last: str = "") -> discord.Embed:
     """Табло драфта: две команды + свободные игроки."""
     e = discord.Embed(title=f"Очередь — FreePick #{no}", color=0x2B2D31)
     if done:
-        e.description = "✅ Драфт завершён."
+        e.description = "# Драфт завершён\nКоманды собраны."
     elif cap:
-        e.description = f"Ход капитана {cap.mention} — выберите игрока кнопками ниже."
+        e.description = (f"# Выбор игроков\nХод капитана {cap.mention}: "
+                         f"выберите игрока кнопками ниже ({PICK_TIMEOUT} сек).")
     for t in teams:
         lines = [f"`{n:02d}` {m.mention}" for n, m in enumerate(t, 1)]
         e.add_field(name=f"team_{t[0].display_name}"[:256], value="\n".join(lines), inline=True)
     if pool:
         free = [f"`{n:02d}` {m.mention}" for n, m in enumerate(pool, 1)]
         e.add_field(name=f"Свободные игроки: {len(pool)}", value="\n".join(free), inline=False)
+    if last:
+        e.set_footer(text=last)
+    return e
+
+
+def veto_embed(no: int, maps: list, banned: list, cap=None, final: str = "", last: str = "") -> discord.Embed:
+    """Табло вето карт в том же стиле, что и очередь: нумерованный список + последнее действие внизу."""
+    e = discord.Embed(title=f"Очередь — FreePick #{no}", color=0x2B2D31)
+    if final:
+        e.description = f"# Карта выбрана\nИграем на **{pretty(final)}**."
+    else:
+        e.description = (f"# Вето карт\nХод капитана {cap.mention}: "
+                         f"забаньте карту кнопками ниже ({PICK_TIMEOUT} сек).")
+    e.add_field(name=f"Доступные карты: {len(maps)}",
+                value="\n".join(f"`{n:02d}` {pretty(m)}" for n, m in enumerate(maps, 1)), inline=True)
+    if banned:
+        e.add_field(name=f"Забанены: {len(banned)}",
+                    value="\n".join(f"`{n:02d}` ~~{pretty(m)}~~ · {c.display_name}"
+                                    for n, (m, c) in enumerate(banned, 1))[:1024], inline=True)
+    if last:
+        e.set_footer(text=last)
     return e
 
 
@@ -615,7 +638,7 @@ def build_match(match_id: int, teams: list[list[discord.Member]], map_name: str)
         "clinch_series": True,
         "team1": team(teams[0]),
         "team2": team(teams[1]),
-        "cvars": {"hostname": "KZLP FreePick"},
+        "cvars": {"hostname": "VIBE MIX FreePick"},
     }
 
 
@@ -681,6 +704,19 @@ def rcon_force_start() -> str:
     """Блокирующая функция: принудительный старт матча MatchZy (как админская команда .start)."""
     with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
         return _rcon_run(c, "css_start") or ""
+
+
+def rcon_force_ready() -> str:
+    """Запасной вариант старта: все игроки сразу «готовы» (как .forceready)."""
+    with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
+        return _rcon_run(c, "css_forceready") or ""
+
+
+def rcon_players() -> set:
+    """Блокирующая функция: SteamID64 всех игроков, которые сейчас на сервере (по команде status)."""
+    with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
+        resp = _rcon_run(c, "status") or ""
+    return {str(76561197960265728 + int(a)) for a in re.findall(r"\[U:1:(\d+)\]", resp)}
 
 
 # ----------------------------- ВОЙСЫ КОМАНД --------------------------
@@ -939,6 +975,10 @@ async def force_start(match_id: int, reason: str):
             return
         resp = await asyncio.to_thread(rcon_force_start)
         log.info("Автостарт матча %s, ответ сервера: %r", match_id, resp[:200])
+        await asyncio.sleep(6)
+        if await asyncio.to_thread(rcon_gamestate) == "warmup":  # css_start не сработал: пробуем forceready
+            resp = await asyncio.to_thread(rcon_force_ready)
+            log.info("Автостарт (forceready) матча %s, ответ сервера: %r", match_id, resp[:200])
     except Exception:
         S.auto_started = False
         log.exception("Не удалось автоматически стартовать матч")
@@ -960,13 +1000,33 @@ async def track_connect(data: dict):
 
 
 async def warmup_timer(match_id: int):
-    """Разминка WARMUP_SECONDS (4 мин): потом матч стартует принудительно, если на сервере кто-то есть."""
-    await asyncio.sleep(WARMUP_SECONDS)
+    """Каждые 5 сек спрашивает у сервера (RCON status), кто на нём сидит, и не зависит от событий MatchZy.
+    Все игроки на сервере -> старт через AUTO_START_DELAY. Иначе через WARMUP_SECONDS после первого входа."""
+    t0 = None          # когда зашёл первый игрок
+    full_since = None  # когда на сервере стали все
     while S.phase == "playing" and S.match_id == match_id and not S.live and not S.auto_started:
-        if S.connected:  # хотя бы один игрок на сервере
+        await asyncio.sleep(5)
+        try:
+            present = await asyncio.to_thread(rcon_players)
+        except Exception:
+            log.warning("Не удалось получить список игроков сервера (RCON status)")
+            continue
+        S.connected = {sid for sid in S.match_players if sid in present}
+        need = len(S.match_players)
+        if S.connected and t0 is None:
+            t0 = time.time()
+        if AUTO_START and need and len(S.connected) >= need:
+            if full_since is None:
+                full_since = time.time()
+                log.info("Все %s игроков на сервере, старт через %s сек", need, AUTO_START_DELAY)
+            elif time.time() - full_since >= AUTO_START_DELAY:
+                await force_start(match_id, "Все игроки на сервере")
+                return
+        else:
+            full_since = None
+        if t0 and time.time() - t0 >= WARMUP_SECONDS:
             await force_start(match_id, "Разминка закончилась")
             return
-        await asyncio.sleep(30)
 
 
 async def break_timer():
@@ -1173,10 +1233,11 @@ async def draft(channel, players):
     # ---- пики игроков: одно сообщение, которое обновляется после каждого выбора ----
     turn = 0
     msg = None
+    last = ""
     while len(pool) > 1:
         cap = caps[turn]
         view = PickView(cap, pool)
-        emb = draft_embed(no, teams, pool, cap)
+        emb = draft_embed(no, teams, pool, cap, last=last)
         if msg is None:
             msg = await track_send(channel, embed=emb, view=view)
         else:
@@ -1185,28 +1246,33 @@ async def draft(channel, players):
         picked = view.picked or random.choice(pool)  # не успел: случайный игрок
         pool.remove(picked)
         teams[turn].append(picked)
+        last = f"{cap.display_name} выбрал {picked.display_name}"
         turn ^= 1
     teams[turn].append(pool[0])  # последний игрок достаётся автоматически
-    await msg.edit(embed=draft_embed(no, teams, [], done=True), view=None)
+    await msg.edit(embed=draft_embed(no, teams, [], done=True, last=last), view=None)
 
-    # ---- вето карт ----
+    # ---- вето карт: одно сообщение в стиле очереди, обновляется после каждого бана ----
     maps = MAPS.copy()
+    banned_list = []
     turn = 0
+    vmsg = None
+    last = ""
     while len(maps) > 1:
         cap = caps[turn]
         view = VetoView(cap, maps)
-        left = ", ".join(pretty(m) for m in maps)
-        vmsg = await track_send(
-            channel,
-            f"🗺 {cap.mention}, забаньте карту ({PICK_TIMEOUT} сек)\nОсталось: {left}",
-            view=view)
+        emb = veto_embed(no, maps, banned_list, cap, last=last)
+        if vmsg is None:
+            vmsg = await track_send(channel, embed=emb, view=view)
+        else:
+            await vmsg.edit(embed=emb, view=view)
         await view.wait()
         banned = view.banned or random.choice(maps)
         maps.remove(banned)
-        await vmsg.edit(content=f"❌ {cap.mention} забанил **{pretty(banned)}**", view=None)
+        banned_list.append((banned, cap))
+        last = f"{cap.display_name} забанил карту {pretty(banned)}"
         turn ^= 1
     map_name = maps[0]
-    await track_send(channel, f"✅ Выбрана карта: **{pretty(map_name)}**")
+    await vmsg.edit(embed=veto_embed(no, maps, banned_list, final=map_name, last=last), view=None)
     return teams, map_name
 
 
@@ -1236,6 +1302,7 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
         S.matches[match_id] = build_match(match_id, teams, map_name)
         S.match_players = {get_steam(m.id): (m, n) for n, t in enumerate(teams, 1) for m in t}
         S.captain_ids = {t[0].id for t in teams if t}
+        snapshots[match_id] = dict(S.match_players)
         S.live = False
         S.match_id = match_id
         S.connected = set()
@@ -1395,10 +1462,14 @@ def render_result_card(map_name: str, s1, s2, team_rows: dict, mvp: dict,
             cy = y + 34
             d.ellipse((x0 + 22, cy - 8, x0 + 38, cy + 8), fill=col)
             d.text((x0 + 52, cy), fit(r["name"], f_name, 205), font=f_name, fill=white, anchor="lm")
-            kd = r["k"] / r["d"] if r["d"] else float(r["k"])
-            d.text((x0 + PW - 150, cy), f"{r['k']}-{r['d']}", font=f_stat, fill=gray, anchor="rm")
-            d.text((x0 + PW - 85, cy), f"{kd:.2f}", font=f_stat, fill=gray, anchor="rm")
-            d.text((x0 + PW - 20, cy), f"{r['hs']}%", font=f_stat, fill=gray, anchor="rm")
+            if mvp is None:  # статистики нет: прочерки
+                for dx in (150, 85, 20):
+                    d.text((x0 + PW - dx, cy), "–", font=f_stat, fill=gray, anchor="rm")
+            else:
+                kd = r["k"] / r["d"] if r["d"] else float(r["k"])
+                d.text((x0 + PW - 150, cy), f"{r['k']}-{r['d']}", font=f_stat, fill=gray, anchor="rm")
+                d.text((x0 + PW - 85, cy), f"{kd:.2f}", font=f_stat, fill=gray, anchor="rm")
+                d.text((x0 + PW - 20, cy), f"{r['hs']}%", font=f_stat, fill=gray, anchor="rm")
             d.line((x0 + 18, y + 71, x0 + PW - 18, y + 71), fill=(60, 70, 96), width=1)
             y += 76
 
@@ -1416,18 +1487,18 @@ def render_result_card(map_name: str, s1, s2, team_rows: dict, mvp: dict,
             av = None
     if av is None:
         av = Image.new("RGBA", (2 * R, 2 * R), (40, 48, 72, 255))
-        ImageDraw.Draw(av).text((R, R), (mvp["name"][:1] or "?").upper(), font=get_font(70), fill=white, anchor="mm")
+        ImageDraw.Draw(av).text((R, R), ((mvp["name"][:1] if mvp else "") or "?").upper(), font=get_font(70), fill=white, anchor="mm")
     mask = Image.new("L", (2 * R, 2 * R), 0)
     ImageDraw.Draw(mask).ellipse((0, 0, 2 * R - 1, 2 * R - 1), fill=255)
     ring.paste(av, (6, 6), mask)
     img.alpha_composite(ring, (cx - R - 6, 62))
     d = ImageDraw.Draw(img)
-    d.text((cx, 258), "MVP", font=get_font(50), fill=GOLD, anchor="mm")
-    d.text((cx, 304), fit(mvp["name"], get_font(24), 250), font=get_font(24), fill=white, anchor="mm")
+    d.text((cx, 258), "MVP" if mvp else "ИТОГ", font=get_font(50), fill=GOLD, anchor="mm")
+    d.text((cx, 304), fit(mvp["name"] if mvp else "Матч завершён", get_font(24), 250), font=get_font(24), fill=white, anchor="mm")
     f_score = get_font(72)
-    d.text((cx - 78, 380), str(s1), font=f_score, fill=BLUE, anchor="mm")
+    d.text((cx - 78, 380), str(s1) if s1 is not None else "–", font=f_score, fill=BLUE, anchor="mm")
     d.text((cx, 380), "–", font=get_font(40), fill=gray, anchor="mm")
-    d.text((cx + 78, 380), str(s2), font=f_score, fill=ORANGE, anchor="mm")
+    d.text((cx + 78, 380), str(s2) if s2 is not None else "–", font=f_score, fill=ORANGE, anchor="mm")
     d.text((cx, 462), f"КАРТА: {map_name.replace('de_', '').upper()}", font=get_font(24), fill=gray, anchor="mm")
 
     out = io.BytesIO()
@@ -1459,7 +1530,7 @@ result_msgs: dict[int, discord.Message] = {}   # match_id -> сообщение 
 
 def demo_view(url: str) -> discord.ui.View:
     v = discord.ui.View()
-    v.add_item(discord.ui.Button(label="Скачать демо", emoji="⬇️", url=url))
+    v.add_item(discord.ui.Button(label="Скачать демку", emoji="⬇️", url=url))
     return v
 
 
@@ -1547,22 +1618,35 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
                 pass
         try:
             card = await asyncio.to_thread(render_result_card, raw_map, s1 or 0, s2 or 0,
-                                           team_rows, mvp, avatar, ("TEAM 1", "TEAM 2"))
+                                           team_rows, mvp, avatar, ("TEAM A", "TEAM B"))
         except Exception:
             log.exception("Не удалось нарисовать карточку (установлен ли Pillow?)")
 
-    if card and mvp:
+    if not all_rows:  # статистики нет (матч завершён вручную): всё равно рисуем табло, но только с составами
+        fb = {n: [{"name": m.display_name, "member": m, "k": 0, "d": 0, "a": 0, "adr": 0, "hs": 0}
+                  for m, tn in players.values() if tn == n] for n in (1, 2)}
+        if fb[1] or fb[2]:
+            try:
+                card = await asyncio.to_thread(render_result_card, raw_map, s1, s2, fb, None, None,
+                                               ("TEAM A", "TEAM B"))
+            except Exception:
+                log.exception("Не удалось нарисовать карточку (установлен ли Pillow?)")
+
+    if card:
         names = [(cfg.get(f"team{n}") or {}).get("name", f"Team {n}") for n in (1, 2)]
         lines = []
         if win in ("team1", "team2"):
             wn = 1 if win == "team1" else 2
             ws, ls = (s1, s2) if wn == 1 else (s2, s1)
-            lines.append(f"**Победитель:** 🏆 {names[wn - 1]} (Счёт: {ws}-{ls})")
+            lines.append(f"**Победитель:** 🏆 {names[wn - 1]} (Счёт: {ws} - {ls})")
         elif s1 is not None and s2 is not None:
-            lines.append(f"**Матч завершён** (Счёт: {s1}-{s2})")
-        lines.append("")
-        lines.append(f"🏅 **MVP — {mvp['name']}** · {mvp['k']}/{mvp['d']}/{mvp['a']} · "
-                     f"{mvp['adr']} ADR · {mvp['hs']}% HS")
+            lines.append(f"**Матч завершён** (Счёт: {s1} - {s2})")
+        if not lines:
+            lines.append("**Матч завершён**")
+        if mvp:
+            lines.append("")
+            lines.append(f"🏅 **MVP — {mvp['name']}** · {mvp['k']}/{mvp['d']}/{mvp['a']} · "
+                         f"{mvp['adr']} ADR · {mvp['hs']}% HS")
         e = discord.Embed(title=f"Match #{mid} — РЕЗУЛЬТАТЫ", description="\n".join(lines), color=0xF1C40F)
         e.set_image(url="attachment://result.png")
         if changes:
@@ -1773,7 +1857,7 @@ async def ban_expiry_loop():
 
 # ---- страница со списком банов (/bans)
 BANS_PAGE = """<!doctype html><html lang="ru"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Список наказаний — KZLP FreePick</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Список наказаний — VIBE MIX FreePick</title>
 <style>
 :root{color-scheme:dark}*{box-sizing:border-box}
 body{margin:0;min-height:100vh;font-family:Inter,system-ui,"Segoe UI",Roboto,Arial,sans-serif;color:#e8e6f2;
@@ -1911,10 +1995,18 @@ async def h_events(req: web.Request):
         asyncio.create_task(reset_to_queue())
     elif same and ev == "going_live":
         S.live = True            # матч пошёл (после ножей): теперь выход игрока = перерыв
-    elif same and ev == "map_result":
-        S.live = False           # карта закончилась: выходы игроков больше не считаем
-        # снимок игроков берём сразу: series_end может сбросить матч раньше, чем отправится результат
-        asyncio.create_task(post_result(data, dict(S.match_players), S.match_id))
+    elif ev == "map_result":
+        if same:
+            S.live = False       # карта закончилась: выходы игроков больше не считаем
+        try:
+            mid = int(data.get("matchid"))
+        except (TypeError, ValueError):
+            mid = None
+        snap = snapshots.get(mid)  # снимок игроков сохранён при старте: результат придёт, даже если матч уже сброшен
+        if snap and mid not in posted_results:
+            asyncio.create_task(post_result(data, dict(snap), mid))
+        else:
+            log.warning("map_result для матча %s: нет снимка игроков или результат уже опубликован", mid)
     elif same and ev == "player_connect":
         asyncio.create_task(handle_connect(data))
         asyncio.create_task(track_connect(data))
