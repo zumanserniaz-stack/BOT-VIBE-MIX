@@ -1,12 +1,12 @@
 """
-VIBE FreePick 5x5: очередь -> готовность -> капитаны -> пики игроков -> вето карт -> запуск матча на CS2 (MatchZy).
+VIBE MIX FreePick 5x5: очередь -> готовность -> капитаны -> пики игроков -> вето карт -> запуск матча на CS2 (MatchZy).
 После драфта бот САМ создаёт войсы Team 1 / Team 2 и перекидывает туда игроков (после матча войсы удаляются).
 Авто-старт матча: как только все игроки зашли на сервер, матч стартует сам; иначе после разминки (4 мин).
 Если во время драфта все игроки вышли из войса очереди, драфт отменяется и очередь сбрасывается.
 При Steam-верификации бот определяет FACEIT-уровень игрока и выдаёт роль «FACEIT LVL n».
 Результат матча: табло + MVP + ELO (+30 / -20) + кнопка «Скачать демо».
 """
-print("▶ bot.py v30 загружается...", flush=True)
+print("▶ bot.py v31 загружается...", flush=True)
 import asyncio
 import io
 import json
@@ -58,9 +58,9 @@ VERIFIED_ROLE = int(os.getenv("VERIFIED_ROLE_ID", "1565117832251965653"))
 
 # FACEIT: ключ с https://developers.faceit.com (Server side API key). Пусто = FACEIT-роли выключены.
 # Ключ задаётся ТОЛЬКО в Render -> Environment (FACEIT_API_KEY), в коде его не храним.
-FACEIT_API_KEY = os.getenv("FACEIT_API_KEY", "590b7ce5-2812-4f48-9628-938aff17dff2").strip()
+FACEIT_API_KEY = os.getenv("FACEIT_API_KEY", "").strip()
 # 1 = стартовый ELO в FreePick берётся из FACEIT ELO (только для тех, у кого ещё нет рейтинга)
-FACEIT_START_ELO = os.getenv("FACEIT_START_ELO", "1:1548371779523837955,2:1548371779523837956,3:1548371779523837957,4;1548371779523837958,5:1548371779523837959,6:1548371779523837960,7:1548371779523837961,8:1548371779528040610,9:1548371779528040611,10:1548371779528040612") == "1"
+FACEIT_START_ELO = os.getenv("FACEIT_START_ELO", "0") == "1"
 
 TEST_MODE = os.getenv("TEST_MODE", "0") == "1"  # 1 = тест: хватает одного игрока, без драфта
 TEAM_SIZE = 1 if TEST_MODE else 5
@@ -90,7 +90,7 @@ DB_PATH = os.getenv("DB_PATH", "freepick.db")
 DEMO_DIR = os.getenv("DEMO_DIR", "demos")
 
 MAPS = ["de_anubis", "de_mirage", "de_inferno", "de_nuke",
-        "de_ancient", "de_dust2", "de_overpass"]
+        "de_ancient", "de_dust2", "de_overpass", "de_cache"]
 
 # ----------------------------- БАЗА ДАННЫХ ---------------------------
 db = sqlite3.connect(DB_PATH)
@@ -721,9 +721,25 @@ def rcon_players() -> set:
 
 # ----------------------------- ВОЙСЫ КОМАНД --------------------------
 async def move_to_voice(guild: discord.Guild, teams):
-    """Создаёт войсы Team 1 / Team 2 только для игроков матча и перекидывает их туда."""
+    """Создаёт категорию «VIBE — team_A VS team_B» с двумя войсами (по одному на команду) и перекидывает туда игроков."""
     await clear_voice_access()  # на случай, если остались войсы от прошлого матча
-    category = S.panel.channel.category if S.panel else None
+    names = [f"team_{t[0].display_name}" if t else f"team_{n}" for n, t in enumerate(teams, 1)]
+    cat_name = f"VIBE — {names[0]} VS {names[1]}"[:100]
+    base_cat = S.panel.channel.category if S.panel else None
+    category = None
+    try:
+        category = await guild.create_category(
+            cat_name,
+            overwrites={
+                guild.default_role: discord.PermissionOverwrite(view_channel=False, connect=False),
+                guild.me: discord.PermissionOverwrite(view_channel=True, connect=True,
+                                                      move_members=True, manage_channels=True),
+            },
+            reason="FreePick: категория матча")
+        S.team_vcs[0] = category.id  # ключ 0 = категория
+        save_access()
+    except discord.HTTPException:
+        log.exception("Не удалось создать категорию матча (нужно право Manage Channels)")
     for n, team in enumerate(teams, 1):
         if not team:
             continue
@@ -737,7 +753,8 @@ async def move_to_voice(guild: discord.Guild, teams):
             if mem:
                 ow[mem] = discord.PermissionOverwrite(view_channel=True, connect=True, speak=True)
         try:
-            ch = await guild.create_voice_channel(f"Team {n}", overwrites=ow, category=category,
+            ch = await guild.create_voice_channel(names[n - 1][:100], overwrites=ow,
+                                                  category=category or base_cat,
                                                   reason="FreePick: войс команды")
         except discord.HTTPException:
             log.exception("Не удалось создать войс Team %s (нужны права Manage Channels и Move Members)", n)
@@ -755,16 +772,17 @@ async def move_to_voice(guild: discord.Guild, teams):
 
 
 async def clear_voice_access():
-    """После матча удаляет временные войсы (игроков из них возвращает в войс очереди)."""
+    """После матча удаляет войсы и категорию (игроков из войсов возвращает в войс очереди)."""
     if not S.team_vcs:
         return
-    vcs, S.team_vcs = list(S.team_vcs.values()), {}  # обнуляем сразу, чтобы on_voice_state_update не гнал игроков обратно
+    vcs, S.team_vcs = dict(S.team_vcs), {}  # обнуляем сразу, чтобы on_voice_state_update не гнал игроков обратно
     queue_ch = bot.get_channel(QUEUE_VC) if QUEUE_VC else None
-    for cid in vcs:
+    order = [v for k, v in vcs.items() if k != 0] + ([vcs[0]] if 0 in vcs else [])  # категория удаляется последней
+    for cid in order:
         ch = bot.get_channel(cid)
         if not ch:
             continue
-        if queue_ch:
+        if queue_ch and isinstance(ch, discord.VoiceChannel):
             for m in list(ch.members):
                 try:
                     await m.move_to(queue_ch)
@@ -773,7 +791,7 @@ async def clear_voice_access():
         try:
             await ch.delete(reason="FreePick: матч окончен")
         except discord.HTTPException:
-            log.exception("Не удалось удалить войс команды")
+            log.exception("Не удалось удалить войс/категорию матча")
     save_access()
 
 
