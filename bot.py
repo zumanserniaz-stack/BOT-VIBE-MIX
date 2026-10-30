@@ -72,7 +72,7 @@ MATCH_MAX_SECONDS = 600 if TEST_MODE else 2 * 3600  # автосброс, есл
 BREAK_SECONDS = int(os.getenv("BREAK_SECONDS", "300"))  # сколько ждём вышедшего игрока, потом матч продолжается
 
 # Автостарт матча: все зашли на сервер -> через AUTO_START_DELAY сек матч стартует сам
-AUTO_START = os.getenv("AUTO_START", "1") == "1"            # 0 = выключить автостарт
+AUTO_START = os.getenv("AUTO_START", "10") == "1"            # 0 = выключить автостарт
 AUTO_START_DELAY = int(os.getenv("AUTO_START_DELAY", "15"))  # сек. ждём, пока все прогрузятся
 WARMUP_SECONDS = int(os.getenv("WARMUP_SECONDS", "240"))     # разминка 4 минуты, потом матч стартует принудительно
 CHAT_PREFIX = os.getenv("CHAT_PREFIX", "[{PURPLE}VIBE MIX{Default}] ")
