@@ -3,7 +3,7 @@ KZLP FreePick 5x5: очередь -> капитаны -> пики игроков
 После драфта игроки получают доступ в войс своей команды (Team 1 / Team 2) и перемещаются туда.
 Авто-старт: как только набралось нужное число игроков, драфт запускается сам.
 """
-print("▶ bot.py v21 загружается...", flush=True)
+print("▶ bot.py v24 загружается...", flush=True)
 import asyncio
 import io
 import json
@@ -84,6 +84,14 @@ db.execute("CREATE TABLE IF NOT EXISTS links ("
 db.execute("CREATE TABLE IF NOT EXISTS bans ("
            "discord_id INTEGER PRIMARY KEY, reason TEXT)")
 db.execute("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)")
+try:  # срок бана (0 = навсегда); для старых баз добавляем колонку
+    db.execute("ALTER TABLE bans ADD COLUMN expires INTEGER NOT NULL DEFAULT 0")
+except sqlite3.OperationalError:
+    pass
+db.execute("CREATE TABLE IF NOT EXISTS ban_log ("
+           "id INTEGER PRIMARY KEY AUTOINCREMENT, discord_id INTEGER, steamid64 TEXT, name TEXT, avatar TEXT, "
+           "reason TEXT, admin_id INTEGER, admin_name TEXT, created INTEGER, "
+           "expires INTEGER NOT NULL DEFAULT 0, unbanned_at INTEGER, unban_reason TEXT, unban_by TEXT)")
 db.execute("CREATE TABLE IF NOT EXISTS elo ("
            "discord_id INTEGER PRIMARY KEY, elo INTEGER NOT NULL DEFAULT 1000, "
            "wins INTEGER NOT NULL DEFAULT 0, losses INTEGER NOT NULL DEFAULT 0)")
@@ -109,7 +117,8 @@ def get_steam(discord_id: int):
 
 
 def is_banned(discord_id: int) -> bool:
-    return db.execute("SELECT 1 FROM bans WHERE discord_id=?", (discord_id,)).fetchone() is not None
+    row = db.execute("SELECT expires FROM bans WHERE discord_id=?", (discord_id,)).fetchone()
+    return bool(row) and (row[0] == 0 or row[0] > time.time())
 
 
 def kv_set(key: str, value):
@@ -132,7 +141,8 @@ def _dump() -> str:
     keys = ("panel_channel", "panel_message", "team_access")
     data = {
         "links": db.execute("SELECT discord_id, steamid64 FROM links").fetchall(),
-        "bans": db.execute("SELECT discord_id, reason FROM bans").fetchall(),
+        "bans": db.execute("SELECT discord_id, reason, expires FROM bans").fetchall(),
+        "ban_log": db.execute("SELECT * FROM ban_log").fetchall(),
         "elo": db.execute("SELECT discord_id, elo, wins, losses FROM elo").fetchall(),
         "kv": {k: kv_get(k) for k in keys if kv_get(k) is not None},
     }
@@ -204,8 +214,13 @@ async def restore_backup(schedule: bool = True):
     if data:
         for did, sid in data.get("links", []):
             db.execute("INSERT OR IGNORE INTO links VALUES (?, ?)", (int(did), str(sid)))
-        for did, reason in data.get("bans", []):
-            db.execute("INSERT OR IGNORE INTO bans VALUES (?, ?)", (int(did), reason))
+        for row in data.get("bans", []):
+            exp = int(row[2]) if len(row) > 2 else 0
+            db.execute("INSERT OR IGNORE INTO bans (discord_id, reason, expires) VALUES (?, ?, ?)",
+                       (int(row[0]), row[1], exp))
+        for row in data.get("ban_log", []):
+            if len(row) == 13:
+                db.execute("INSERT OR IGNORE INTO ban_log VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", tuple(row))
         for did, e_, w_, l_ in data.get("elo", []):
             db.execute("INSERT OR IGNORE INTO elo VALUES (?, ?, ?, ?)", (int(did), int(e_), int(w_), int(l_)))
         for k, v in data.get("kv", {}).items():
@@ -522,6 +537,13 @@ def rcon_gamestate():
     return m.group(1) if m else None
 
 
+def rcon_kick(user_id, steamid: str):
+    """Блокирующая функция: кикает игрока с CS2-сервера (по userid из события MatchZy)."""
+    target = str(user_id) if user_id not in (None, "") else steamid
+    with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
+        _rcon_run(c, f"kickid {target}")
+
+
 def rcon_pause(pause: bool):
     """Блокирующая функция: ставит матч на паузу или снимает её (админская пауза MatchZy)."""
     primary = "css_forcepause" if pause else "css_forceunpause"
@@ -734,6 +756,36 @@ async def handle_disconnect(steamid: str):
                           f"Возвращайтесь: {WEB_BASE_URL}/connect")
     except discord.HTTPException:
         pass
+
+
+# SteamID, которым можно заходить на сервер во время матча без привязки (админы, комментаторы), через запятую
+ADMIN_STEAMIDS = {x.strip() for x in os.getenv("ADMIN_STEAMIDS", "").split(",") if x.strip()}
+
+
+async def handle_connect(data: dict):
+    """Игрок зашёл на сервер: если его Steam-аккаунта нет в матче (зашёл с другого аккаунта), кикаем."""
+    player = data.get("player") or {}
+    if player.get("is_bot"):
+        return
+    sid = str(player.get("steamid", ""))
+    if not sid or sid == "0" or sid in S.match_players or sid in ADMIN_STEAMIDS:
+        return
+    try:
+        await asyncio.to_thread(rcon_kick, player.get("user_id"), sid)
+    except Exception:
+        log.exception("Не удалось кикнуть %s", sid)
+        return
+    log.warning("Кикнут игрок %s (%s): аккаунта нет в матче", player.get("name"), sid)
+    owner = db.execute("SELECT discord_id FROM links WHERE steamid64=?", (sid,)).fetchone()
+    who = f" (привязан к <@{owner[0]}>)" if owner else " (аккаунт не привязан к Discord)"
+    ch = S.match_channel or (S.panel.channel if S.panel else None)
+    if ch:
+        try:
+            await ch.send(f"🚫 Игрок **{player.get('name', '?')}** (`{sid}`){who} зашёл с аккаунта, которого нет "
+                          f"в матче, и был кикнут. Заходите только с привязанного Steam: {WEB_BASE_URL}/connect",
+                          delete_after=60, allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException:
+            pass
 
 
 async def break_timer():
@@ -1324,6 +1376,246 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
         log.exception("Не удалось отправить результат (права бота: Send Messages, Embed Links, Attach Files)")
 
 
+# ----------------------------- БАНЫ (лог в Discord + сайт) -----------
+import html as _html
+
+BAN_LOG_CHANNEL = int(os.getenv("BAN_LOG_CHANNEL_ID", "0"))  # 0 = канал, в названии которого есть "баны"
+
+_UNITS = {"m": 60, "min": 60, "м": 60, "мин": 60, "минут": 60,
+          "h": 3600, "ч": 3600, "час": 3600, "часа": 3600, "часов": 3600,
+          "d": 86400, "д": 86400, "дн": 86400, "дня": 86400, "дней": 86400,
+          "w": 604800, "н": 604800, "нед": 604800, "недели": 604800, "недель": 604800}
+
+
+def parse_duration(text: str):
+    """'30m', '12h', '3d', '1w', '1d12h', 'perm' -> секунды (0 = навсегда). Ошибка -> None."""
+    t = (text or "").strip().lower()
+    if t in ("", "perm", "permanent", "forever", "навсегда", "0"):
+        return 0
+    parts = re.findall(r"(\d+)\s*([a-zа-я]*)", t)
+    if not parts or "".join(f"{n}{u}" for n, u in parts) != re.sub(r"\s+", "", t):
+        return None
+    total = 0
+    for n, u in parts:
+        mult = _UNITS.get(u or "d")  # число без буквы = дни
+        if mult is None:
+            return None
+        total += int(n) * mult
+    return total or None
+
+
+def fmt_dur(sec: int) -> str:
+    sec, parts = int(sec), []
+    for name, n in (("д.", 86400), ("ч.", 3600), ("мин.", 60)):
+        if sec >= n:
+            parts.append(f"{sec // n} {name}")
+            sec %= n
+        if len(parts) == 2:
+            break
+    return " ".join(parts) or "1 мин."
+
+
+def find_ban_channel():
+    g = get_guild()
+    if not g:
+        return None
+    if BAN_LOG_CHANNEL:
+        ch = g.get_channel(BAN_LOG_CHANNEL)
+        if ch:
+            return ch
+    for ch in g.text_channels:
+        n = ch.name.lower()
+        if "баны" in n or "bans" in n or "наказани" in n:
+            return ch
+    return None
+
+
+class BanLogView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(discord.ui.Button(label="Список банов", url=f"{WEB_BASE_URL}/bans"))
+
+    @discord.ui.button(label="Посмотреть SteamID", style=discord.ButtonStyle.secondary,
+                       custom_id="fp:banlog_steam")
+    async def steam(self, i: discord.Interaction, b: discord.ui.Button):
+        field = i.message.embeds[0].fields[0].value if i.message and i.message.embeds and i.message.embeds[0].fields else ""
+        m = re.search(r"(\d{17,20})", field)
+        if not m:
+            return await i.response.send_message("Не удалось определить игрока.", ephemeral=True)
+        did = int(m.group(1))
+        sid = get_steam(did)
+        if not sid:
+            row = db.execute("SELECT steamid64 FROM ban_log WHERE discord_id=? AND steamid64 IS NOT NULL "
+                             "ORDER BY id DESC LIMIT 1", (did,)).fetchone()
+            sid = row[0] if row else None
+        if not sid:
+            return await i.response.send_message("У игрока нет привязанного Steam.", ephemeral=True)
+        await i.response.send_message(f"SteamID: `{sid}`\nhttps://steamcommunity.com/profiles/{sid}",
+                                      ephemeral=True)
+
+
+async def send_ban_log(embed: discord.Embed):
+    ch = find_ban_channel()
+    if not ch:
+        log.warning("Канал банов не найден (создай канал с «баны» в названии или задай BAN_LOG_CHANNEL_ID)")
+        return
+    try:
+        await ch.send(embed=embed, view=BanLogView(), allowed_mentions=discord.AllowedMentions.none())
+    except discord.HTTPException:
+        log.exception("Не удалось отправить лог бана (права: Send Messages, Embed Links)")
+
+
+async def do_ban(member: discord.Member, reason: str, duration: int, admin):
+    now = int(time.time())
+    expires = now + duration if duration else 0
+    db.execute("UPDATE ban_log SET unbanned_at=?, unban_reason='Заменён новым баном', unban_by='Система' "
+               "WHERE discord_id=? AND unbanned_at IS NULL", (now, member.id))
+    db.execute("INSERT OR REPLACE INTO bans (discord_id, reason, expires) VALUES (?, ?, ?)",
+               (member.id, reason, expires))
+    db.execute("INSERT INTO ban_log (discord_id, steamid64, name, avatar, reason, admin_id, admin_name, "
+               "created, expires) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+               (member.id, get_steam(member.id), member.display_name, member.display_avatar.url,
+                reason, admin.id, admin.display_name, now, expires))
+    db.commit()
+    schedule_backup()
+    async with S.lock:
+        if S.phase == "queue":
+            S.queue = [m for m in S.queue if m.id != member.id]
+    if QUEUE_VC and member.voice and member.voice.channel and member.voice.channel.id == QUEUE_VC:
+        try:
+            await member.move_to(None)
+        except discord.HTTPException:
+            pass
+    await refresh_panel()
+
+    e = discord.Embed(title="🚫 Бан выдан", color=0xED4245, timestamp=discord.utils.utcnow())
+    e.add_field(name="Игрок", value=f"<@{member.id}>\n`{member.id}`")
+    e.add_field(name="Разбан", value=f"<t:{expires}:R>" if expires else "Никогда")
+    e.add_field(name="Причина", value=reason[:1000])
+    e.set_thumbnail(url=member.display_avatar.url)
+    e.set_footer(text=f"Администратор: {admin.display_name} • {admin.id}")
+    await send_ban_log(e)
+
+
+async def do_unban(did: int, reason: str, by: str | None = None) -> bool:
+    """by=None означает автоматический разбан по истечении срока."""
+    if not db.execute("SELECT 1 FROM bans WHERE discord_id=?", (did,)).fetchone():
+        return False
+    now = int(time.time())
+    db.execute("DELETE FROM bans WHERE discord_id=?", (did,))
+    last = db.execute("SELECT id, avatar, reason, admin_id FROM ban_log WHERE discord_id=? "
+                      "AND unbanned_at IS NULL ORDER BY id DESC LIMIT 1", (did,)).fetchone()
+    if last:
+        db.execute("UPDATE ban_log SET unbanned_at=?, unban_reason=?, unban_by=? WHERE id=?",
+                   (now, reason, by or "Автоматически", last[0]))
+    db.commit()
+    schedule_backup()
+
+    e = discord.Embed(title="✅ Бан снят", color=0x57F287, timestamp=discord.utils.utcnow())
+    e.add_field(name="Игрок", value=f"<@{did}>\n`{did}`")
+    e.add_field(name="Причина разбана", value=reason[:1000])
+    if last:
+        e.add_field(name="За что был бан", value=f"Причина: {last[2]}\nВыдал: `{last[3]}`", inline=False)
+        if last[1]:
+            e.set_thumbnail(url=last[1])
+    e.set_footer(text="Автоматически · истёк срок наказания" if by is None else f"Администратор: {by}")
+    await send_ban_log(e)
+    return True
+
+
+_ban_loop_started = False
+
+
+async def ban_expiry_loop():
+    """Раз в минуту снимает баны, у которых истёк срок."""
+    while True:
+        try:
+            now = int(time.time())
+            for (did,) in db.execute("SELECT discord_id FROM bans WHERE expires>0 AND expires<=?",
+                                     (now,)).fetchall():
+                await do_unban(did, "Истекло время наказания")
+        except Exception:
+            log.exception("Ошибка в цикле снятия банов")
+        await asyncio.sleep(60)
+
+
+# ---- страница со списком банов (/bans)
+BANS_PAGE = """<!doctype html><html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Список наказаний — KZLP FreePick</title>
+<style>
+:root{color-scheme:dark}*{box-sizing:border-box}
+body{margin:0;min-height:100vh;font-family:Inter,system-ui,"Segoe UI",Roboto,Arial,sans-serif;color:#e8e6f2;
+background:radial-gradient(1100px 600px at 15% -10%,#2b1252 0%,transparent 60%),
+radial-gradient(900px 600px at 95% 5%,#14244f 0%,transparent 55%),#090613}
+.wrap{max-width:1280px;margin:0 auto;padding:32px 20px;display:grid;grid-template-columns:320px 1fr;gap:20px;align-items:start}
+@media(max-width:900px){.wrap{grid-template-columns:1fr}}
+.card{background:rgba(18,14,34,.86);border:1px solid rgba(255,255,255,.07);border-radius:16px;padding:20px}
+h2{margin:0 0 14px;font-size:18px}h3{margin:18px 0 10px;font-size:13px;color:#9a97b0;font-weight:500}
+.tag{display:inline-block;background:#5b21d6;color:#fff;border-radius:8px;padding:8px 18px;font-weight:600;font-size:14px;margin-right:6px}
+input{width:100%;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);border-radius:10px;
+color:#e8e6f2;padding:11px 12px;font-size:14px;outline:none}input:focus{border-color:#7c3aed}
+.stat{display:flex;justify-content:space-between;padding:11px 12px;border-radius:8px;background:rgba(255,255,255,.04);margin-bottom:8px;font-size:14px}
+.stat b{color:#fff}
+.tw{overflow-x:auto}
+table{width:100%;border-collapse:separate;border-spacing:0 6px;min-width:640px}
+th{text-align:left;font-size:12px;color:#9a97b0;padding:6px 12px;font-weight:500}
+td{background:rgba(255,255,255,.035);padding:10px 12px;font-size:14px}
+td:first-child{border-radius:10px 0 0 10px;width:44px;text-align:center}td:last-child{border-radius:0 10px 10px 0}
+.pl{display:flex;align-items:center;gap:10px}
+.pl img{width:30px;height:30px;border-radius:8px;object-fit:cover;background:#2a2640}
+.b{padding:3px 10px;border-radius:6px;font-size:12px;font-weight:600;white-space:nowrap}
+.perm{background:rgba(237,66,69,.16);color:#ff5a5f}
+.done{background:rgba(87,242,135,.12);color:#57f287;text-decoration:line-through}
+.act{background:rgba(255,176,32,.16);color:#ffb020}
+.unb{background:#4b1fb8;color:#d9ccff}
+.empty{padding:30px;text-align:center;color:#9a97b0}
+</style></head><body><div class="wrap">
+<div class="card"><h2>Инфо</h2><span class="tag">Баны</span><span class="tag" style="background:#1f3a8a">FreePick</span>
+<h3>Найти нарушителя</h3><input id="q" placeholder="Ник, причина или админ" autocomplete="off">
+<h3>Статистика наказаний</h3>
+<div class="stat"><span>Всего банов</span><b>__TOTAL__</b></div>
+<div class="stat"><span>Активных банов</span><b>__ACTIVE__</b></div>
+<div class="stat"><span>Перманентных банов</span><b>__PERM__</b></div></div>
+<div class="card"><h2>Список наказаний</h2><div class="tw"><table><thead><tr>
+<th>Тип</th><th>Игрок</th><th>Причина</th><th>Срок</th><th>Админ</th></tr></thead><tbody id="rows">__ROWS__</tbody></table>
+__EMPTY__</div></div></div>
+<script>
+const q=document.getElementById('q');
+q.addEventListener('input',()=>{const v=q.value.toLowerCase();
+document.querySelectorAll('#rows tr').forEach(r=>{r.style.display=r.textContent.toLowerCase().includes(v)?'':'none'})});
+</script></body></html>"""
+
+
+def render_bans_page(rows: list, now: int) -> str:
+    esc = _html.escape
+    total = len(rows)
+    active = sum(1 for r in rows if r[7] is None and (r[6] == 0 or r[6] > now))
+    perm = sum(1 for r in rows if r[7] is None and r[6] == 0)
+    out = []
+    for did, name, avatar, reason, admin, created, expires, unbanned in rows:
+        if unbanned:
+            badge = '<span class="b unb">Разбанен</span>'
+        elif expires == 0:
+            badge = '<span class="b perm">Навсегда</span>'
+        elif expires <= now:
+            badge = f'<span class="b done">{esc(fmt_dur(expires - created))}</span>'
+        else:
+            badge = f'<span class="b act">{esc(fmt_dur(expires - now))}</span>'
+        img = (f'<img src="{esc(avatar, quote=True)}" alt="" loading="lazy" '
+               f'onerror="this.style.visibility=\'hidden\'">') if avatar else ""
+        out.append(f'<tr><td>🚫</td><td><div class="pl">{img}<span>{esc(name or str(did))}</span></div></td>'
+                   f'<td>{esc(reason or "—")}</td><td>{badge}</td><td>{esc(admin or "—")}</td></tr>')
+    empty = '' if out else '<div class="empty">Наказаний пока нет</div>'
+    return (BANS_PAGE.replace("__TOTAL__", str(total)).replace("__ACTIVE__", str(active))
+            .replace("__PERM__", str(perm)).replace("__ROWS__", "".join(out)).replace("__EMPTY__", empty))
+
+
+async def h_bans(req: web.Request):
+    rows = db.execute("SELECT discord_id, name, avatar, reason, admin_name, created, expires, unbanned_at "
+                      "FROM ban_log ORDER BY created DESC LIMIT 500").fetchall()
+    return web.Response(text=render_bans_page(rows, int(time.time())), content_type="text/html")
+
+
 # ----------------------------- ВЕБ-СЕРВЕР ----------------------------
 async def h_match(req: web.Request):
     cfg = S.matches.get(int(req.match_info["mid"]))
@@ -1358,6 +1650,8 @@ async def h_events(req: web.Request):
         S.live = False           # карта закончилась: выходы игроков больше не считаем
         # снимок игроков берём сразу: series_end может сбросить матч раньше, чем отправится результат
         asyncio.create_task(post_result(data, dict(S.match_players), S.match_id))
+    elif same and ev == "player_connect":
+        asyncio.create_task(handle_connect(data))
     elif same and ev == "player_disconnect":
         player = data.get("player") or {}
         if not player.get("is_bot"):
@@ -1554,6 +1848,7 @@ class FreePickBot(commands.Bot):
     async def setup_hook(self):
         self.add_view(QueueView())
         self.add_view(VerifyView())
+        self.add_view(BanLogView())
         await ensure_fonts()  # шрифт с кириллицей для картинки результата
 
         app = web.Application()
@@ -1561,6 +1856,7 @@ class FreePickBot(commands.Bot):
             web.get("/", lambda r: web.Response(text="ok")),  # health check
             web.get(r"/match/{mid:\d+}.json", h_match),
             web.get("/connect", h_connect),
+            web.get("/bans", h_bans),
             web.post("/events", h_events),
             web.get("/auth/steam", h_auth),
             web.get("/auth/steam/callback", h_auth_callback),
@@ -1600,11 +1896,7 @@ async def setup_cmd(i: discord.Interaction):
     await i.response.send_message("Панель отправлена.", ephemeral=True)
 
 
-@bot.tree.command(name="verify_setup", description="Отправить панель Steam-верификации в этот канал")
-@app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
-@admin
-async def verify_setup_cmd(i: discord.Interaction):
+def verify_embed() -> discord.Embed:
     e = discord.Embed(title="Верификация", color=0xE8D44D)
     e.description = (
         "**Как пройти верификацию**\n"
@@ -1617,6 +1909,33 @@ async def verify_setup_cmd(i: discord.Interaction):
         "• Если роли не выдались — нажмите «Обновить роли» или откройте тикет\n"
         "• Отвязать Steam нельзя, пока вы в очереди, драфте или матче"
     )
+    return e
+
+
+async def refresh_verify_panels():
+    """Обновляет уже отправленные панели верификации (добавляет кнопку «Отвязать Steam» и новый текст)."""
+    g = get_guild()
+    if not g:
+        return
+    for ch in g.text_channels:
+        if "верификация" not in ch.name.lower():
+            continue
+        try:
+            async for m in ch.history(limit=30):
+                if (m.author.id == bot.user.id and m.embeds
+                        and (m.embeds[0].title or "") == "Верификация"):
+                    await m.edit(embed=verify_embed(), view=VerifyView())
+                    log.info("Панель верификации обновлена в #%s", ch.name)
+        except discord.HTTPException:
+            log.warning("Не удалось обновить панель верификации в #%s", ch.name)
+
+
+@bot.tree.command(name="verify_setup", description="Отправить панель Steam-верификации в этот канал")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@admin
+async def verify_setup_cmd(i: discord.Interaction):
+    e = verify_embed()
     await i.channel.send(embed=e, view=VerifyView())
     await i.response.send_message("Панель верификации отправлена.", ephemeral=True)
 
@@ -1702,30 +2021,31 @@ async def fp_elo_set_cmd(i: discord.Interaction, member: discord.Member, value: 
     await i.response.send_message(f"{member.mention}: ELO = {value}", ephemeral=True)
 
 
-@bot.tree.command(name="fp_ban", description="Забанить игрока в FreePick")
+@bot.tree.command(name="fp_ban", description="Забанить игрока в FreePick (срок: 30m, 12h, 3d, 1w, perm)")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @admin
-async def ban_cmd(i: discord.Interaction, member: discord.Member, reason: str = "—"):
-    db.execute("INSERT OR REPLACE INTO bans VALUES (?, ?)", (member.id, reason))
-    db.commit()
-    schedule_backup()
-    async with S.lock:
-        if S.phase == "queue":
-            S.queue = [m for m in S.queue if m.id != member.id]
-    await refresh_panel()
-    await i.response.send_message(f"{member.mention} забанен: {reason}", ephemeral=True)
+async def ban_cmd(i: discord.Interaction, member: discord.Member, reason: str = "—", duration: str = "perm"):
+    seconds = parse_duration(duration)
+    if seconds is None:
+        return await i.response.send_message(
+            "Неверный срок. Примеры: `30m`, `12h`, `3d`, `1w`, `1d12h`, `perm` (навсегда).", ephemeral=True)
+    await i.response.defer(ephemeral=True)
+    await do_ban(member, reason, seconds, i.user)
+    await i.followup.send(f"{member.mention} забанен ({'навсегда' if not seconds else fmt_dur(seconds)}): {reason}",
+                          ephemeral=True)
 
 
 @bot.tree.command(name="fp_unban", description="Разбанить игрока в FreePick")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @admin
-async def unban_cmd(i: discord.Interaction, member: discord.Member):
-    db.execute("DELETE FROM bans WHERE discord_id=?", (member.id,))
-    db.commit()
-    schedule_backup()
-    await i.response.send_message(f"{member.mention} разбанен.", ephemeral=True)
+async def unban_cmd(i: discord.Interaction, member: discord.User, reason: str = "Снят администратором"):
+    await i.response.defer(ephemeral=True)
+    if await do_unban(member.id, reason, by=i.user.display_name):
+        await i.followup.send(f"{member.mention} разбанен.", ephemeral=True)
+    else:
+        await i.followup.send("Этот игрок не в бане.", ephemeral=True)
 
 
 @bot.tree.command(name="endmatch", description="Принудительно сбросить матч и очередь")
@@ -1760,6 +2080,10 @@ async def find_panel():
 async def on_ready():
     log.info("Бот запущен как %s", bot.user)
     await restore_backup()  # привязки не должны пропадать при обновлении бота
+    global _ban_loop_started
+    if not _ban_loop_started:  # автоматическое снятие банов по сроку
+        _ban_loop_started = True
+        asyncio.create_task(ban_expiry_loop())
     asyncio.create_task(restore_from_dms())  # доберём тех, кого нет в бэкапе (из ЛС бота)
     load_access()
     # Если бот перезапустился во время матча, а матча уже нет — снимаем старые доступы
@@ -1774,6 +2098,7 @@ async def on_ready():
             await refresh_panel()
         except discord.HTTPException:
             log.warning("Не удалось восстановить панель, отправьте /setup заново")
+    await refresh_verify_panels()  # старые панели верификации получают кнопку «Отвязать Steam»
     if not S.panel:
         S.panel = await find_panel()
         if S.panel:
