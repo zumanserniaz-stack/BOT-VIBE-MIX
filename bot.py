@@ -39,7 +39,7 @@ log = logging.getLogger("freepick")
 # CS2-сервер (RCON_PASSWORD обязательно задай в Render -> Environment)
 SERVER_IP = os.getenv("SERVER_IP", "45.86.81.37").strip()
 SERVER_PORT = int(os.getenv("SERVER_PORT", "55031"))
-RCON_PASSWORD = os.getenv("RCON_PASSWORD", "")
+RCON_PASSWORD = os.getenv("RCON_PASSWORD", "ArniAlash22062008Nurlan")
 SERVER_PASSWORD = os.getenv("SERVER_PASSWORD", "")
 
 # Веб-сервер бота (его должен видеть CS2-сервер)
@@ -58,9 +58,9 @@ VERIFIED_ROLE = int(os.getenv("VERIFIED_ROLE_ID", "1565117832251965653"))
 
 # FACEIT: ключ с https://developers.faceit.com (Server side API key). Пусто = FACEIT-роли выключены.
 # Ключ задаётся ТОЛЬКО в Render -> Environment (FACEIT_API_KEY), в коде его не храним.
-FACEIT_API_KEY = os.getenv("FACEIT_API_KEY", "").strip()
+FACEIT_API_KEY = os.getenv("FACEIT_API_KEY", "590b7ce5-2812-4f48-9628-938aff17dff2").strip()
 # 1 = стартовый ELO в FreePick берётся из FACEIT ELO (только для тех, у кого ещё нет рейтинга)
-FACEIT_START_ELO = os.getenv("FACEIT_START_ELO", "0") == "1"
+FACEIT_START_ELO = os.getenv("FACEIT_START_ELO", "1:1548371779523837955,2:1548371779523837956,3:1548371779523837957,4;1548371779523837958,5:1548371779523837959,6:1548371779523837960,7:1548371779523837961,8:1548371779528040610,9:1548371779528040611,10:1548371779528040612") == "1"
 
 TEST_MODE = os.getenv("TEST_MODE", "0") == "1"  # 1 = тест: хватает одного игрока, без драфта
 TEAM_SIZE = 1 if TEST_MODE else 5
