@@ -2,8 +2,9 @@
 KZLP FreePick 5x5: очередь -> капитаны -> пики игроков -> вето карт -> запуск матча на CS2 (MatchZy).
 После драфта игроки получают доступ в войс своей команды (Team 1 / Team 2) и перемещаются туда.
 Авто-старт: как только набралось нужное число игроков, драфт запускается сам.
+При Steam-верификации бот определяет FACEIT-уровень игрока и выдаёт роль «FACEIT LVL n».
 """
-print("▶ bot.py v24 загружается...", flush=True)
+print("▶ bot.py v25 загружается...", flush=True)
 import asyncio
 import io
 import json
@@ -56,6 +57,11 @@ QUEUE_VC = int(os.getenv("QUEUE_VC_ID", "1565440992574705734"))
 
 # Роль, которая выдаётся после Steam-верификации (0 = не выдавать)
 VERIFIED_ROLE = int(os.getenv("VERIFIED_ROLE_ID", "1565117832251965653"))
+
+# FACEIT: ключ с https://developers.faceit.com (Server side API key). Пусто = FACEIT-роли выключены
+FACEIT_API_KEY = os.getenv("FACEIT_API_KEY", "590b7ce5-2812-4f48-9628-938aff17dff2").strip()
+# 1 = стартовый ELO в FreePick берётся из FACEIT ELO (только для тех, у кого ещё нет рейтинга)
+FACEIT_START_ELO = os.getenv("FACEIT_START_ELO", "1:1548371779523837955,2:1548371779523837956,3:1548371779523837957,4:1548371779523837958,5:1548371779523837959,6:1548371779523837960,7:1548371779523837961,8:1548371779528040610,9:1548371779528040611,10:1548371779528040612") == "1"
 
 TEST_MODE = os.getenv("TEST_MODE", "0") == "1"  # 1 = тест: хватает одного игрока, без драфта
 TEAM_SIZE = 1 if TEST_MODE else 5
@@ -1686,6 +1692,79 @@ async def give_role(member):
             log.exception("Не удалось выдать роль (роль бота должна быть выше выдаваемой)")
 
 
+# ----------------------------- FACEIT --------------------------------
+async def fetch_faceit(steamid: str):
+    """Уровень и ELO на FACEIT по SteamID64. None, если аккаунта нет или ключ не задан."""
+    if not FACEIT_API_KEY:
+        return None
+    headers = {"Authorization": f"Bearer {FACEIT_API_KEY}"}
+    for game in ("cs2", "csgo"):
+        try:
+            async with aiohttp.ClientSession() as ses:
+                async with ses.get("https://open.faceit.com/data/v4/players",
+                                   params={"game": game, "game_player_id": steamid},
+                                   headers=headers,
+                                   timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    if r.status != 200:
+                        continue
+                    data = await r.json()
+        except Exception:
+            log.exception("FACEIT API недоступен")
+            return None
+        g = (data.get("games") or {}).get(game)
+        if g and g.get("skill_level"):
+            return {"level": int(g["skill_level"]),
+                    "elo": int(g.get("faceit_elo") or 0),
+                    "nickname": data.get("nickname")}
+    return None
+
+
+async def give_faceit_role(member: discord.Member, level: int):
+    """Выдаёт роль «FACEIT LVL n» (создаёт, если её нет) и снимает старые FACEIT-роли."""
+    if not member:
+        return
+    guild = member.guild
+    wanted = f"FACEIT LVL {level}"
+    old = [r for r in member.roles if r.name.startswith("FACEIT LVL ") and r.name != wanted]
+    try:
+        role = discord.utils.get(guild.roles, name=wanted)
+        if not role:
+            role = await guild.create_role(name=wanted, reason="FACEIT уровень")
+        if old:
+            await member.remove_roles(*old, reason="FACEIT уровень изменился")
+        if role not in member.roles:
+            await member.add_roles(role, reason="FACEIT уровень")
+    except discord.HTTPException:
+        log.exception("Не удалось выдать FACEIT-роль (нужно право Manage Roles, роль бота выше)")
+
+
+async def apply_faceit(member, steamid: str):
+    """Тянет FACEIT-данные, выдаёт роль уровня и (по желанию) стартовый ELO. Возвращает данные или None."""
+    fc = await fetch_faceit(steamid)
+    if not fc:
+        return None
+    if isinstance(member, discord.Member):
+        await give_faceit_role(member, fc["level"])
+    if FACEIT_START_ELO and member and fc["elo"]:
+        db.execute("INSERT OR IGNORE INTO elo (discord_id, elo) VALUES (?, ?)",
+                   (member.id, max(ELO_MIN, fc["elo"])))
+        db.commit()
+        schedule_backup()
+    return fc
+
+
+async def remove_faceit_roles(member):
+    """Снимает все роли «FACEIT LVL n» (при отвязке Steam)."""
+    if not isinstance(member, discord.Member):
+        return
+    old = [r for r in member.roles if r.name.startswith("FACEIT LVL ")]
+    if old:
+        try:
+            await member.remove_roles(*old, reason="Steam отвязан")
+        except discord.HTTPException:
+            log.exception("Не удалось снять FACEIT-роли")
+
+
 class VerifyView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -1707,10 +1786,16 @@ class VerifyView(discord.ui.View):
 
     @discord.ui.button(label="Обновить роли", style=discord.ButtonStyle.secondary, custom_id="fp:roles")
     async def roles(self, i: discord.Interaction, b: discord.ui.Button):
-        if not get_steam(i.user.id):
+        sid = get_steam(i.user.id)
+        if not sid:
             return await i.response.send_message("Сначала пройдите верификацию.", ephemeral=True)
+        await i.response.defer(ephemeral=True)
         await give_role(i.user)
-        await i.response.send_message("✅ Роли обновлены.", ephemeral=True)
+        fc = await apply_faceit(i.user, sid)
+        text = "✅ Роли обновлены."
+        if fc:
+            text += f" FACEIT: уровень {fc['level']} (ELO {fc['elo']})"
+        await i.followup.send(text, ephemeral=True)
 
     @discord.ui.button(label="Отвязать Steam", style=discord.ButtonStyle.danger, custom_id="fp:unlink")
     async def unlink(self, i: discord.Interaction, b: discord.ui.Button):
@@ -1751,6 +1836,7 @@ class UnlinkConfirm(discord.ui.View):
                     await i.user.remove_roles(role, reason="Steam отвязан пользователем")
                 except discord.HTTPException:
                     log.exception("Не удалось снять роль верификации")
+            await remove_faceit_roles(i.user)  # FACEIT-роль относилась к старому Steam
             # если сидит в голосе очереди, выкидываем оттуда
             if QUEUE_VC and i.user.voice and i.user.voice.channel and i.user.voice.channel.id == QUEUE_VC:
                 try:
@@ -1835,9 +1921,13 @@ async def h_auth_callback(req: web.Request):
     guild = bot.get_guild(rec["guild_id"])
     member = guild.get_member(did) if guild else None
     await give_role(member)
+    fc = await apply_faceit(member, steamid)  # роль «FACEIT LVL n» по уровню на FACEIT
     try:
         user = member or await bot.fetch_user(did)
-        await user.send(f"✅ Steam привязан: `{steamid}`. Роли выданы, можно заходить в очередь FreePick.")
+        text = f"✅ Steam привязан: `{steamid}`. Роли выданы, можно заходить в очередь FreePick."
+        if fc:
+            text += f"\n🎯 Ваш FACEIT: уровень {fc['level']} (ELO {fc['elo']})"
+        await user.send(text)
     except discord.HTTPException:
         pass
     return page("Готово", "Steam привязан. Закройте страницу и вернитесь в Discord.")
@@ -1964,11 +2054,15 @@ async def fp_link_cmd(i: discord.Interaction, member: discord.Member, steamid64:
     row = db.execute("SELECT discord_id FROM links WHERE steamid64=?", (steamid64,)).fetchone()
     if row and row[0] != member.id:
         return await i.response.send_message("Этот SteamID уже привязан к другому аккаунту.", ephemeral=True)
+    await i.response.defer(ephemeral=True)
     db.execute("INSERT OR REPLACE INTO links VALUES (?, ?)", (member.id, steamid64))
     db.commit()
     schedule_backup()
     await give_role(member)
-    await i.response.send_message(f"✅ {member.mention}: Steam `{steamid64}` привязан.", ephemeral=True)
+    fc = await apply_faceit(member, steamid64)
+    await i.followup.send(
+        f"✅ {member.mention}: Steam `{steamid64}` привязан."
+        + (f" FACEIT LVL {fc['level']}." if fc else ""), ephemeral=True)
 
 
 @bot.tree.command(name="fp_unlink", description="(админ) Сбросить привязку Steam игрока")
@@ -1979,6 +2073,7 @@ async def fp_unlink_cmd(i: discord.Interaction, member: discord.Member):
     db.execute("DELETE FROM links WHERE discord_id=?", (member.id,))
     db.commit()
     schedule_backup()
+    await remove_faceit_roles(member)
     await i.response.send_message(f"Привязка {member.mention} сброшена, он может пройти верификацию заново.",
                                   ephemeral=True)
 
@@ -2166,6 +2261,7 @@ def main():
     say(f"▶ DISCORD_TOKEN: {'задан, длина ' + str(len(token)) if token else 'НЕ ЗАДАН'}")
     say(f"▶ Порт веб-сервера: {WEB_PORT}, WEB_BASE_URL: {WEB_BASE_URL}")
     say(f"▶ TEST_MODE={TEST_MODE}, QUEUE_VC_ID={QUEUE_VC}, GUILD_ID={GUILD_ID}")
+    say(f"▶ FACEIT: {'ключ задан' if FACEIT_API_KEY else 'FACEIT_API_KEY не задан (FACEIT-роли выключены)'}")
     if not token:
         say("❌ Не задана переменная DISCORD_TOKEN (Render -> Environment)")
         raise SystemExit(1)
