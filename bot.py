@@ -3,7 +3,7 @@ KZLP FreePick 5x5: очередь -> капитаны -> пики игроков
 После драфта игроки получают доступ в войс своей команды (Team 1 / Team 2) и перемещаются туда.
 Авто-старт: как только набралось нужное число игроков, драфт запускается сам.
 """
-print("▶ bot.py v19 загружается...", flush=True)
+print("▶ bot.py v21 загружается...", flush=True)
 import asyncio
 import io
 import json
@@ -84,7 +84,23 @@ db.execute("CREATE TABLE IF NOT EXISTS links ("
 db.execute("CREATE TABLE IF NOT EXISTS bans ("
            "discord_id INTEGER PRIMARY KEY, reason TEXT)")
 db.execute("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)")
+db.execute("CREATE TABLE IF NOT EXISTS elo ("
+           "discord_id INTEGER PRIMARY KEY, elo INTEGER NOT NULL DEFAULT 1000, "
+           "wins INTEGER NOT NULL DEFAULT 0, losses INTEGER NOT NULL DEFAULT 0)")
 db.commit()
+
+ELO_START = 1000   # стартовый рейтинг
+ELO_K = 30         # сила изменения за матч
+ELO_MIN = 100      # ниже этого рейтинг не падает
+
+
+def get_stats(discord_id: int):
+    row = db.execute("SELECT elo, wins, losses FROM elo WHERE discord_id=?", (discord_id,)).fetchone()
+    return row if row else (ELO_START, 0, 0)
+
+
+def get_elo(discord_id: int) -> int:
+    return get_stats(discord_id)[0]
 
 
 def get_steam(discord_id: int):
@@ -117,6 +133,7 @@ def _dump() -> str:
     data = {
         "links": db.execute("SELECT discord_id, steamid64 FROM links").fetchall(),
         "bans": db.execute("SELECT discord_id, reason FROM bans").fetchall(),
+        "elo": db.execute("SELECT discord_id, elo, wins, losses FROM elo").fetchall(),
         "kv": {k: kv_get(k) for k in keys if kv_get(k) is not None},
     }
     return json.dumps(data, ensure_ascii=False)
@@ -189,6 +206,8 @@ async def restore_backup(schedule: bool = True):
             db.execute("INSERT OR IGNORE INTO links VALUES (?, ?)", (int(did), str(sid)))
         for did, reason in data.get("bans", []):
             db.execute("INSERT OR IGNORE INTO bans VALUES (?, ?)", (int(did), reason))
+        for did, e_, w_, l_ in data.get("elo", []):
+            db.execute("INSERT OR IGNORE INTO elo VALUES (?, ?, ?, ?)", (int(did), int(e_), int(w_), int(l_)))
         for k, v in data.get("kv", {}).items():
             if kv_get(k) is None:
                 kv_set(k, v)
@@ -298,7 +317,7 @@ def panel_embed() -> discord.Embed:
                         value=f"Зайдите в голосовой канал <#{QUEUE_VC}> (нужна Steam-верификация).\n"
                               f"Когда наберётся {NEED} игроков, матч стартует автоматически.",
                         inline=False)
-        lines = [f"{n}. {m.mention}" for n, m in enumerate(S.queue, 1)]
+        lines = [f"{n}. {m.mention} · {get_elo(m.id)}" for n, m in enumerate(S.queue, 1)]
         e.add_field(name=f"Игроков {len(S.queue)} из {NEED}",
                     value="\n".join(lines) or "Ожидаем игроков...", inline=False)
     elif S.phase == "draft":
@@ -414,7 +433,7 @@ class PickView(discord.ui.View):
         self.cap, self.pool, self.picked = cap, pool, None
         self.select = discord.ui.Select(
             placeholder="Выберите игрока",
-            options=[discord.SelectOption(label=m.display_name[:100], value=str(m.id)) for m in pool],
+            options=[discord.SelectOption(label=f"{m.display_name[:80]} · ELO {get_elo(m.id)}", value=str(m.id)) for m in pool],
         )
         self.select.callback = self.on_pick
         self.add_item(self.select)
@@ -982,6 +1001,166 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
         await reset_to_queue()
 
 
+# ----------------------------- КАРТОЧКА РЕЗУЛЬТАТА -------------------
+FONT_DIR = "fonts"
+FONT_URLS = {
+    "bold": "https://raw.githubusercontent.com/dejavu-fonts/dejavu-fonts/master/ttf/DejaVuSans-Bold.ttf",
+    "regular": "https://raw.githubusercontent.com/dejavu-fonts/dejavu-fonts/master/ttf/DejaVuSans.ttf",
+}
+FONT_SYSTEM = {
+    "bold": ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+             "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+             "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+             "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+             "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf"],
+    "regular": ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+                "/usr/share/fonts/TTF/DejaVuSans.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+                "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf"],
+}
+
+
+def _find_font(kind: str):
+    env = os.getenv("FONT_PATH_BOLD" if kind == "bold" else "FONT_PATH", "")
+    for path in [env, f"{FONT_DIR}/{kind}.ttf", *FONT_SYSTEM[kind]]:
+        if path and os.path.exists(path):
+            return path
+    return None
+
+
+def get_font(size: int, kind: str = "bold"):
+    from PIL import ImageFont
+    path = _find_font(kind)
+    if path:
+        try:
+            return ImageFont.truetype(path, size)
+        except OSError:
+            pass
+    try:
+        return ImageFont.load_default(size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+async def ensure_fonts():
+    """Если на хостинге нет шрифта с кириллицей, скачиваем DejaVu один раз."""
+    os.makedirs(FONT_DIR, exist_ok=True)
+    for kind, url in FONT_URLS.items():
+        if _find_font(kind):
+            continue
+        try:
+            async with aiohttp.ClientSession() as ses:
+                async with ses.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
+                    if r.status == 200:
+                        with open(f"{FONT_DIR}/{kind}.ttf", "wb") as f:
+                            f.write(await r.read())
+                        log.info("Шрифт %s скачан", kind)
+        except Exception:
+            log.warning("Не удалось скачать шрифт %s (задай FONT_PATH / FONT_PATH_BOLD)", kind)
+
+
+def render_result_card(map_name: str, s1, s2, team_rows: dict, mvp: dict,
+                       mvp_avatar: bytes | None, names: tuple) -> bytes:
+    """Рисует картинку-табло матча (как в популярных ботах). Блокирующая: вызывать через to_thread."""
+    from PIL import Image, ImageDraw, ImageFilter, ImageEnhance
+
+    W, H = 1300, 540
+    BLUE, ORANGE, GOLD = (76, 142, 255), (255, 176, 32), (255, 205, 60)
+
+    # --- фон: картинка карты (maps/de_xxx.jpg) или тёмный градиент
+    bg = None
+    for ext in ("jpg", "jpeg", "png", "webp"):
+        path = f"maps/{map_name}.{ext}"
+        if os.path.exists(path):
+            try:
+                src = Image.open(path).convert("RGB")
+                k = max(W / src.width, H / src.height)
+                src = src.resize((int(src.width * k) + 1, int(src.height * k) + 1))
+                l, t = (src.width - W) // 2, (src.height - H) // 2
+                bg = src.crop((l, t, l + W, t + H)).filter(ImageFilter.GaussianBlur(3))
+                bg = ImageEnhance.Brightness(bg).enhance(0.42)
+            except Exception:
+                bg = None
+            break
+    if bg is None:
+        bg = Image.new("RGB", (W, H))
+        px = ImageDraw.Draw(bg)
+        for y in range(H):
+            f = y / H
+            px.line([(0, y), (W, y)], fill=(int(22 - 12 * f), int(28 - 14 * f), int(48 - 24 * f)))
+    img = bg.convert("RGBA")
+    ov = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    od = ImageDraw.Draw(ov)
+
+    PW, PY0, PY1 = 480, 40, 500
+    panels = {1: 30, 2: W - 30 - PW}
+    colors = {1: BLUE, 2: ORANGE}
+    for n, x0 in panels.items():
+        od.rounded_rectangle((x0, PY0, x0 + PW, PY1), 18, fill=(8, 12, 26, 195), outline=colors[n] + (160,), width=2)
+        od.rounded_rectangle((x0 + 90, PY0 + 12, x0 + PW - 90, PY0 + 56), 10, fill=(6, 10, 22, 220),
+                             outline=colors[n] + (255,), width=2)
+    img = Image.alpha_composite(img, ov)
+    d = ImageDraw.Draw(img)
+
+    f_head, f_name, f_stat = get_font(26), get_font(24), get_font(22, "regular")
+    gray, white = (200, 206, 220), (245, 247, 252)
+
+    def fit(text: str, font, max_w: int) -> str:
+        if d.textlength(text, font=font) <= max_w:
+            return text
+        while text and d.textlength(text + "…", font=font) > max_w:
+            text = text[:-1]
+        return text + "…"
+
+    for n, x0 in panels.items():
+        col = colors[n]
+        d.text((x0 + PW // 2, PY0 + 34), names[n - 1], font=f_head, fill=col, anchor="mm")
+        y = PY0 + 70
+        for r in team_rows.get(n, [])[:5]:
+            cy = y + 34
+            d.ellipse((x0 + 22, cy - 8, x0 + 38, cy + 8), fill=col)
+            d.text((x0 + 52, cy), fit(r["name"], f_name, 205), font=f_name, fill=white, anchor="lm")
+            kd = r["k"] / r["d"] if r["d"] else float(r["k"])
+            d.text((x0 + PW - 150, cy), f"{r['k']}-{r['d']}", font=f_stat, fill=gray, anchor="rm")
+            d.text((x0 + PW - 85, cy), f"{kd:.2f}", font=f_stat, fill=gray, anchor="rm")
+            d.text((x0 + PW - 20, cy), f"{r['hs']}%", font=f_stat, fill=gray, anchor="rm")
+            d.line((x0 + 18, y + 71, x0 + PW - 18, y + 71), fill=(60, 70, 96), width=1)
+            y += 76
+
+    # --- центр: аватар MVP, счёт, карта
+    cx = W // 2
+    R = 78
+    ring = Image.new("RGBA", (2 * R + 12, 2 * R + 12), (0, 0, 0, 0))
+    rd = ImageDraw.Draw(ring)
+    rd.ellipse((0, 0, 2 * R + 11, 2 * R + 11), fill=GOLD + (255,))
+    av = None
+    if mvp_avatar:
+        try:
+            av = Image.open(io.BytesIO(mvp_avatar)).convert("RGBA").resize((2 * R, 2 * R))
+        except Exception:
+            av = None
+    if av is None:
+        av = Image.new("RGBA", (2 * R, 2 * R), (40, 48, 72, 255))
+        ImageDraw.Draw(av).text((R, R), (mvp["name"][:1] or "?").upper(), font=get_font(70), fill=white, anchor="mm")
+    mask = Image.new("L", (2 * R, 2 * R), 0)
+    ImageDraw.Draw(mask).ellipse((0, 0, 2 * R - 1, 2 * R - 1), fill=255)
+    ring.paste(av, (6, 6), mask)
+    img.alpha_composite(ring, (cx - R - 6, 62))
+    d = ImageDraw.Draw(img)
+    d.text((cx, 258), "MVP", font=get_font(50), fill=GOLD, anchor="mm")
+    d.text((cx, 304), fit(mvp["name"], get_font(24), 250), font=get_font(24), fill=white, anchor="mm")
+    f_score = get_font(72)
+    d.text((cx - 78, 380), str(s1), font=f_score, fill=BLUE, anchor="mm")
+    d.text((cx, 380), "–", font=get_font(40), fill=gray, anchor="mm")
+    d.text((cx + 78, 380), str(s2), font=f_score, fill=ORANGE, anchor="mm")
+    d.text((cx, 462), f"КАРТА: {map_name.replace('de_', '').upper()}", font=get_font(24), fill=gray, anchor="mm")
+
+    out = io.BytesIO()
+    img.convert("RGB").save(out, "PNG")
+    return out.getvalue()
+
+
 # ----------------------------- РЕЗУЛЬТАТЫ МАТЧА ----------------------
 def find_results_channel():
     g = get_guild()
@@ -1000,9 +1179,35 @@ def find_results_channel():
 posted_results: set[int] = set()  # матчи, результат которых уже опубликован
 
 
+def apply_elo(players: dict, win_n: int) -> dict:
+    """Пересчитывает ELO по среднему рейтингу команд. Возвращает {discord_id: (было, стало)}."""
+    teams = {1: [], 2: []}
+    for m, n in players.values():
+        teams[n].append(m.id)
+    if not teams[1] or not teams[2]:
+        return {}
+    avg = {n: sum(get_elo(i) for i in ids) / len(ids) for n, ids in teams.items()}
+    changes = {}
+    for n, ids in teams.items():
+        expected = 1 / (1 + 10 ** ((avg[3 - n] - avg[n]) / 400))
+        won = 1 if n == win_n else 0
+        delta = round(ELO_K * (won - expected))
+        for i in ids:
+            old = get_elo(i)
+            new = max(ELO_MIN, old + delta)
+            db.execute(
+                "INSERT INTO elo (discord_id, elo, wins, losses) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(discord_id) DO UPDATE SET elo=?, wins=wins+?, losses=losses+?",
+                (i, new, won, 1 - won, new, won, 1 - won))
+            changes[i] = (old, new)
+    db.commit()
+    schedule_backup()
+    return changes
+
+
 async def post_result(data: dict, players: dict, match_id, note: str = ""):
-    """Публикует итог матча в канал результатов. Работает и без статистики сервера
-    (тогда просто пишет составы и что матч завершён)."""
+    """Публикует итог матча в канал результатов: карточка-табло + MVP + ELO.
+    Без статистики сервера пишет простой список составов."""
     try:
         mid = int(match_id)
     except (TypeError, ValueError):
@@ -1018,40 +1223,105 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
     t1, t2 = data.get("team1") or {}, data.get("team2") or {}
     s1, s2 = t1.get("score"), t2.get("score")
     win = (data.get("winner") or {}).get("team")
-    map_name = pretty(((S.matches.get(mid) or {}).get("maplist") or ["?"])[0])
+    cfg = S.matches.get(mid) or {}
+    raw_map = (cfg.get("maplist") or ["?"])[0]
+    total_rounds = (s1 or 0) + (s2 or 0)
 
-    lines = []
-    if s1 is not None and s2 is not None:
-        lines.append(f"**Team 1  {s1} : {s2}  Team 2**")
-    if win in ("team1", "team2"):
-        lines.append("🏆 Победитель: **" + ("Team 1" if win == "team1" else "Team 2") + "**")
-    if note:
-        lines.append(note)
-    e = discord.Embed(title=f"Результат матча #{mid} — {map_name}", color=0x57F287)
-    e.description = "\n".join(lines) or "Матч завершён."
+    # ELO меняем только если известен победитель (при ручном завершении рейтинг не трогаем)
+    changes = {}
+    if win in ("team1", "team2") and not note:
+        changes = apply_elo(players, 1 if win == "team1" else 2)
+
+    # --- строки статистики по командам
+    team_rows = {}
     for n, t in ((1, t1), (2, t2)):
         rows = []
         for p in t.get("players") or []:
             st = p.get("stats") or {}
             info = players.get(str(p.get("steamid", "")))
-            name = info[0].mention if info else p.get("name", "?")
+            member = info[0] if info else None
             k, d, a = st.get("kills", 0), st.get("deaths", 0), st.get("assists", 0)
-            rounds = st.get("rounds_played") or ((s1 or 0) + (s2 or 0)) or 1
-            adr = round(st.get("damage", 0) / rounds)
-            rows.append((k, f"{name}: **{k}/{d}/{a}** · ADR {adr}"))
-        rows.sort(key=lambda r: -r[0])
-        if not rows:  # статистики нет: показываем хотя бы состав команды
-            rows = [(0, m.mention) for m, tn in players.values() if tn == n]
-        title = f"Team {n}" + (f" ({t.get('score')})" if t.get("score") is not None else "")
-        e.add_field(name=title, value="\n".join(r[1] for r in rows) or "—", inline=False)
-    if any((t.get("players") for t in (t1, t2))):
-        e.set_footer(text="K/D/A · ADR")
+            rounds = st.get("rounds_played") or total_rounds or 1
+            rows.append({
+                "name": member.display_name if member else p.get("name", "?"),
+                "member": member, "k": k, "d": d, "a": a,
+                "adr": round(st.get("damage", 0) / rounds),
+                "hs": round(st.get("headshot_kills", 0) * 100 / k) if k else 0,
+            })
+        rows.sort(key=lambda r: (-r["k"], -r["adr"]))
+        team_rows[n] = rows
+    all_rows = team_rows[1] + team_rows[2]
+
+    # --- картинка-табло
+    card, mvp = None, None
+    if all_rows:
+        mvp = max(all_rows, key=lambda r: (r["k"], r["adr"]))
+        avatar = None
+        if mvp["member"]:
+            try:
+                avatar = await mvp["member"].display_avatar.replace(size=256, static_format="png").read()
+            except discord.HTTPException:
+                pass
+        try:
+            card = await asyncio.to_thread(render_result_card, raw_map, s1 or 0, s2 or 0,
+                                           team_rows, mvp, avatar, ("TEAM 1", "TEAM 2"))
+        except Exception:
+            log.exception("Не удалось нарисовать карточку (установлен ли Pillow?)")
+
+    if card and mvp:
+        names = [(cfg.get(f"team{n}") or {}).get("name", f"Team {n}") for n in (1, 2)]
+        lines = []
+        if win in ("team1", "team2"):
+            wn = 1 if win == "team1" else 2
+            ws, ls = (s1, s2) if wn == 1 else (s2, s1)
+            lines.append(f"**Победитель:** 🏆 {names[wn - 1]} (Счёт: {ws}-{ls})")
+        elif s1 is not None and s2 is not None:
+            lines.append(f"**Матч завершён** (Счёт: {s1}-{s2})")
+        lines.append("")
+        lines.append(f"🏅 **MVP — {mvp['name']}** · {mvp['k']}/{mvp['d']}/{mvp['a']} · "
+                     f"{mvp['adr']} ADR · {mvp['hs']}% HS")
+        e = discord.Embed(title=f"Match #{mid} — РЕЗУЛЬТАТЫ", description="\n".join(lines), color=0xF1C40F)
+        e.set_image(url="attachment://result.png")
+        if changes:
+            elo_lines = [f"{m.mention}: {changes[m.id][1]} ({changes[m.id][1] - changes[m.id][0]:+d})"
+                         for m, n in sorted(players.values(), key=lambda x: x[1]) if m.id in changes]
+            e.add_field(name="📈 ELO", value="\n".join(elo_lines)[:1024], inline=False)
+        e.set_footer(text=f"Карта: {raw_map} · Сыграно раундов: {total_rounds}")
+        kwargs = {"embed": e, "file": discord.File(io.BytesIO(card), filename="result.png")}
+    else:
+        # запасной вариант без картинки (нет статистики или Pillow не установлен)
+        def elo_tag(did: int) -> str:
+            if did in changes:
+                old, new = changes[did]
+                return f" · ELO {new} ({new - old:+d})"
+            return ""
+
+        lines = []
+        if s1 is not None and s2 is not None:
+            lines.append(f"**Team 1  {s1} : {s2}  Team 2**")
+        if win in ("team1", "team2"):
+            lines.append("🏆 Победитель: **" + ("Team 1" if win == "team1" else "Team 2") + "**")
+        if note:
+            lines.append(note)
+        e = discord.Embed(title=f"Результат матча #{mid} — {pretty(raw_map)}", color=0x57F287)
+        e.description = "\n".join(lines) or "Матч завершён."
+        for n in (1, 2):
+            rows = [(r["k"], f"{r['member'].mention if r['member'] else r['name']}: "
+                             f"**{r['k']}/{r['d']}/{r['a']}** · ADR {r['adr']}"
+                             f"{elo_tag(r['member'].id) if r['member'] else ''}")
+                    for r in team_rows[n]]
+            if not rows:  # статистики нет: показываем хотя бы состав команды
+                rows = [(0, m.mention + elo_tag(m.id)) for m, tn in players.values() if tn == n]
+            t = (t1, t2)[n - 1]
+            title = f"Team {n}" + (f" ({t.get('score')})" if t.get("score") is not None else "")
+            e.add_field(name=title, value="\n".join(r[1] for r in rows) or "—", inline=False)
+        kwargs = {"embed": e}
     try:
-        await ch.send(embed=e)
+        await ch.send(**kwargs)
         log.info("Результат матча %s опубликован в #%s", mid, ch.name)
     except discord.HTTPException:
         posted_results.discard(mid)
-        log.exception("Не удалось отправить результат (проверь права бота в канале результатов)")
+        log.exception("Не удалось отправить результат (права бота: Send Messages, Embed Links, Attach Files)")
 
 
 # ----------------------------- ВЕБ-СЕРВЕР ----------------------------
@@ -1284,6 +1554,7 @@ class FreePickBot(commands.Bot):
     async def setup_hook(self):
         self.add_view(QueueView())
         self.add_view(VerifyView())
+        await ensure_fonts()  # шрифт с кириллицей для картинки результата
 
         app = web.Application()
         app.add_routes([
@@ -1391,6 +1662,44 @@ async def fp_unlink_cmd(i: discord.Interaction, member: discord.Member):
     schedule_backup()
     await i.response.send_message(f"Привязка {member.mention} сброшена, он может пройти верификацию заново.",
                                   ephemeral=True)
+
+
+@bot.tree.command(name="elo", description="Показать ELO игрока")
+@app_commands.guild_only()
+async def elo_cmd(i: discord.Interaction, member: discord.Member = None):
+    member = member or i.user
+    e, w, l = get_stats(member.id)
+    total = w + l
+    wr = round(w * 100 / total) if total else 0
+    await i.response.send_message(
+        f"{member.mention}: **ELO {e}** · Побед {w} · Поражений {l} · Винрейт {wr}%", ephemeral=True)
+
+
+@bot.tree.command(name="top", description="Таблица лидеров по ELO")
+@app_commands.guild_only()
+async def top_cmd(i: discord.Interaction):
+    rows = db.execute("SELECT discord_id, elo, wins, losses FROM elo "
+                      "ORDER BY elo DESC, wins DESC LIMIT 10").fetchall()
+    if not rows:
+        return await i.response.send_message("Пока нет сыгранных матчей.", ephemeral=True)
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    lines = [f"{medals.get(n, f'{n}.')} <@{did}> — **{e}** ({w}W / {l}L)"
+             for n, (did, e, w, l) in enumerate(rows, 1)]
+    emb = discord.Embed(title="Топ игроков FreePick", description="\n".join(lines), color=0xFEE75C)
+    await i.response.send_message(embed=emb, allowed_mentions=discord.AllowedMentions.none())
+
+
+@bot.tree.command(name="fp_elo_set", description="(админ) Установить ELO игроку")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@admin
+async def fp_elo_set_cmd(i: discord.Interaction, member: discord.Member, value: int):
+    value = max(ELO_MIN, value)
+    db.execute("INSERT INTO elo (discord_id, elo) VALUES (?, ?) "
+               "ON CONFLICT(discord_id) DO UPDATE SET elo=?", (member.id, value, value))
+    db.commit()
+    schedule_backup()
+    await i.response.send_message(f"{member.mention}: ELO = {value}", ephemeral=True)
 
 
 @bot.tree.command(name="fp_ban", description="Забанить игрока в FreePick")
