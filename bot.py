@@ -62,7 +62,7 @@ FACEIT_API_KEY = os.getenv("FACEIT_API_KEY", "590b7ce5-2812-4f48-9628-938aff17df
 # 1 = стартовый ELO в FreePick берётся из FACEIT ELO (только для тех, у кого ещё нет рейтинга)
 FACEIT_START_ELO = os.getenv("FACEIT_START_ELO", "1:1548371779523837955,2:1548371779523837956,3:1548371779523837957,4;1548371779523837958,5:1548371779523837959,6:1548371779523837960,7:1548371779523837961,8:1548371779528040610,9:1548371779528040611,10:1548371779528040612") == "1"
 
-TEST_MODE = os.getenv("TEST_MODE", "1") == "1"  # 1 = тест: хватает одного игрока, без драфта
+TEST_MODE = os.getenv("TEST_MODE", "0") == "1"  # 1 = тест: хватает одного игрока, без драфта
 TEAM_SIZE = 1 if TEST_MODE else 5
 NEED = 1 if TEST_MODE else TEAM_SIZE * 2
 PICK_TIMEOUT = 30            # секунд на пик/бан, потом выбор случайный
@@ -72,7 +72,7 @@ MATCH_MAX_SECONDS = 600 if TEST_MODE else 2 * 3600  # автосброс, есл
 BREAK_SECONDS = int(os.getenv("BREAK_SECONDS", "300"))  # сколько ждём вышедшего игрока, потом матч продолжается
 
 # Автостарт матча: все зашли на сервер -> через AUTO_START_DELAY сек матч стартует сам
-AUTO_START = os.getenv("AUTO_START", "10") == "1"            # 0 = выключить автостарт
+AUTO_START = os.getenv("AUTO_START", "1") == "1"            # 0 = выключить автостарт
 AUTO_START_DELAY = int(os.getenv("AUTO_START_DELAY", "15"))  # сек. ждём, пока все прогрузятся
 WARMUP_SECONDS = int(os.getenv("WARMUP_SECONDS", "240"))     # разминка 4 минуты, потом матч стартует принудительно
 CHAT_PREFIX = os.getenv("CHAT_PREFIX", "[{PURPLE}VIBE MIX{Default}] ")
