@@ -3,8 +3,9 @@ KZLP FreePick 5x5: очередь -> капитаны -> пики игроков
 После драфта игроки получают доступ в войс своей команды (Team 1 / Team 2) и перемещаются туда.
 Авто-старт: как только набралось нужное число игроков, драфт запускается сам.
 При Steam-верификации бот определяет FACEIT-уровень игрока и выдаёт роль «FACEIT LVL n».
+Результат матча: табло + MVP + ELO + кнопка «Скачать демо».
 """
-print("▶ bot.py v25 загружается...", flush=True)
+print("▶ bot.py v26 загружается...", flush=True)
 import asyncio
 import io
 import json
@@ -58,10 +59,11 @@ QUEUE_VC = int(os.getenv("QUEUE_VC_ID", "1565440992574705734"))
 # Роль, которая выдаётся после Steam-верификации (0 = не выдавать)
 VERIFIED_ROLE = int(os.getenv("VERIFIED_ROLE_ID", "1565117832251965653"))
 
-# FACEIT: ключ с https://developers.faceit.com (Server side API key). Пусто = FACEIT-роли выключены
+# FACEIT: ключ с https://developers.faceit.com (Server side API key). Пусто = FACEIT-роли выключены.
+# Ключ задаётся ТОЛЬКО в Render -> Environment (FACEIT_API_KEY), в коде его не храним.
 FACEIT_API_KEY = os.getenv("FACEIT_API_KEY", "590b7ce5-2812-4f48-9628-938aff17dff2").strip()
 # 1 = стартовый ELO в FreePick берётся из FACEIT ELO (только для тех, у кого ещё нет рейтинга)
-FACEIT_START_ELO = os.getenv("FACEIT_START_ELO", "1:1548371779523837955,2:1548371779523837956,3:1548371779523837957,4:1548371779523837958,5:1548371779523837959,6:1548371779523837960,7:1548371779523837961,8:1548371779528040610,9:1548371779528040611,10:1548371779528040612") == "1"
+FACEIT_START_ELO = os.getenv("FACEIT_START_ELO", "1:1548371779523837955,2:1548371779523837956,3:1548371779523837957,4;1548371779523837958,5:1548371779523837959,6:1548371779523837960,7:1548371779523837961,8:1548371779528040610,9:1548371779528040611,10:1548371779528040612") == "1"
 
 TEST_MODE = os.getenv("TEST_MODE", "0") == "1"  # 1 = тест: хватает одного игрока, без драфта
 TEAM_SIZE = 1 if TEST_MODE else 5
@@ -79,6 +81,9 @@ RESULTS_CHANNEL = int(os.getenv("RESULTS_CHANNEL_ID", "1565444339084038314"))
 BACKUP_CHANNEL = int(os.getenv("BACKUP_CHANNEL_ID", "1565489828706000948"))
 # Если подключён Render Disk, укажи DB_PATH=/data/freepick.db
 DB_PATH = os.getenv("DB_PATH", "freepick.db")
+
+# Папка для демо матчей (на Render без диска файлы стираются при деплое; с диском: DEMO_DIR=/data/demos)
+DEMO_DIR = os.getenv("DEMO_DIR", "demos")
 
 MAPS = ["de_anubis", "de_mirage", "de_inferno", "de_nuke",
         "de_ancient", "de_dust2", "de_overpass"]
@@ -526,6 +531,10 @@ def load_on_server(match_id: int):
         f'matchzy_remote_log_url "{WEB_BASE_URL}/events"',
         'matchzy_remote_log_header_key "Authorization"',
         f'matchzy_remote_log_header_value "{EVENT_TOKEN}"',
+        # загрузка демо матча на веб-сервер бота (приходит после окончания карты)
+        f'matchzy_demo_upload_url "{WEB_BASE_URL}/demo"',
+        'matchzy_demo_upload_header_key "Authorization"',
+        f'matchzy_demo_upload_header_value "{EVENT_TOKEN}"',
         f'matchzy_loadmatch_url "{WEB_BASE_URL}/match/{match_id}.json"',
     ]
     with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
@@ -876,8 +885,7 @@ async def clear_chat():
 async def reset_to_queue():
     # если сервер не прислал результат (ручной сброс, таймер), всё равно пишем итог в канал результатов
     if S.match_id and S.phase == "playing" and S.match_id not in posted_results:
-        await post_result({}, dict(S.match_players), S.match_id,
-                          note="ℹ️ Статистика с сервера не получена (матч завершён вручную или по таймеру).")
+        await post_result({}, dict(S.match_players), S.match_id, note="manual")
     await clear_voice_access()
     await clear_chat()
     await close_match_chat()
@@ -1236,6 +1244,16 @@ def find_results_channel():
 
 posted_results: set[int] = set()  # матчи, результат которых уже опубликован
 
+# ---- демо матчей
+demo_urls: dict[int, str] = {}                 # match_id -> ссылка на демо
+result_msgs: dict[int, discord.Message] = {}   # match_id -> сообщение с результатом (чтобы добавить кнопку демо позже)
+
+
+def demo_view(url: str) -> discord.ui.View:
+    v = discord.ui.View()
+    v.add_item(discord.ui.Button(label="Скачать демо", emoji="⬇️", url=url))
+    return v
+
 
 def apply_elo(players: dict, win_n: int) -> dict:
     """Пересчитывает ELO по среднему рейтингу команд. Возвращает {discord_id: (было, стало)}."""
@@ -1264,8 +1282,9 @@ def apply_elo(players: dict, win_n: int) -> dict:
 
 
 async def post_result(data: dict, players: dict, match_id, note: str = ""):
-    """Публикует итог матча в канал результатов: карточка-табло + MVP + ELO.
-    Без статистики сервера пишет простой список составов."""
+    """Публикует итог матча в канал результатов: карточка-табло + MVP + ELO + демо.
+    Без статистики сервера пишет простой список составов (с текущим ELO игроков).
+    note: непустая строка = матч завершён вручную/по таймеру (ELO не меняется, на экран ничего не выводится)."""
     try:
         mid = int(match_id)
     except (TypeError, ValueError):
@@ -1352,15 +1371,13 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
             if did in changes:
                 old, new = changes[did]
                 return f" · ELO {new} ({new - old:+d})"
-            return ""
+            return f" · ELO {get_elo(did)}"  # изменения нет (матч завершён вручную): показываем текущий рейтинг
 
         lines = []
         if s1 is not None and s2 is not None:
             lines.append(f"**Team 1  {s1} : {s2}  Team 2**")
         if win in ("team1", "team2"):
             lines.append("🏆 Победитель: **" + ("Team 1" if win == "team1" else "Team 2") + "**")
-        if note:
-            lines.append(note)
         e = discord.Embed(title=f"Результат матча #{mid} — {pretty(raw_map)}", color=0x57F287)
         e.description = "\n".join(lines) or "Матч завершён."
         for n in (1, 2):
@@ -1375,7 +1392,10 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
             e.add_field(name=title, value="\n".join(r[1] for r in rows) or "—", inline=False)
         kwargs = {"embed": e}
     try:
-        await ch.send(**kwargs)
+        if mid in demo_urls:  # демо уже успело прийти
+            kwargs["view"] = demo_view(demo_urls[mid])
+        msg = await ch.send(**kwargs)
+        result_msgs[mid] = msg
         log.info("Результат матча %s опубликован в #%s", mid, ch.name)
     except discord.HTTPException:
         posted_results.discard(mid)
@@ -1635,6 +1655,39 @@ async def h_connect(req: web.Request):
     html = (f'<meta http-equiv="refresh" content="0;url={url}">'
             f'<meta charset="utf-8"><a href="{url}">Подключиться к серверу</a>')
     return web.Response(text=html, content_type="text/html")
+
+
+async def h_demo(req: web.Request):
+    """Принимает файл демо от MatchZy (POST, тело = .dem), сохраняет и добавляет кнопку в сообщение с результатом."""
+    if req.headers.get("Authorization") != EVENT_TOKEN:
+        log.warning("Загрузка демо отклонена: неверный заголовок Authorization")
+        return web.Response(status=401)
+    fname = re.sub(r"[^\w.\-]", "_", os.path.basename(
+        req.headers.get("MatchZy-FileName") or f"match_{int(time.time())}.dem"))
+    os.makedirs(DEMO_DIR, exist_ok=True)
+    path = os.path.join(DEMO_DIR, fname)
+    try:
+        with open(path, "wb") as f:
+            async for chunk in req.content.iter_chunked(1 << 20):
+                f.write(chunk)
+    except Exception:
+        log.exception("Не удалось сохранить демо %s", fname)
+        return web.Response(status=500)
+    url = f"{WEB_BASE_URL}/demos/{fname}"
+    log.info("Демо сохранено: %s", fname)
+    try:
+        mid = int(req.headers.get("MatchZy-MatchId", ""))
+    except ValueError:
+        mid = None
+    if mid:
+        demo_urls[mid] = url
+        msg = result_msgs.get(mid)
+        if msg:  # результат уже опубликован: добавляем кнопку к нему
+            try:
+                await msg.edit(view=demo_view(url))
+            except discord.HTTPException:
+                log.exception("Не удалось добавить кнопку демо к результату")
+    return web.Response(text="ok")
 
 
 async def h_events(req: web.Request):
@@ -1941,13 +1994,16 @@ class FreePickBot(commands.Bot):
         self.add_view(BanLogView())
         await ensure_fonts()  # шрифт с кириллицей для картинки результата
 
-        app = web.Application()
+        os.makedirs(DEMO_DIR, exist_ok=True)
+        app = web.Application(client_max_size=1024 ** 3)  # демо CS2 может весить сотни МБ
         app.add_routes([
             web.get("/", lambda r: web.Response(text="ok")),  # health check
             web.get(r"/match/{mid:\d+}.json", h_match),
             web.get("/connect", h_connect),
             web.get("/bans", h_bans),
             web.post("/events", h_events),
+            web.post("/demo", h_demo),
+            web.static("/demos", DEMO_DIR),
             web.get("/auth/steam", h_auth),
             web.get("/auth/steam/callback", h_auth_callback),
         ])
@@ -2262,6 +2318,7 @@ def main():
     say(f"▶ Порт веб-сервера: {WEB_PORT}, WEB_BASE_URL: {WEB_BASE_URL}")
     say(f"▶ TEST_MODE={TEST_MODE}, QUEUE_VC_ID={QUEUE_VC}, GUILD_ID={GUILD_ID}")
     say(f"▶ FACEIT: {'ключ задан' if FACEIT_API_KEY else 'FACEIT_API_KEY не задан (FACEIT-роли выключены)'}")
+    say(f"▶ Демо сохраняются в: {DEMO_DIR}")
     if not token:
         say("❌ Не задана переменная DISCORD_TOKEN (Render -> Environment)")
         raise SystemExit(1)
