@@ -1,12 +1,12 @@
 """
-KZLP FreePick 5x5: очередь -> капитаны -> пики игроков -> вето карт -> запуск матча на CS2 (MatchZy).
-После драфта игроки получают доступ в войс своей команды (Team 1 / Team 2) и перемещаются туда.
-Авто-старт: как только набралось нужное число игроков, драфт запускается сам.
+KZLP FreePick 5x5: очередь -> готовность -> капитаны -> пики игроков -> вето карт -> запуск матча на CS2 (MatchZy).
+После драфта бот САМ создаёт войсы Team 1 / Team 2 и перекидывает туда игроков (после матча войсы удаляются).
+Авто-старт матча: как только все игроки зашли на сервер, матч стартует сам; иначе после разминки (4 мин).
 Если во время драфта все игроки вышли из войса очереди, драфт отменяется и очередь сбрасывается.
 При Steam-верификации бот определяет FACEIT-уровень игрока и выдаёт роль «FACEIT LVL n».
-Результат матча: табло + MVP + ELO + кнопка «Скачать демо».
+Результат матча: табло + MVP + ELO (+30 / -20) + кнопка «Скачать демо».
 """
-print("▶ bot.py v28 загружается...", flush=True)
+print("▶ bot.py v29 загружается...", flush=True)
 import asyncio
 import io
 import json
@@ -50,10 +50,6 @@ EVENT_TOKEN = os.getenv("EVENT_TOKEN") or secrets.token_urlsafe(24)  # секр�
 # ID твоего Discord-сервера: команды появятся мгновенно (необязательно)
 GUILD_ID = int(os.getenv("GUILD_ID", "1548371779523837952"))
 
-# Голосовые каналы команд (0 = выключено)
-TEAM1_VC = int(os.getenv("TEAM1_VC_ID", "1565442747450659038"))
-TEAM2_VC = int(os.getenv("TEAM2_VC_ID", "1565442482425041016"))
-
 # Голосовой канал очереди: зашёл в него = встал в очередь, вышел = покинул (0 = только кнопки)
 QUEUE_VC = int(os.getenv("QUEUE_VC_ID", "1565440992574705734"))
 
@@ -71,8 +67,15 @@ TEAM_SIZE = 1 if TEST_MODE else 5
 NEED = 1 if TEST_MODE else TEAM_SIZE * 2
 PICK_TIMEOUT = 30            # секунд на пик/бан, потом выбор случайный
 CAPTAIN_TIMEOUT = 30         # секунд на выбор капитанов (кто не вызвался, назначается случайно)
+READY_TIMEOUT = int(os.getenv("READY_TIMEOUT", "60"))   # секунд на кнопку «Готов»
 MATCH_MAX_SECONDS = 600 if TEST_MODE else 2 * 3600  # автосброс, если series_end не пришёл
 BREAK_SECONDS = int(os.getenv("BREAK_SECONDS", "300"))  # сколько ждём вышедшего игрока, потом матч продолжается
+
+# Автостарт матча: все зашли на сервер -> через AUTO_START_DELAY сек матч стартует сам
+AUTO_START = os.getenv("AUTO_START", "1") == "1"            # 0 = выключить автостарт
+AUTO_START_DELAY = int(os.getenv("AUTO_START_DELAY", "15"))  # сек. ждём, пока все прогрузятся
+WARMUP_SECONDS = int(os.getenv("WARMUP_SECONDS", "240"))     # разминка 4 минуты, потом матч стартует принудительно
+CHAT_PREFIX = os.getenv("CHAT_PREFIX", "[{Green}KZLP{Default}] ")
 
 # Канал для результатов матчей (0 = бот сам найдёт канал, в названии которого есть "результаты")
 RESULTS_CHANNEL = int(os.getenv("RESULTS_CHANNEL_ID", "1565444339084038314"))
@@ -110,7 +113,8 @@ db.execute("CREATE TABLE IF NOT EXISTS elo ("
 db.commit()
 
 ELO_START = 1000   # стартовый рейтинг
-ELO_K = 30         # сила изменения за матч
+ELO_WIN = 30       # +30 за победу
+ELO_LOSS = 20      # -20 за поражение
 ELO_MIN = 100      # ниже этого рейтинг не падает
 
 
@@ -150,7 +154,7 @@ _restore_done = False  # пока бэкап не прочитан, новый �
 
 
 def _dump() -> str:
-    keys = ("panel_channel", "panel_message", "team_access")
+    keys = ("panel_channel", "panel_message", "team_vcs", "match_no")
     data = {
         "links": db.execute("SELECT discord_id, steamid64 FROM links").fetchall(),
         "bans": db.execute("SELECT discord_id, reason, expires FROM bans").fetchall(),
@@ -293,7 +297,7 @@ class State:
         self.panel: discord.Message | None = None
         self.match_id: int | None = None
         self.matches: dict[int, dict] = {}
-        self.team_access: list[tuple[int, int]] = []   # (id канала, id игрока) с выданным доступом
+        self.team_vcs: dict[int, int] = {}             # номер команды -> id временного войса
         self.active_ids: set[int] = set()              # игроки текущего драфта/матча
         self.chat_msgs: list[discord.Message] = []     # сообщения драфта/матча, удаляются при сбросе
         self.match_players: dict[str, tuple[discord.Member, int]] = {}  # steamid64 -> (игрок, номер команды)
@@ -307,6 +311,8 @@ class State:
         self.match_channel: discord.TextChannel | None = None   # отдельный чат матча
         self.draft_task: asyncio.Task | None = None    # задача драфта (чтобы отменить, если все вышли из войса)
         self.draft_check = False                       # идёт проверка «все ли вышли из войса»
+        self.connected: set[str] = set()               # steamid игроков матча, которые сейчас на сервере
+        self.auto_started = False                      # автостарт уже запущен для этого матча
         self.lock = asyncio.Lock()
 
 
@@ -314,17 +320,17 @@ S = State()
 
 
 def save_access():
-    kv_set("team_access", json.dumps(S.team_access))
+    kv_set("team_vcs", json.dumps(S.team_vcs))
     schedule_backup()
 
 
 def load_access():
-    raw = kv_get("team_access")
+    raw = kv_get("team_vcs")
     if raw:
         try:
-            S.team_access = [tuple(x) for x in json.loads(raw)]
+            S.team_vcs = {int(k): int(v) for k, v in json.loads(raw).items()}
         except (ValueError, TypeError):
-            S.team_access = []
+            S.team_vcs = {}
 
 
 def pretty(map_name: str) -> str:
@@ -412,6 +418,78 @@ class QueueView(discord.ui.View):
         await i.response.edit_message(embed=panel_embed(), view=self)
 
 
+# ----------------------------- ГОТОВНОСТЬ ----------------------------
+class ReadyView(discord.ui.View):
+    """Когда набрано 10 игроков, каждый должен нажать «Готов». Кто не нажал, выбывает из очереди."""
+
+    def __init__(self, players: list[discord.Member]):
+        super().__init__(timeout=READY_TIMEOUT)
+        self.players = players
+        self.ids = {m.id for m in players}
+        self.ready: set[int] = set()
+
+    def embed(self, title: str = "Матч найден!", color: int = 0x57F287) -> discord.Embed:
+        lines = [f"{'✅' if m.id in self.ready else '⏳'} {m.mention}" for m in self.players]
+        e = discord.Embed(title=title, color=color,
+                          description=f"Нажмите **Готов** в течение {READY_TIMEOUT} сек.\n\n" + "\n".join(lines))
+        e.set_footer(text=f"Готовы: {len(self.ready)} из {len(self.players)}")
+        return e
+
+    @discord.ui.button(label="Готов", emoji="✅", style=discord.ButtonStyle.success)
+    async def ok(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id not in self.ids:
+            return await i.response.send_message("Вы не участвуете в этом матче.", ephemeral=True)
+        self.ready.add(i.user.id)
+        if len(self.ready) == len(self.players):
+            await i.response.edit_message(embed=self.embed(), view=None)
+            self.stop()
+        else:
+            await i.response.edit_message(embed=self.embed(), view=self)
+
+
+async def ready_check(channel, players: list[discord.Member]) -> bool:
+    """True, если все нажали «Готов». Иначе матч отменяется, не нажавшие убираются из очереди."""
+    view = ReadyView(players)
+    msg = await track_send(channel, " ".join(m.mention for m in players),
+                           embed=view.embed(), view=view)
+    await view.wait()
+    if len(view.ready) == len(players):
+        return True
+
+    # ---- не все готовы: отмена ----
+    absent = [m for m in players if m.id not in view.ready]
+    ready_players = [m for m in players if m.id in view.ready]
+    try:
+        await msg.edit(embed=view.embed("Матч отменён", 0xED4245), view=None)
+    except discord.HTTPException:
+        pass
+    for m in absent:
+        if QUEUE_VC and m.voice and m.voice.channel and m.voice.channel.id == QUEUE_VC:
+            try:
+                await m.move_to(None)  # убираем из войса очереди
+            except discord.HTTPException:
+                pass
+        try:
+            await m.send("⏰ Вы не нажали «Готов» и были убраны из очереди. Зайдите снова, когда будете готовы.")
+        except discord.HTTPException:
+            pass
+    async with S.lock:
+        S.phase = "queue"
+        S.queue = ready_players          # готовые остаются в очереди
+        S.active_ids.clear()
+        S.draft_task = None
+    await clear_chat()
+    try:
+        await channel.send("⏰ Не все нажали «Готов». Не нажавшие убраны, остальные остались в очереди: "
+                           + ", ".join(m.mention for m in absent),
+                           delete_after=30, allowed_mentions=discord.AllowedMentions.none())
+    except discord.HTTPException:
+        pass
+    await refresh_panel()
+    await sync_queue()
+    return False
+
+
 # ----------------------------- ПИКИ И ВЕТО ---------------------------
 class CaptainView(discord.ui.View):
     """Игроки сами вызываются в капитаны: первые двое нажавших становятся капитанами."""
@@ -456,23 +534,49 @@ async def choose_captains(channel, players: list[discord.Member]) -> list[discor
     return caps
 
 
+def next_match_no() -> int:
+    n = int(kv_get("match_no") or 0) + 1
+    kv_set("match_no", n)
+    schedule_backup()
+    return n
+
+
+def draft_embed(no: int, teams, pool, cap=None, done: bool = False) -> discord.Embed:
+    """Табло драфта: две команды + свободные игроки."""
+    e = discord.Embed(title=f"Очередь — FreePick #{no}", color=0x2B2D31)
+    if done:
+        e.description = "✅ Драфт завершён."
+    elif cap:
+        e.description = f"Ход капитана {cap.mention} — выберите игрока кнопками ниже."
+    for t in teams:
+        lines = [f"`{n:02d}` {m.mention}" for n, m in enumerate(t, 1)]
+        e.add_field(name=f"team_{t[0].display_name}"[:256], value="\n".join(lines), inline=True)
+    if pool:
+        free = [f"`{n:02d}` {m.mention}" for n, m in enumerate(pool, 1)]
+        e.add_field(name=f"Свободные игроки: {len(pool)}", value="\n".join(free), inline=False)
+    return e
+
+
 class PickView(discord.ui.View):
+    """Кнопка на каждого свободного игрока: «ник | ELO: 1000»."""
+
     def __init__(self, cap: discord.Member, pool: list[discord.Member]):
         super().__init__(timeout=PICK_TIMEOUT)
         self.cap, self.pool, self.picked = cap, pool, None
-        self.select = discord.ui.Select(
-            placeholder="Выберите игрока",
-            options=[discord.SelectOption(label=f"{m.display_name[:80]} · ELO {get_elo(m.id)}", value=str(m.id)) for m in pool],
-        )
-        self.select.callback = self.on_pick
-        self.add_item(self.select)
+        for m in pool:
+            btn = discord.ui.Button(label=f"{m.display_name[:55]} | ELO: {get_elo(m.id)}",
+                                    style=discord.ButtonStyle.secondary)
+            btn.callback = self._make_cb(m)
+            self.add_item(btn)
 
-    async def on_pick(self, i: discord.Interaction):
-        if i.user.id != self.cap.id:
-            return await i.response.send_message("Сейчас выбирает другой капитан.", ephemeral=True)
-        self.picked = next(m for m in self.pool if str(m.id) == self.select.values[0])
-        await i.response.defer()
-        self.stop()
+    def _make_cb(self, member: discord.Member):
+        async def cb(i: discord.Interaction):
+            if i.user.id != self.cap.id:
+                return await i.response.send_message("Сейчас выбирает другой капитан.", ephemeral=True)
+            self.picked = member
+            await i.response.defer()
+            self.stop()
+        return cb
 
 
 class VetoView(discord.ui.View):
@@ -534,6 +638,7 @@ def load_on_server(match_id: int):
         f'matchzy_remote_log_url "{WEB_BASE_URL}/events"',
         'matchzy_remote_log_header_key "Authorization"',
         f'matchzy_remote_log_header_value "{EVENT_TOKEN}"',
+        f'matchzy_chat_prefix "{CHAT_PREFIX}"',
         # загрузка демо матча на веб-сервер бота (приходит после окончания карты)
         f'matchzy_demo_upload_url "{WEB_BASE_URL}/demo"',
         'matchzy_demo_upload_header_key "Authorization"',
@@ -572,57 +677,67 @@ def rcon_pause(pause: bool):
             _rcon_run(c, fallback)
 
 
+def rcon_force_start() -> str:
+    """Блокирующая функция: принудительный старт матча MatchZy (как админская команда .start)."""
+    with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
+        return _rcon_run(c, "css_start") or ""
+
+
 # ----------------------------- ВОЙСЫ КОМАНД --------------------------
 async def move_to_voice(guild: discord.Guild, teams):
-    """Выдаёт игрокам доступ в войс их команды (Team 1 / Team 2) и перекидывает их туда."""
-    await clear_voice_access()  # на случай, если остались доступы от прошлого матча
-    for vc_id, team in ((TEAM1_VC, teams[0]), (TEAM2_VC, teams[1])):
-        if not vc_id:
+    """Создаёт войсы Team 1 / Team 2 только для игроков матча и перекидывает их туда."""
+    await clear_voice_access()  # на случай, если остались войсы от прошлого матча
+    category = S.panel.channel.category if S.panel else None
+    for n, team in enumerate(teams, 1):
+        if not team:
             continue
-        ch = guild.get_channel(vc_id)
-        if not ch:
-            log.warning("Голосовой канал %s не найден", vc_id)
-            continue
+        ow = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False, connect=False),
+            guild.me: discord.PermissionOverwrite(view_channel=True, connect=True,
+                                                  move_members=True, manage_channels=True),
+        }
         for m in team:
-            member = guild.get_member(m.id)
-            if not member:
-                continue
-            # 1) доступ в канал
-            try:
-                await ch.set_permissions(member, view_channel=True, connect=True, speak=True,
-                                         reason="FreePick: игрок матча")
-                S.team_access.append((vc_id, member.id))
-            except discord.HTTPException:
-                log.exception("Не удалось выдать доступ %s в войс %s", member, vc_id)
-                continue
-            # 2) перекидываем, если он сейчас в любом войсе
-            if member.voice:
+            mem = guild.get_member(m.id)
+            if mem:
+                ow[mem] = discord.PermissionOverwrite(view_channel=True, connect=True, speak=True)
+        try:
+            ch = await guild.create_voice_channel(f"Team {n}", overwrites=ow, category=category,
+                                                  reason="FreePick: войс команды")
+        except discord.HTTPException:
+            log.exception("Не удалось создать войс Team %s (нужны права Manage Channels и Move Members)", n)
+            continue
+        S.team_vcs[n] = ch.id
+        save_access()  # сохраняем сразу: если бот упадёт, войс удалится при следующем старте
+        for m in team:
+            mem = guild.get_member(m.id)
+            if mem and mem.voice:
                 try:
-                    await member.move_to(ch)
+                    await mem.move_to(ch)
                 except discord.HTTPException:
-                    log.exception("Не удалось переместить %s", member)
+                    log.exception("Не удалось переместить %s", mem)
     save_access()
 
 
 async def clear_voice_access():
-    """Забирает доступ в командные войсы после матча."""
-    if not S.team_access:
+    """После матча удаляет временные войсы (игроков из них возвращает в войс очереди)."""
+    if not S.team_vcs:
         return
-    for vc_id, member_id in list(S.team_access):
-        ch = bot.get_channel(vc_id)
+    vcs, S.team_vcs = list(S.team_vcs.values()), {}  # обнуляем сразу, чтобы on_voice_state_update не гнал игроков обратно
+    queue_ch = bot.get_channel(QUEUE_VC) if QUEUE_VC else None
+    for cid in vcs:
+        ch = bot.get_channel(cid)
         if not ch:
             continue
-        member = ch.guild.get_member(member_id)
-        if not member:
-            try:
-                member = await ch.guild.fetch_member(member_id)
-            except discord.HTTPException:
-                continue  # игрока уже нет на сервере
+        if queue_ch:
+            for m in list(ch.members):
+                try:
+                    await m.move_to(queue_ch)
+                except discord.HTTPException:
+                    pass
         try:
-            await ch.set_permissions(member, overwrite=None, reason="FreePick: матч окончен")
+            await ch.delete(reason="FreePick: матч окончен")
         except discord.HTTPException:
-            log.exception("Не удалось забрать доступ в войс")
-    S.team_access.clear()
+            log.exception("Не удалось удалить войс команды")
     save_access()
 
 
@@ -806,6 +921,54 @@ async def handle_connect(data: dict):
             pass
 
 
+# ----------------------------- АВТОСТАРТ -----------------------------
+async def force_start(match_id: int, reason: str):
+    """Принудительно стартует матч (без .ready). Срабатывает один раз за матч."""
+    if S.phase != "playing" or S.match_id != match_id or S.live or S.auto_started:
+        return
+    S.auto_started = True
+    ch = S.match_channel or (S.panel.channel if S.panel else None)
+    if ch:
+        try:
+            await ch.send(f"✅ {reason}. Матч стартует, писать .ready не нужно.", delete_after=60)
+        except discord.HTTPException:
+            pass
+    try:
+        state = await asyncio.to_thread(rcon_gamestate)
+        if state not in ("warmup", None):  # матч уже идёт (например, начали вручную): не вмешиваемся
+            return
+        resp = await asyncio.to_thread(rcon_force_start)
+        log.info("Автостарт матча %s, ответ сервера: %r", match_id, resp[:200])
+    except Exception:
+        S.auto_started = False
+        log.exception("Не удалось автоматически стартовать матч")
+
+
+async def track_connect(data: dict):
+    """Игрок зашёл на сервер: если на сервере уже все игроки матча, запускаем автостарт."""
+    player = data.get("player") or {}
+    sid = str(player.get("steamid", ""))
+    if player.get("is_bot") or sid not in S.match_players:
+        return
+    S.connected.add(sid)
+    log.info("На сервере %s из %s игроков матча", len(S.connected), len(S.match_players))
+    if AUTO_START and not S.auto_started and not S.live and len(S.connected) >= len(S.match_players):
+        mid = S.match_id
+        await asyncio.sleep(AUTO_START_DELAY)  # даём всем догрузиться
+        if S.match_id == mid and len(S.connected) >= len(S.match_players):
+            await force_start(mid, "Все игроки на сервере")
+
+
+async def warmup_timer(match_id: int):
+    """Разминка WARMUP_SECONDS (4 мин): потом матч стартует принудительно, если на сервере кто-то есть."""
+    await asyncio.sleep(WARMUP_SECONDS)
+    while S.phase == "playing" and S.match_id == match_id and not S.live and not S.auto_started:
+        if S.connected:  # хотя бы один игрок на сервере
+            await force_start(match_id, "Разминка закончилась")
+            return
+        await asyncio.sleep(30)
+
+
 async def break_timer():
     await asyncio.sleep(BREAK_SECONDS)
     if S.paused:
@@ -898,6 +1061,8 @@ async def reset_to_queue():
     S.absent.clear()
     S.match_players = {}
     S.captain_ids = set()
+    S.connected = set()
+    S.auto_started = False
     async with S.lock:
         S.phase = "queue"
         S.queue.clear()
@@ -1000,23 +1165,29 @@ async def auto_reset(match_id: int):
 
 
 async def draft(channel, players):
+    no = next_match_no()
     caps = await choose_captains(channel, players)  # капитаны вызываются сами
     pool = [m for m in players if m not in caps]
     teams = [[caps[0]], [caps[1]]]
 
-    # ---- пики игроков (по очереди) ----
+    # ---- пики игроков: одно сообщение, которое обновляется после каждого выбора ----
     turn = 0
+    msg = None
     while len(pool) > 1:
         cap = caps[turn]
         view = PickView(cap, pool)
-        msg = await track_send(channel, f"{cap.mention}, выберите игрока ({PICK_TIMEOUT} сек)", view=view)
+        emb = draft_embed(no, teams, pool, cap)
+        if msg is None:
+            msg = await track_send(channel, embed=emb, view=view)
+        else:
+            await msg.edit(embed=emb, view=view)
         await view.wait()
-        picked = view.picked or random.choice(pool)
+        picked = view.picked or random.choice(pool)  # не успел: случайный игрок
         pool.remove(picked)
         teams[turn].append(picked)
-        await msg.edit(content=f"{cap.mention} выбрал {picked.mention}", view=None)
         turn ^= 1
     teams[turn].append(pool[0])  # последний игрок достаётся автоматически
+    await msg.edit(embed=draft_embed(no, teams, [], done=True), view=None)
 
     # ---- вето карт ----
     maps = MAPS.copy()
@@ -1025,14 +1196,14 @@ async def draft(channel, players):
         cap = caps[turn]
         view = VetoView(cap, maps)
         left = ", ".join(pretty(m) for m in maps)
-        msg = await track_send(
+        vmsg = await track_send(
             channel,
             f"🗺 {cap.mention}, забаньте карту ({PICK_TIMEOUT} сек)\nОсталось: {left}",
             view=view)
         await view.wait()
         banned = view.banned or random.choice(maps)
         maps.remove(banned)
-        await msg.edit(content=f"❌ {cap.mention} забанил **{pretty(banned)}**", view=None)
+        await vmsg.edit(content=f"❌ {cap.mention} забанил **{pretty(banned)}**", view=None)
         turn ^= 1
     map_name = maps[0]
     await track_send(channel, f"✅ Выбрана карта: **{pretty(map_name)}**")
@@ -1044,6 +1215,8 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
     S.draft_task = asyncio.current_task()  # чтобы драфт можно было отменить, если все вышли из войса
     try:
         S.active_ids = {m.id for m in players}
+        if not TEST_MODE and not await ready_check(channel, players):
+            return  # не все нажали «Готов»: очередь уже сброшена внутри ready_check
         chat = await open_match_chat(channel, players)
         if chat:
             channel = chat  # драфт, вето и карточка матча идут в отдельный чат
@@ -1065,6 +1238,8 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
         S.captain_ids = {t[0].id for t in teams if t}
         S.live = False
         S.match_id = match_id
+        S.connected = set()
+        S.auto_started = False
         await asyncio.to_thread(load_on_server, match_id)
 
         S.phase = "playing"
@@ -1072,6 +1247,7 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
         await refresh_panel()
         asyncio.create_task(auto_reset(match_id))
         asyncio.create_task(watch_match(match_id))
+        asyncio.create_task(warmup_timer(match_id))
 
         connect = f"connect {SERVER_IP}:{SERVER_PORT}"
         if SERVER_PASSWORD:
@@ -1082,14 +1258,14 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
                         value="\n".join(m.mention for m in t) or "—")
         e.add_field(name="Важно",
                     value="Заходите с **привязанного Steam-аккаунта**: команда выдаётся автоматически по SteamID. "
-                          "Подробности пришли вам в личные сообщения.",
+                          "Матч стартует сам, когда все зайдут на сервер. Подробности пришли в личные сообщения.",
                     inline=False)
         e.add_field(name="Подключение (консоль CS2)", value=f"```{connect}```", inline=False)
         link_view = MatchView()
         await track_send(channel, embed=e, view=link_view)
         asyncio.create_task(notify_players(teams, map_name, match_id))
 
-        # ---- доступ в войсы Team 1 / Team 2 и перемещение ----
+        # ---- войсы Team 1 / Team 2: бот создаёт их и перекидывает игроков ----
         if hasattr(channel, "guild") and channel.guild:
             await move_to_voice(channel.guild, teams)
 
@@ -1288,18 +1464,16 @@ def demo_view(url: str) -> discord.ui.View:
 
 
 def apply_elo(players: dict, win_n: int) -> dict:
-    """Пересчитывает ELO по среднему рейтингу команд. Возвращает {discord_id: (было, стало)}."""
+    """Победителям +ELO_WIN (30), проигравшим -ELO_LOSS (20). Возвращает {discord_id: (было, стало)}."""
     teams = {1: [], 2: []}
     for m, n in players.values():
         teams[n].append(m.id)
     if not teams[1] or not teams[2]:
         return {}
-    avg = {n: sum(get_elo(i) for i in ids) / len(ids) for n, ids in teams.items()}
     changes = {}
     for n, ids in teams.items():
-        expected = 1 / (1 + 10 ** ((avg[3 - n] - avg[n]) / 400))
         won = 1 if n == win_n else 0
-        delta = round(ELO_K * (won - expected))
+        delta = ELO_WIN if won else -ELO_LOSS
         for i in ids:
             old = get_elo(i)
             new = max(ELO_MIN, old + delta)
@@ -1743,9 +1917,11 @@ async def h_events(req: web.Request):
         asyncio.create_task(post_result(data, dict(S.match_players), S.match_id))
     elif same and ev == "player_connect":
         asyncio.create_task(handle_connect(data))
+        asyncio.create_task(track_connect(data))
     elif same and ev == "player_disconnect":
         player = data.get("player") or {}
         if not player.get("is_bot"):
+            S.connected.discard(str(player.get("steamid", "")))
             asyncio.create_task(handle_disconnect(str(player.get("steamid", ""))))
     return web.Response(text="ok")
 
@@ -2238,7 +2414,7 @@ async def unban_cmd(i: discord.Interaction, member: discord.User, reason: str = 
 async def endmatch_cmd(i: discord.Interaction):
     await i.response.defer(ephemeral=True)
     await reset_to_queue()
-    await i.followup.send("Очередь сброшена, доступы в войсы команд забраны.", ephemeral=True)
+    await i.followup.send("Очередь сброшена, временные войсы команд удалены.", ephemeral=True)
 
 
 async def find_panel():
@@ -2269,8 +2445,8 @@ async def on_ready():
         asyncio.create_task(ban_expiry_loop())
     asyncio.create_task(restore_from_dms())  # доберём тех, кого нет в бэкапе (из ЛС бота)
     load_access()
-    # Если бот перезапустился во время матча, а матча уже нет — снимаем старые доступы
-    if S.team_access and S.phase != "playing":
+    # Если бот перезапустился во время матча, а матча уже нет — удаляем старые войсы команд
+    if S.team_vcs and S.phase != "playing":
         await clear_voice_access()
     # Восстанавливаем панель после перезапуска
     ch_id, msg_id = kv_get("panel_channel"), kv_get("panel_message")
@@ -2300,7 +2476,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     # Во время матча игрока, зашедшего в любой войс, сразу перекидываем в войс его команды
     if after.channel and S.phase == "playing":
         team_n = next((n for m, n in S.match_players.values() if m.id == member.id), None)
-        vc_id = (TEAM1_VC if team_n == 1 else TEAM2_VC) if team_n else 0
+        vc_id = S.team_vcs.get(team_n, 0) if team_n else 0
         if vc_id and after.channel.id != vc_id:
             target = member.guild.get_channel(vc_id)
             if target:
@@ -2352,6 +2528,7 @@ def main():
     say(f"▶ DISCORD_TOKEN: {'задан, длина ' + str(len(token)) if token else 'НЕ ЗАДАН'}")
     say(f"▶ Порт веб-сервера: {WEB_PORT}, WEB_BASE_URL: {WEB_BASE_URL}")
     say(f"▶ TEST_MODE={TEST_MODE}, QUEUE_VC_ID={QUEUE_VC}, GUILD_ID={GUILD_ID}")
+    say(f"▶ Автостарт: {'вкл' if AUTO_START else 'выкл'}, разминка {WARMUP_SECONDS} сек")
     say(f"▶ FACEIT: {'ключ задан' if FACEIT_API_KEY else 'FACEIT_API_KEY не задан (FACEIT-роли выключены)'}")
     say(f"▶ Демо сохраняются в: {DEMO_DIR}")
     if not token:
