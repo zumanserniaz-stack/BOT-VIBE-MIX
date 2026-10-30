@@ -329,7 +329,7 @@ def pretty(map_name: str) -> str:
 
 
 def panel_embed() -> discord.Embed:
-    e = discord.Embed(title="Очередь — FreePick", color=0x5865F2)
+    e = discord.Embed(title="Очередь — FreePick", color=0x2B2D31)
     e.add_field(
         name="Настройки матча",
         value=("Режим: Соревновательный\nВыбор игроков: Капитаны\n"
@@ -1044,7 +1044,7 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
         connect = f"connect {SERVER_IP}:{SERVER_PORT}"
         if SERVER_PASSWORD:
             connect += f"; password {SERVER_PASSWORD}"
-        e = discord.Embed(title=f"Матч #{match_id} готов — {pretty(map_name)}", color=0x57F287)
+        e = discord.Embed(title=f"Матч #{match_id} готов — {pretty(map_name)}", color=0x2B2D31)
         for n, t in enumerate(teams, 1):
             e.add_field(name=f"Team {n}" + (f" ({t[0].display_name})" if t else ""),
                         value="\n".join(m.mention for m in t) or "—")
