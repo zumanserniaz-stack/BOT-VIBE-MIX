@@ -6,7 +6,7 @@ VIBE MIX FreePick 5x5: очередь -> готовность -> капитан�
 При Steam-верификации бот определяет FACEIT-уровень игрока и выдаёт роль «FACEIT LVL n».
 Результат матча: табло + MVP + ELO (+30 / -20) + кнопка «Скачать демо».
 """
-print("▶ bot.py v31 загружается...", flush=True)
+print("▶ bot.py v32 загружается...", flush=True)
 import asyncio
 import io
 import json
@@ -75,7 +75,7 @@ BREAK_SECONDS = int(os.getenv("BREAK_SECONDS", "300"))  # сколько ждё�
 AUTO_START = os.getenv("AUTO_START", "1") == "1"            # 0 = выключить автостарт
 AUTO_START_DELAY = int(os.getenv("AUTO_START_DELAY", "15"))  # сек. ждём, пока все прогрузятся
 WARMUP_SECONDS = int(os.getenv("WARMUP_SECONDS", "240"))     # разминка 4 минуты, потом матч стартует принудительно
-CHAT_PREFIX = os.getenv("CHAT_PREFIX", "[{PURPLE}VIBE MIX{Default}] ")
+CHAT_PREFIX = os.getenv("CHAT_PREFIX", "[{PURPLE}VIBE MIX{Default}]" )
 
 # Канал для результатов матчей (0 = бот сам найдёт канал, в названии которого есть "результаты")
 RESULTS_CHANNEL = int(os.getenv("RESULTS_CHANNEL_ID", "1565444339084038314"))
@@ -716,7 +716,21 @@ def rcon_players() -> set:
     """Блокирующая функция: SteamID64 всех игроков, которые сейчас на сервере (по команде status)."""
     with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
         resp = _rcon_run(c, "status") or ""
-    return {str(76561197960265728 + int(a)) for a in re.findall(r"\[U:1:(\d+)\]", resp)}
+    ids = {str(76561197960265728 + int(a)) for a in re.findall(r"\[U:1:(\d+)\]", resp)}
+    global _status_logged
+    if not ids and not _status_logged:
+        _status_logged = True
+        log.info("RCON status не содержит SteamID игроков, ответ сервера: %r", resp[:400])
+    return ids
+
+
+_status_logged = False
+
+
+def rcon_raw(cmd: str) -> str:
+    """Блокирующая функция: выполняет любую RCON-команду и возвращает ответ (для /fp_diag)."""
+    with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
+        return _rcon_run(c, cmd) or ""
 
 
 # ----------------------------- ВОЙСЫ КОМАНД --------------------------
@@ -976,30 +990,56 @@ async def handle_connect(data: dict):
 
 
 # ----------------------------- АВТОСТАРТ -----------------------------
-async def force_start(match_id: int, reason: str):
-    """Принудительно стартует матч (без .ready). Срабатывает один раз за матч."""
+STARTED_STATES = {"knife", "waiting_for_knife_decision", "going_live", "live", "pending_restore"}
+
+
+def match_chat():
+    return S.match_channel or (S.panel.channel if S.panel else None)
+
+
+async def force_start(match_id: int, reason: str) -> bool:
+    """Принудительно стартует матч (без .ready). True = матч стартовал (или уже идёт)."""
     if S.phase != "playing" or S.match_id != match_id or S.live or S.auto_started:
-        return
+        return True
     S.auto_started = True
-    ch = S.match_channel or (S.panel.channel if S.panel else None)
+    ch = match_chat()
     if ch:
         try:
             await ch.send(f"✅ {reason}. Матч стартует, писать .ready не нужно.", delete_after=60)
         except discord.HTTPException:
             pass
+    resp = resp2 = ""
+    state = None
+    failed = False
     try:
-        state = await asyncio.to_thread(rcon_gamestate)
-        if state not in ("warmup", None):  # матч уже идёт (например, начали вручную): не вмешиваемся
-            return
+        state0 = await asyncio.to_thread(rcon_gamestate)
+        if state0 in STARTED_STATES:  # матч уже идёт
+            return True
         resp = await asyncio.to_thread(rcon_force_start)
-        log.info("Автостарт матча %s, ответ сервера: %r", match_id, resp[:200])
         await asyncio.sleep(6)
-        if await asyncio.to_thread(rcon_gamestate) == "warmup":  # css_start не сработал: пробуем forceready
-            resp = await asyncio.to_thread(rcon_force_ready)
-            log.info("Автостарт (forceready) матча %s, ответ сервера: %r", match_id, resp[:200])
-    except Exception:
-        S.auto_started = False
+        state = await asyncio.to_thread(rcon_gamestate)
+        if state is not None and state not in STARTED_STATES:  # css_start не помог: пробуем forceready
+            resp2 = await asyncio.to_thread(rcon_force_ready)
+            await asyncio.sleep(6)
+            state = await asyncio.to_thread(rcon_gamestate)
+        log.info("Автостарт матча %s: состояние %s, css_start=%r, css_forceready=%r",
+                 match_id, state, resp[:200], resp2[:200])
+    except Exception as exc:
+        failed = True
+        resp = f"{type(exc).__name__}: {exc}"
         log.exception("Не удалось автоматически стартовать матч")
+    if not failed and (state in STARTED_STATES or state is None):
+        return True
+    S.auto_started = False
+    if ch:
+        try:
+            await ch.send(f"⚠ Автостарт не сработал. Состояние матча на сервере: `{state}`.\n"
+                          f"Ответ css_start: `{resp[:150] or '—'}`\nОтвет css_forceready: `{resp2[:150] or '—'}`\n"
+                          "Админ может нажать /fp_start или проверить сервер командой /fp_diag.",
+                          delete_after=180)
+        except discord.HTTPException:
+            pass
+    return False
 
 
 async def track_connect(data: dict):
@@ -1022,29 +1062,54 @@ async def warmup_timer(match_id: int):
     Все игроки на сервере -> старт через AUTO_START_DELAY. Иначе через WARMUP_SECONDS после первого входа."""
     t0 = None          # когда зашёл первый игрок
     full_since = None  # когда на сервере стали все
+    tries = 0
+    reported = set()
+    first = True
     while S.phase == "playing" and S.match_id == match_id and not S.live and not S.auto_started:
         await asyncio.sleep(5)
         try:
             present = await asyncio.to_thread(rcon_players)
-        except Exception:
-            log.warning("Не удалось получить список игроков сервера (RCON status)")
+        except Exception as exc:
+            msg = f"{type(exc).__name__}: {exc}"
+            log.warning("RCON status не удался: %s", msg)
+            if msg not in reported:  # сообщаем в чат матча один раз для каждой ошибки
+                reported.add(msg)
+                ch = match_chat()
+                if ch:
+                    try:
+                        await ch.send(f"⚠ Бот не может связаться с CS2-сервером по RCON (`{msg}`). "
+                                      "Проверьте RCON_PASSWORD, SERVER_IP и SERVER_PORT в Render.",
+                                      delete_after=300)
+                    except discord.HTTPException:
+                        pass
             continue
         S.connected = {sid for sid in S.match_players if sid in present}
+        if first:
+            first = False
+            log.info("RCON status: на сервере %s SteamID, из игроков матча %s из %s",
+                     len(present), len(S.connected), len(S.match_players))
         need = len(S.match_players)
         if S.connected and t0 is None:
             t0 = time.time()
+        reason = None
         if AUTO_START and need and len(S.connected) >= need:
             if full_since is None:
                 full_since = time.time()
                 log.info("Все %s игроков на сервере, старт через %s сек", need, AUTO_START_DELAY)
             elif time.time() - full_since >= AUTO_START_DELAY:
-                await force_start(match_id, "Все игроки на сервере")
-                return
+                reason = "Все игроки на сервере"
         else:
             full_since = None
-        if t0 and time.time() - t0 >= WARMUP_SECONDS:
-            await force_start(match_id, "Разминка закончилась")
-            return
+        if not reason and t0 and time.time() - t0 >= WARMUP_SECONDS:
+            reason = "Разминка закончилась"
+        if reason:
+            if await force_start(match_id, reason):
+                return
+            tries += 1
+            if tries >= 3:
+                return
+            full_since = None
+            await asyncio.sleep(20)
 
 
 async def break_timer():
@@ -2525,6 +2590,37 @@ async def endmatch_cmd(i: discord.Interaction):
     await i.response.defer(ephemeral=True)
     await reset_to_queue()
     await i.followup.send("Очередь сброшена, временные войсы команд удалены.", ephemeral=True)
+
+
+@bot.tree.command(name="fp_start", description="(админ) Принудительно стартовать текущий матч на сервере")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@admin
+async def fp_start_cmd(i: discord.Interaction):
+    if S.phase != "playing" or not S.match_id:
+        return await i.response.send_message("Сейчас нет матча на сервере.", ephemeral=True)
+    await i.response.defer(ephemeral=True)
+    S.auto_started = False
+    ok = await force_start(S.match_id, f"{i.user.display_name} запустил матч")
+    await i.followup.send("✅ Команда старта отправлена." if ok else "⚠ Сервер не стартовал матч, смотрите сообщение в чате матча.",
+                          ephemeral=True)
+
+
+@bot.tree.command(name="fp_diag", description="(админ) Проверить связь с CS2-сервером (RCON)")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@admin
+async def fp_diag_cmd(i: discord.Interaction):
+    await i.response.defer(ephemeral=True)
+    parts = [f"Сервер: `{SERVER_IP}:{SERVER_PORT}`, RCON_PASSWORD: {'задан' if RCON_PASSWORD else 'НЕ ЗАДАН'}",
+             f"Матч: `{S.match_id}`, фаза `{S.phase}`, игроков матча {len(S.match_players)}"]
+    for cmd in ("status", "get5_status"):
+        try:
+            resp = await asyncio.to_thread(rcon_raw, cmd)
+            parts.append(f"**{cmd}**\n```{resp.strip()[:650] or '(пусто)'}```")
+        except Exception as exc:
+            parts.append(f"**{cmd}**: ошибка `{type(exc).__name__}: {exc}`")
+    await i.followup.send("\n".join(parts)[:1990], ephemeral=True)
 
 
 async def find_panel():
