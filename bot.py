@@ -4,9 +4,9 @@ VIBE MIX FreePick 5x5: очередь -> готовность -> капитан�
 Авто-старт матча: как только все игроки зашли на сервер, матч стартует сам; иначе после разминки (4 мин).
 Если во время драфта все игроки вышли из войса очереди, драфт отменяется и очередь сбрасывается.
 При Steam-верификации бот определяет FACEIT-уровень игрока и выдаёт роль «FACEIT LVL n».
-Результат матча: табло + MVP + ELO (+30 / -20) + кнопка «Скачать демо».
+Результат матча: табло + MVP + статистика каждого игрока + ELO (+30 / -20) + кнопка «Скачать демо».
 """
-print("▶ bot.py v40 загружается...", flush=True)
+print("▶ bot.py v42 загружается...", flush=True)
 import asyncio
 from collections import deque
 import io
@@ -63,7 +63,7 @@ FACEIT_API_KEY = os.getenv("FACEIT_API_KEY", "").strip()
 # 1 = стартовый ELO в FreePick берётся из FACEIT ELO (только для тех, у кого ещё нет рейтинга)
 FACEIT_START_ELO = os.getenv("FACEIT_START_ELO", "0") == "1"
 
-TEST_MODE = os.getenv("TEST_MODE", "0") == "1"  # 1 = тест: хватает одного игрока, без драфта
+TEST_MODE = os.getenv("TEST_MODE", "1") == "1"  # 1 = тест: хватает одного игрока, без драфта
 TEAM_SIZE = 1 if TEST_MODE else 5
 NEED = 1 if TEST_MODE else TEAM_SIZE * 2
 PICK_TIMEOUT = 30            # секунд на пик/бан, потом выбор случайный
@@ -321,6 +321,7 @@ class State:
 S = State()
 last_round: dict[int, dict] = {}   # match_id -> последнее событие round_end (там статистика игроков)
 event_log = deque(maxlen=12)       # последние события MatchZy (для /fp_diag)
+events_seen: set[int] = set()      # match_id, от которых сервер уже присылал события (значит, remote log настроен)
 snapshots: dict[int, dict] = {}  # match_id -> {steamid64: (игрок, команда)}: чтобы результат пришёл даже после сброса
 
 
@@ -672,6 +673,9 @@ def load_on_server(match_id: int):
         'matchzy_remote_log_header_key "Authorization"',
         f'matchzy_remote_log_header_value "{EVENT_TOKEN}"',
         'matchzy_chat_prefix [{PURPLE}VIBE MIX{Default}]',
+        # запись демо: в имени файла обязательно {MATCH_ID}, по нему кнопка «Скачать демку» находит файл
+        'matchzy_demo_path "MatchZy/"',
+        'matchzy_demo_name_format "{TIME}_{MATCH_ID}_{MAP}"',
         # загрузка демо матча на веб-сервер бота (приходит после окончания карты)
         f'matchzy_demo_upload_url "{WEB_BASE_URL}/demo"',
         'matchzy_demo_upload_header_key "Authorization"',
@@ -685,6 +689,25 @@ def load_on_server(match_id: int):
         for cmd in cmds:
             last = _rcon_run(c, cmd) or ""
     return last  # ответ сервера на matchzy_loadmatch_url (последняя команда)
+
+
+def set_event_cvars():
+    """Блокирующая функция: заново ставит адрес для событий и загрузки демо уже ПОСЛЕ загрузки матча
+    (MatchZy мог сбросить эти настройки при loadmatch). Возвращает то, что сервер отвечает на запрос remote_log_url."""
+    cmds = [
+        f'matchzy_remote_log_url "{WEB_BASE_URL}/events"',
+        'matchzy_remote_log_header_key "Authorization"',
+        f'matchzy_remote_log_header_value "{EVENT_TOKEN}"',
+        f'matchzy_demo_upload_url "{WEB_BASE_URL}/demo"',
+        'matchzy_demo_upload_header_key "Authorization"',
+        f'matchzy_demo_upload_header_value "{EVENT_TOKEN}"',
+        'matchzy_demo_path "MatchZy/"',
+        'matchzy_demo_name_format "{TIME}_{MATCH_ID}_{MAP}"',
+    ]
+    with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
+        for cmd in cmds:
+            _rcon_run(c, cmd)
+        return _rcon_run(c, "matchzy_remote_log_url") or ""
 
 
 def rcon_gamestate():
@@ -1076,6 +1099,7 @@ async def force_start(match_id: int, reason: str) -> bool:
     try:
         state0 = await asyncio.to_thread(rcon_gamestate)
         if state0 in STARTED_STATES:  # матч уже идёт
+            S.ever_live = True
             return True
         resp = await asyncio.to_thread(rcon_force_start)
         await asyncio.sleep(6)
@@ -1091,6 +1115,8 @@ async def force_start(match_id: int, reason: str) -> bool:
         resp = f"{type(exc).__name__}: {exc}"
         log.exception("Не удалось автоматически стартовать матч")
     if not failed and (state in STARTED_STATES or state is None):
+        if state in STARTED_STATES:
+            S.ever_live = True
         return True
     S.auto_started = False
     if ch:
@@ -1128,6 +1154,7 @@ async def warmup_timer(match_id: int):
     reported = set()
     said = set()
     first = True
+    warned_events = False
     while S.phase == "playing" and S.match_id == match_id and not S.live and not S.auto_started:
         await asyncio.sleep(3)
         try:
@@ -1154,6 +1181,16 @@ async def warmup_timer(match_id: int):
         n_here = max(len(S.connected), humans)  # сколько людей на сервере
         if n_here and t0 is None:
             t0 = time.time()
+        if t0 and not warned_events and time.time() - t0 >= 30 and match_id not in events_seen:
+            warned_events = True
+            wch = match_chat()
+            if wch:
+                try:
+                    await wch.send("⚠ От сервера не приходят события MatchZy: результат и демо автоматически не появятся. "
+                                   "Админу: проверьте /fp_diag (matchzy_remote_log_url) и что "
+                                   f"{WEB_BASE_URL}/events доступен с CS2-сервера.", delete_after=300)
+                except discord.HTTPException:
+                    pass
         reason = None
         if AUTO_START and need and n_here >= need:
             if full_since is None:
@@ -1367,6 +1404,8 @@ async def watch_match(match_id: int):
         if state in active:
             seen_active = True
             ended = 0
+            if state in STARTED_STATES:
+                S.ever_live = True  # матч реально идёт, даже если события MatchZy не доходят до бота
         elif state == "post_game" or (state == "none" and seen_active):
             ended += 1
         else:
@@ -1447,7 +1486,7 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
             return  # не все нажали «Готов»: очередь уже сброшена внутри ready_check
         chat = await open_match_chat(channel, players)
         if chat:
-            channel = chat  # драфт, вето и карточка матча идут в отдельный чат
+            channel = chat  # драфт, вето и карточка матча идут в отдельном чате
         else:
             # чат создать не удалось: сообщаем о наборе в общем канале и в ЛС
             await track_send(channel, f"🎯 Набрано {NEED} игроков! " +
@@ -1482,6 +1521,11 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
         loaded, info = await wait_loaded(match_id)
         if not loaded:
             raise RuntimeError(f"сервер не загрузил матч ({info}). Ответ: {(load_resp or '—').strip()[:150]}")
+        try:  # события и демо: ставим заново после загрузки матча
+            cur = await asyncio.to_thread(set_event_cvars)
+            log.info("matchzy_remote_log_url после загрузки матча: %r", cur.strip()[:200])
+        except Exception:
+            log.exception("Не удалось повторно задать адрес событий MatchZy")
 
         S.phase = "playing"
         S.moving = False
@@ -1735,9 +1779,9 @@ def apply_elo(players: dict, win_n: int) -> dict:
 
 
 async def post_result(data: dict, players: dict, match_id, note: str = ""):
-    """Публикует итог матча в канал результатов: карточка-табло + MVP + ELO + демо.
+    """Публикует итог матча в канал результатов: карточка-табло + MVP + статистика и ELO каждого игрока + демо.
     Без статистики сервера пишет простой список составов (с текущим ELO игроков).
-    note: непустая строка = матч завершён вручную/по таймеру (ELO не меняется, на экран ничего не выводится)."""
+    note: непустая строка = победитель неизвестен (ELO не меняется)."""
     try:
         mid = int(match_id)
     except (TypeError, ValueError):
@@ -1757,7 +1801,7 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
     raw_map = (cfg.get("maplist") or ["?"])[0]
     total_rounds = (s1 or 0) + (s2 or 0)
 
-    # ELO меняем только если известен победитель (при ручном завершении рейтинг не трогаем)
+    # ELO меняем только если известен победитель
     changes = {}
     if win in ("team1", "team2") and not note:
         changes = apply_elo(players, 1 if win == "team1" else 2)
@@ -1825,10 +1869,23 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
                          f"{mvp['adr']} ADR · {mvp['hs']}% HS")
         e = discord.Embed(title=f"Match #{mid} — РЕЗУЛЬТАТЫ", description="\n".join(lines), color=0xF1C40F)
         e.set_image(url="attachment://result.png")
-        if changes:
-            elo_lines = [f"{m.mention}: {changes[m.id][1]} ({changes[m.id][1] - changes[m.id][0]:+d})"
-                         for m, n in sorted(players.values(), key=lambda x: x[1]) if m.id in changes]
-            e.add_field(name="📈 ELO", value="\n".join(elo_lines)[:1024], inline=False)
+        # статистика и ELO каждого игрока по командам
+        for n in (1, 2):
+            lines_t = []
+            for r in team_rows[n]:
+                tag = ""
+                if r["member"] and r["member"].id in changes:
+                    old, new = changes[r["member"].id]
+                    tag = f" · **{new}** ({new - old:+d} ELO)"
+                who = r["member"].mention if r["member"] else r["name"]
+                lines_t.append(f"{who} `{r['k']}/{r['d']}/{r['a']}` · ADR {r['adr']} · HS {r['hs']}%{tag}")
+            if not lines_t:  # статистики нет: показываем состав и ELO
+                lines_t = [m.mention + (f" · **{changes[m.id][1]}** ({changes[m.id][1] - changes[m.id][0]:+d} ELO)"
+                                        if m.id in changes else "")
+                           for m, tn in players.values() if tn == n]
+            tsc = (t1, t2)[n - 1].get("score")
+            e.add_field(name=f"Team {n}" + (f" — {tsc}" if tsc is not None else ""),
+                        value="\n".join(lines_t)[:1024] or "—", inline=False)
         e.set_footer(text=f"Карта: {raw_map} · Сыграно раундов: {total_rounds}")
         kwargs = {"embed": e, "file": discord.File(io.BytesIO(card), filename="result.png")}
     else:
@@ -1837,7 +1894,7 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
             if did in changes:
                 old, new = changes[did]
                 return f" · ELO {new} ({new - old:+d})"
-            return f" · ELO {get_elo(did)}"  # изменения нет (матч завершён вручную): показываем текущий рейтинг
+            return f" · ELO {get_elo(did)}"  # изменения нет: показываем текущий рейтинг
 
         lines = []
         if s1 is not None and s2 is not None:
@@ -1869,13 +1926,13 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
 
 async def post_fallback_result(mid: int, players: dict):
     """map_result не пришёл: берём статистику из последнего round_end.
-    Если счёт уже финальный (13+ и разница 2+), победитель определяется по счёту и ELO начисляется."""
+    Победителем считается тот, кто ведёт по счёту: ELO начисляется (+30 / -20). При ничьей ELO не меняется."""
     data = last_round.get(mid) or {}
     note = "manual"
     if data:
         s1 = (data.get("team1") or {}).get("score") or 0
         s2 = (data.get("team2") or {}).get("score") or 0
-        if max(s1, s2) >= 13 and abs(s1 - s2) >= 2:
+        if s1 != s2:  # побеждает тот, кто ведёт по счёту (ничья: ELO не меняется)
             data = dict(data)
             data["winner"] = {"team": "team1" if s1 > s2 else "team2"}
             note = ""
@@ -2195,6 +2252,10 @@ async def h_events(req: web.Request):
         return web.Response(status=400)
     log.info("MatchZy event: %s (matchid=%s)", data.get("event"), data.get("matchid"))
     ev = data.get("event")
+    try:
+        events_seen.add(int(data.get("matchid")))
+    except (TypeError, ValueError):
+        pass
     same = S.phase == "playing" and str(data.get("matchid")) == str(S.match_id)
     event_log.append(f"{time.strftime('%H:%M:%S')} {ev} match={data.get('matchid')} {'ok' if same else 'не текущий матч'}")
     if ev == "series_end" and same:
