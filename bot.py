@@ -6,7 +6,7 @@ VIBE MIX FreePick 5x5: очередь -> готовность -> капитан�
 При Steam-верификации бот определяет FACEIT-уровень игрока и выдаёт роль «FACEIT LVL n».
 Результат матча: табло + MVP + ELO (+30 / -20) + кнопка «Скачать демо».
 """
-print("▶ bot.py v38 загружается...", flush=True)
+print("▶ bot.py v39 загружается...", flush=True)
 import asyncio
 from collections import deque
 import io
@@ -63,7 +63,7 @@ FACEIT_API_KEY = os.getenv("FACEIT_API_KEY", "").strip()
 # 1 = стартовый ELO в FreePick берётся из FACEIT ELO (только для тех, у кого ещё нет рейтинга)
 FACEIT_START_ELO = os.getenv("FACEIT_START_ELO", "0") == "1"
 
-TEST_MODE = os.getenv("TEST_MODE", "1") == "1"  # 1 = тест: хватает одного игрока, без драфта
+TEST_MODE = os.getenv("TEST_MODE", "0") == "1"  # 1 = тест: хватает одного игрока, без драфта
 TEAM_SIZE = 1 if TEST_MODE else 5
 NEED = 1 if TEST_MODE else TEAM_SIZE * 2
 PICK_TIMEOUT = 30            # секунд на пик/бан, потом выбор случайный
@@ -661,14 +661,16 @@ def _rcon_run(c, cmd: str):
 def load_on_server(match_id: int):
     """Блокирующая функция: отправляет команды на CS2-сервер по RCON."""
     cmds = [
-        f'matchzy_remote_log_url "{WEB_BASE_URL}/events"',
-        'matchzy_remote_log_header_key "Authorization"',
-        f'matchzy_remote_log_header_value "{EVENT_TOKEN}"',
+        f'matchzy_remote_log_url {WEB_BASE_URL}/events',
+        'matchzy_remote_log_header_key Authorization',
+        f'matchzy_remote_log_header_value {EVENT_TOKEN}',
+        # чистый префикс чата (без кавычек; пробел неразрывный, чтобы консоль не обрезала значение)
+        'matchzy_chat_prefix [{PURPLE}VIBE\u00a0MIX{Default}]',
         # загрузка демо матча на веб-сервер бота (приходит после окончания карты)
-        f'matchzy_demo_upload_url "{WEB_BASE_URL}/demo"',
-        'matchzy_demo_upload_header_key "Authorization"',
-        f'matchzy_demo_upload_header_value "{EVENT_TOKEN}"',
-        f'matchzy_loadmatch_url "{WEB_BASE_URL}/match/{match_id}.json"',
+        f'matchzy_demo_upload_url {WEB_BASE_URL}/demo',
+        'matchzy_demo_upload_header_key Authorization',
+        f'matchzy_demo_upload_header_value {EVENT_TOKEN}',
+        f'matchzy_loadmatch_url {WEB_BASE_URL}/match/{match_id}.json',
     ]
     with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
         _rcon_run(c, "get5_endmatch")  # сбросить прошлый матч, иначе MatchZy не загрузит новый
@@ -1097,6 +1099,7 @@ async def warmup_timer(match_id: int):
     full_since = None  # когда на сервере стали все
     tries = 0
     reported = set()
+    said = set()
     first = True
     while S.phase == "playing" and S.match_id == match_id and not S.live and not S.auto_started:
         await asyncio.sleep(3)
@@ -1135,8 +1138,18 @@ async def warmup_timer(match_id: int):
                     pass
             elif time.time() - full_since >= AUTO_START_DELAY:
                 reason = "Все игроки на сервере"
+            if full_since is not None:  # обратный отсчёт в чат игры
+                left = AUTO_START_DELAY - (time.time() - full_since)
+                for mark in (10, 5):
+                    if left <= mark and mark not in said:
+                        said.add(mark)
+                        try:
+                            await asyncio.to_thread(rcon_raw, f"say Матч начнётся через {mark} сек")
+                        except Exception:
+                            pass
         else:
             full_since = None
+            said.clear()
         if not reason and t0 and time.time() - t0 >= WARMUP_SECONDS:
             reason = "Разминка закончилась"
         if reason:
