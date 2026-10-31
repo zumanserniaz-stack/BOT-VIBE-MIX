@@ -6,7 +6,7 @@ VIBE MIX FreePick 5x5: очередь -> готовность -> капитан�
 При Steam-верификации бот определяет FACEIT-уровень игрока и выдаёт роль «FACEIT LVL n».
 Результат матча: табло + MVP + ELO (+30 / -20) + кнопка «Скачать демо».
 """
-print("▶ bot.py v36 загружается...", flush=True)
+print("▶ bot.py v37 загружается...", flush=True)
 import asyncio
 from collections import deque
 import io
@@ -76,7 +76,7 @@ BREAK_SECONDS = int(os.getenv("BREAK_SECONDS", "300"))  # сколько ждё�
 AUTO_START = os.getenv("AUTO_START", "1") == "1"            # 0 = выключить автостарт
 AUTO_START_DELAY = int(os.getenv("AUTO_START_DELAY", "15"))  # сек. ждём, пока все прогрузятся
 WARMUP_SECONDS = int(os.getenv("WARMUP_SECONDS", "240"))     # разминка 4 минуты, потом матч стартует принудительно
-CHAT_PREFIX = os.getenv("CHAT_PREFIX", "[{PURPLE}VIBE MIX{Default}]")
+CHAT_PREFIX = os.getenv("CHAT_PREFIX", ["{PURPLE}VIBE MIX{Default}"]
 
 # Канал для результатов матчей (0 = бот сам найдёт канал, в названии которого есть "результаты")
 RESULTS_CHANNEL = int(os.getenv("RESULTS_CHANNEL_ID", "1565444339084038314"))
@@ -675,8 +675,10 @@ def load_on_server(match_id: int):
     with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
         _rcon_run(c, "get5_endmatch")  # сбросить прошлый матч, иначе MatchZy не загрузит новый
         time.sleep(1)
+        last = ""
         for cmd in cmds:
-            _rcon_run(c, cmd)
+            last = _rcon_run(c, cmd) or ""
+    return last  # ответ сервера на matchzy_loadmatch_url (последняя команда)
 
 
 def rcon_gamestate():
@@ -997,6 +999,32 @@ async def handle_connect(data: dict):
 
 
 # ----------------------------- АВТОСТАРТ -----------------------------
+async def verify_load(match_id: int, load_resp: str):
+    """Через 8 сек спрашивает у сервера, загрузился ли матч. Если нет, пишет причину в чат матча."""
+    await asyncio.sleep(8)
+    if S.phase != "playing" or S.match_id != match_id:
+        return
+    try:
+        raw = await asyncio.to_thread(rcon_raw, "get5_status")
+    except Exception as exc:
+        raw = f"{type(exc).__name__}: {exc}"
+    st = re.search(r'"gamestate"\s*:\s*"(\w+)"', raw)
+    mi = re.search(r'"matchid"\s*:\s*"?(\w+)"?', raw)
+    state, loaded = (st.group(1) if st else None), (mi.group(1) if mi else None)
+    log.info("Проверка загрузки матча %s: gamestate=%s, matchid на сервере=%s", match_id, state, loaded)
+    if state not in (None, "none") and loaded == str(match_id):
+        return
+    ch = match_chat()
+    if ch:
+        try:
+            await ch.send(f"⚠ Сервер не загрузил матч #{match_id} (gamestate: `{state}`, matchid на сервере: `{loaded}`).\n"
+                          f"Ответ на loadmatch: `{(load_resp or '—').strip()[:200]}`\n"
+                          "Проверьте, что карта есть на сервере, и откройте ссылку матча в браузере: "
+                          f"{WEB_BASE_URL}/match/{match_id}.json")
+        except discord.HTTPException:
+            pass
+
+
 STARTED_STATES = {"knife", "waiting_for_knife_decision", "going_live", "live", "pending_restore"}
 
 
@@ -1403,7 +1431,8 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
         S.match_id = match_id
         S.connected = set()
         S.auto_started = False
-        await asyncio.to_thread(load_on_server, match_id)
+        load_resp = await asyncio.to_thread(load_on_server, match_id)
+        log.info("Ответ сервера на loadmatch: %r", (load_resp or "")[:300])
 
         S.phase = "playing"
         S.moving = False
@@ -1412,6 +1441,7 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
         asyncio.create_task(auto_reset(match_id))
         asyncio.create_task(watch_match(match_id))
         asyncio.create_task(warmup_timer(match_id))
+        asyncio.create_task(verify_load(match_id, load_resp))
 
         connect = f"connect {SERVER_IP}:{SERVER_PORT}"
         if SERVER_PASSWORD:
@@ -2663,10 +2693,16 @@ async def fp_diag_cmd(i: discord.Interaction):
     parts = [f"Сервер: `{SERVER_IP}:{SERVER_PORT}`, RCON_PASSWORD: {'задан' if RCON_PASSWORD else 'НЕ ЗАДАН'}",
              f"Матч: `{S.match_id}`, фаза `{S.phase}`, игроков матча {len(S.match_players)}"]
     parts.append("**События MatchZy (последние)**\n```" + ("\n".join(list(event_log)[-8:]) or "ничего не приходило") + "```")
+    for cv in ("matchzy_remote_log_url", "matchzy_demo_upload_url"):
+        try:
+            resp = await asyncio.to_thread(rcon_raw, cv)
+            parts.append(f"`{cv}`: `{resp.strip()[:110] or '(пусто)'}`")
+        except Exception as exc:
+            parts.append(f"`{cv}`: ошибка `{type(exc).__name__}`")
     for cmd in ("status", "get5_status"):
         try:
             resp = await asyncio.to_thread(rcon_raw, cmd)
-            parts.append(f"**{cmd}**\n```{resp.strip()[:420] or '(пусто)'}```")
+            parts.append(f"**{cmd}**\n```{resp.strip()[:300] or '(пусто)'}```")
         except Exception as exc:
             parts.append(f"**{cmd}**: ошибка `{type(exc).__name__}: {exc}`")
     await i.followup.send("\n".join(parts)[:1990], ephemeral=True)
