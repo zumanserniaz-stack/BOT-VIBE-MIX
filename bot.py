@@ -6,7 +6,7 @@ VIBE MIX FreePick 5x5: очередь -> готовность -> капитан�
 При Steam-верификации бот определяет FACEIT-уровень игрока и выдаёт роль «FACEIT LVL n».
 Результат матча: табло + MVP + ELO (+30 / -20) + кнопка «Скачать демо».
 """
-print("▶ bot.py v39 загружается...", flush=True)
+print("▶ bot.py v40 загружается...", flush=True)
 import asyncio
 from collections import deque
 import io
@@ -303,6 +303,7 @@ class State:
         self.match_players: dict[str, tuple[discord.Member, int]] = {}  # steamid64 -> (игрок, номер команды)
         self.captain_ids: set[int] = set()
         self.live = False                              # матч в живой фазе (после ножей)
+        self.ever_live = False                         # матч хотя бы раз дошёл до going_live (иначе пустой результат не пишем)
         self.paused = False                            # матч на паузе из-за вышедшего игрока
         self.absent: set[int] = set()                  # игроки, которые вышли с сервера
         self.break_channel: discord.TextChannel | None = None
@@ -646,9 +647,10 @@ def build_match(match_id: int, teams: list[list[discord.Member]], map_name: str)
 
 
 def _rcon_run(c, cmd: str):
-    """Ответ CS2 иногда содержит не-UTF-8 байты: команда при этом уже выполнена, ошибку игнорируем."""
+    """Ответ CS2 приходит в UTF-8: читаем его побайтно (latin-1) и затем декодируем как UTF-8,
+    чтобы не было ни ошибок декодирования, ни кракозябр."""
     try:
-        return c.run(cmd, encoding="latin-1")
+        resp = c.run(cmd, encoding="latin-1")
     except TypeError:  # старая версия библиотеки без параметра encoding
         try:
             return c.run(cmd)
@@ -656,21 +658,25 @@ def _rcon_run(c, cmd: str):
             return ""
     except UnicodeDecodeError:
         return ""
+    try:
+        return resp.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return resp
 
 
 def load_on_server(match_id: int):
-    """Блокирующая функция: отправляет команды на CS2-сервер по RCON."""
+    """Блокирующая функция: отправляет команды на CS2-сервер по RCON.
+    Значения со ссылками обязательно в кавычках: иначе консоль CS2 считает «//» комментарием и режет URL до «https:»."""
     cmds = [
-        f'matchzy_remote_log_url {WEB_BASE_URL}/events',
-        'matchzy_remote_log_header_key Authorization',
-        f'matchzy_remote_log_header_value {EVENT_TOKEN}',
-        # чистый префикс чата (без кавычек; пробел неразрывный, чтобы консоль не обрезала значение)
+        f'matchzy_remote_log_url "{WEB_BASE_URL}/events"',
+        'matchzy_remote_log_header_key "Authorization"',
+        f'matchzy_remote_log_header_value "{EVENT_TOKEN}"',
         'matchzy_chat_prefix [{PURPLE}VIBE MIX{Default}]',
         # загрузка демо матча на веб-сервер бота (приходит после окончания карты)
-        f'matchzy_demo_upload_url {WEB_BASE_URL}/demo',
-        'matchzy_demo_upload_header_key Authorization',
-        f'matchzy_demo_upload_header_value {EVENT_TOKEN}',
-        f'matchzy_loadmatch_url {WEB_BASE_URL}/match/{match_id}.json',
+        f'matchzy_demo_upload_url "{WEB_BASE_URL}/demo"',
+        'matchzy_demo_upload_header_key "Authorization"',
+        f'matchzy_demo_upload_header_value "{EVENT_TOKEN}"',
+        f'matchzy_loadmatch_url "{WEB_BASE_URL}/match/{match_id}.json"',
     ]
     with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
         _rcon_run(c, "get5_endmatch")  # сбросить прошлый матч, иначе MatchZy не загрузит новый
@@ -999,6 +1005,27 @@ async def handle_connect(data: dict):
 
 
 # ----------------------------- АВТОСТАРТ -----------------------------
+async def wait_loaded(match_id: int):
+    """Ждёт до 30 сек, пока сервер не покажет наш matchid (после loadmatch сервер может менять карту).
+    Возвращает (True/False, описание). Если get5_status не распознан, матч не блокируем."""
+    info = "нет ответа от сервера"
+    for _ in range(15):
+        await asyncio.sleep(2)
+        try:
+            raw = await asyncio.to_thread(rcon_raw, "get5_status")
+        except Exception as exc:  # во время смены карты RCON может быть недоступен
+            info = type(exc).__name__
+            continue
+        st = re.search(r'"gamestate"\s*:\s*"(\w+)"', raw)
+        mi = re.search(r'"matchid"\s*:\s*"?(\w+)"?', raw)
+        if not st and not mi:
+            return True, "get5_status не распознан"
+        if mi and mi.group(1) == str(match_id) and st and st.group(1) != "none":
+            return True, ""
+        info = f"gamestate={st.group(1) if st else '?'}, matchid={mi.group(1) if mi else '?'}"
+    return False, info
+
+
 async def verify_load(match_id: int, load_resp: str):
     """Через 8 сек спрашивает у сервера, загрузился ли матч. Если нет, пишет причину в чат матча."""
     await asyncio.sleep(8)
@@ -1093,7 +1120,7 @@ async def track_connect(data: dict):
 
 
 async def warmup_timer(match_id: int):
-    """Каждые 5 сек спрашивает у сервера (RCON status), кто на нём сидит, и не зависит от событий MatchZy.
+    """Каждые 3 сек спрашивает у сервера (RCON status), кто на нём сидит, и не зависит от событий MatchZy.
     Все игроки на сервере -> старт через AUTO_START_DELAY. Иначе через WARMUP_SECONDS после первого входа."""
     t0 = None          # когда зашёл первый игрок
     full_since = None  # когда на сервере стали все
@@ -1242,14 +1269,15 @@ async def clear_chat():
 
 
 async def reset_to_queue():
-    # если сервер не прислал результат (ручной сброс, таймер), всё равно пишем итог в канал результатов
-    if S.match_id and S.phase == "playing" and S.match_id not in posted_results:
+    # если сервер не прислал результат (ручной сброс, таймер), пишем итог, но только если матч реально стартовал
+    if S.match_id and S.phase == "playing" and S.match_id not in posted_results and S.ever_live:
         await post_fallback_result(S.match_id, dict(S.match_players))
     await clear_voice_access()
     await clear_chat()
     await close_match_chat()
     await close_break()
     S.live = False
+    S.ever_live = False
     S.paused = False
     S.absent.clear()
     S.match_players = {}
@@ -1443,11 +1471,17 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
         S.captain_ids = {t[0].id for t in teams if t}
         snapshots[match_id] = dict(S.match_players)
         S.live = False
+        S.ever_live = False
         S.match_id = match_id
         S.connected = set()
         S.auto_started = False
         load_resp = await asyncio.to_thread(load_on_server, match_id)
         log.info("Ответ сервера на loadmatch: %r", (load_resp or "")[:300])
+
+        # честная проверка: если сервер матч не принял, не говорим «Матч готов»
+        loaded, info = await wait_loaded(match_id)
+        if not loaded:
+            raise RuntimeError(f"сервер не загрузил матч ({info}). Ответ: {(load_resp or '—').strip()[:150]}")
 
         S.phase = "playing"
         S.moving = False
@@ -1476,7 +1510,10 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
 
     except Exception as exc:  # любая ошибка: возвращаем систему в очередь
         log.exception("Ошибка при запуске матча")
-        await origin.send(f"❌ Не удалось запустить матч: `{exc}`\nОчередь сброшена, нажмите «Играть» заново.")
+        try:
+            await origin.send(f"❌ Не удалось запустить матч: `{exc}`\nОчередь сброшена, зайдите в войс очереди заново.")
+        except discord.HTTPException:
+            pass
         await reset_to_queue()
 
 
@@ -2164,6 +2201,7 @@ async def h_events(req: web.Request):
         asyncio.create_task(reset_to_queue())
     elif same and ev == "going_live":
         S.live = True            # матч пошёл (после ножей): теперь выход игрока = перерыв
+        S.ever_live = True       # матч реально стартовал: если его сбросят вручную, результат опубликуем
     elif ev == "round_end":
         try:
             if data.get("team1"):
