@@ -6,7 +6,7 @@ VIBE MIX FreePick 5x5: очередь -> готовность -> капитан�
 При Steam-верификации бот определяет FACEIT-уровень игрока и выдаёт роль «FACEIT LVL n».
 Результат матча: табло + MVP + ELO (+30 / -20) + кнопка «Скачать демо».
 """
-print("▶ bot.py v32 загружается...", flush=True)
+print("▶ bot.py v34 загружается...", flush=True)
 import asyncio
 import io
 import json
@@ -75,7 +75,7 @@ BREAK_SECONDS = int(os.getenv("BREAK_SECONDS", "300"))  # сколько ждё�
 AUTO_START = os.getenv("AUTO_START", "1") == "1"            # 0 = выключить автостарт
 AUTO_START_DELAY = int(os.getenv("AUTO_START_DELAY", "15"))  # сек. ждём, пока все прогрузятся
 WARMUP_SECONDS = int(os.getenv("WARMUP_SECONDS", "240"))     # разминка 4 минуты, потом матч стартует принудительно
-CHAT_PREFIX = os.getenv("CHAT_PREFIX", "[{PURPLE}VIBE MIX{Default}]" )
+CHAT_PREFIX = os.getenv("CHAT_PREFIX", "[{PURPLE}VIBE MIX{Default}]")
 
 # Канал для результатов матчей (0 = бот сам найдёт канал, в названии которого есть "результаты")
 RESULTS_CHANNEL = int(os.getenv("RESULTS_CHANNEL_ID", "1565444339084038314"))
@@ -313,6 +313,7 @@ class State:
         self.draft_check = False                       # идёт проверка «все ли вышли из войса»
         self.connected: set[str] = set()               # steamid игроков матча, которые сейчас на сервере
         self.auto_started = False                      # автостарт уже запущен для этого матча
+        self.moving = False                            # идёт перемещение игроков в войсы команд (драфт не отменять)
         self.lock = asyncio.Lock()
 
 
@@ -712,16 +713,19 @@ def rcon_force_ready() -> str:
         return _rcon_run(c, "css_forceready") or ""
 
 
-def rcon_players() -> set:
-    """Блокирующая функция: SteamID64 всех игроков, которые сейчас на сервере (по команде status)."""
+def rcon_players():
+    """Блокирующая функция: (SteamID64 игроков из status, число людей на сервере).
+    CS2 в status не показывает SteamID, поэтому главное число людей из строки «players : N humans»."""
     with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
         resp = _rcon_run(c, "status") or ""
     ids = {str(76561197960265728 + int(a)) for a in re.findall(r"\[U:1:(\d+)\]", resp)}
+    m = re.search(r"players\s*:\s*(\d+)\s+humans", resp)
+    humans = int(m.group(1)) if m else 0
     global _status_logged
-    if not ids and not _status_logged:
+    if not m and not _status_logged:
         _status_logged = True
-        log.info("RCON status не содержит SteamID игроков, ответ сервера: %r", resp[:400])
-    return ids
+        log.info("RCON status: не найдена строка с числом игроков, ответ сервера: %r", resp[:400])
+    return ids, humans
 
 
 _status_logged = False
@@ -738,14 +742,14 @@ async def move_to_voice(guild: discord.Guild, teams):
     """Создаёт категорию «VIBE — team_A VS team_B» с двумя войсами (по одному на команду) и перекидывает туда игроков."""
     await clear_voice_access()  # на случай, если остались войсы от прошлого матча
     names = [f"team_{t[0].display_name}" if t else f"team_{n}" for n, t in enumerate(teams, 1)]
-    cat_name = f"VIBE — {names[0]} VS {names[1]}"[:100]
+    cat_name = f"VIBE MIX — {names[0]} VS {names[1]}"[:100]
     base_cat = S.panel.channel.category if S.panel else None
     category = None
     try:
         category = await guild.create_category(
             cat_name,
             overwrites={
-                guild.default_role: discord.PermissionOverwrite(view_channel=False, connect=False),
+                guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=False),
                 guild.me: discord.PermissionOverwrite(view_channel=True, connect=True,
                                                       move_members=True, manage_channels=True),
             },
@@ -758,7 +762,7 @@ async def move_to_voice(guild: discord.Guild, teams):
         if not team:
             continue
         ow = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False, connect=False),
+            guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=False),
             guild.me: discord.PermissionOverwrite(view_channel=True, connect=True,
                                                   move_members=True, manage_channels=True),
         }
@@ -1068,7 +1072,7 @@ async def warmup_timer(match_id: int):
     while S.phase == "playing" and S.match_id == match_id and not S.live and not S.auto_started:
         await asyncio.sleep(5)
         try:
-            present = await asyncio.to_thread(rcon_players)
+            present, humans = await asyncio.to_thread(rcon_players)
         except Exception as exc:
             msg = f"{type(exc).__name__}: {exc}"
             log.warning("RCON status не удался: %s", msg)
@@ -1086,13 +1090,13 @@ async def warmup_timer(match_id: int):
         S.connected = {sid for sid in S.match_players if sid in present}
         if first:
             first = False
-            log.info("RCON status: на сервере %s SteamID, из игроков матча %s из %s",
-                     len(present), len(S.connected), len(S.match_players))
+            log.info("RCON status: людей на сервере %s (SteamID в status: %s)", humans, len(present))
         need = len(S.match_players)
-        if S.connected and t0 is None:
+        n_here = max(len(S.connected), humans)  # сколько людей на сервере
+        if n_here and t0 is None:
             t0 = time.time()
         reason = None
-        if AUTO_START and need and len(S.connected) >= need:
+        if AUTO_START and need and n_here >= need:
             if full_since is None:
                 full_since = time.time()
                 log.info("Все %s игроков на сервере, старт через %s сек", need, AUTO_START_DELAY)
@@ -1206,6 +1210,7 @@ async def reset_to_queue():
     S.captain_ids = set()
     S.connected = set()
     S.auto_started = False
+    S.moving = False
     async with S.lock:
         S.phase = "queue"
         S.queue.clear()
@@ -1248,12 +1253,12 @@ async def sync_queue():
 
 async def check_draft_empty():
     """Во время драфта: если все игроки вышли из войса очереди, драфт отменяется и очередь сбрасывается."""
-    if S.draft_check:
+    if S.draft_check or S.moving:
         return
     S.draft_check = True
     try:
         await asyncio.sleep(5)  # даём шанс переподключиться
-        if S.phase != "draft" or not QUEUE_VC:
+        if S.phase != "draft" or not QUEUE_VC or S.moving:
             return
         ch = bot.get_channel(QUEUE_VC)
         if not ch or any(m.id in S.active_ids for m in ch.members):
@@ -1380,6 +1385,11 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
         else:
             teams, map_name = await draft(channel, players)
 
+        # ---- войсы команд: сразу после деления на две команды (в названиях ники капитанов) ----
+        S.moving = True
+        if hasattr(channel, "guild") and channel.guild:
+            await move_to_voice(channel.guild, teams)
+
         # ---- запуск на сервере ----
         match_id = int(time.time())
         S.matches[match_id] = build_match(match_id, teams, map_name)
@@ -1393,6 +1403,7 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
         await asyncio.to_thread(load_on_server, match_id)
 
         S.phase = "playing"
+        S.moving = False
         S.queue.clear()
         await refresh_panel()
         asyncio.create_task(auto_reset(match_id))
@@ -1414,10 +1425,6 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
         link_view = MatchView()
         await track_send(channel, embed=e, view=link_view)
         asyncio.create_task(notify_players(teams, map_name, match_id))
-
-        # ---- войсы Team 1 / Team 2: бот создаёт их и перекидывает игроков ----
-        if hasattr(channel, "guild") and channel.guild:
-            await move_to_voice(channel.guild, teams)
 
     except Exception as exc:  # любая ошибка: возвращаем систему в очередь
         log.exception("Ошибка при запуске матча")
