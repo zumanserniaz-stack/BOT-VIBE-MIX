@@ -6,7 +6,7 @@ VIBE MIX FreePick 5x5: очередь -> готовность -> капитан�
 При Steam-верификации бот определяет FACEIT-уровень игрока и выдаёт роль «FACEIT LVL n».
 Результат матча: табло + MVP + ELO (+30 / -20) + кнопка «Скачать демо».
 """
-print("▶ bot.py v37 загружается...", flush=True)
+print("▶ bot.py v38 загружается...", flush=True)
 import asyncio
 from collections import deque
 import io
@@ -74,9 +74,8 @@ BREAK_SECONDS = int(os.getenv("BREAK_SECONDS", "300"))  # сколько ждё�
 
 # Автостарт матча: все зашли на сервер -> через AUTO_START_DELAY сек матч стартует сам
 AUTO_START = os.getenv("AUTO_START", "1") == "1"            # 0 = выключить автостарт
-AUTO_START_DELAY = int(os.getenv("AUTO_START_DELAY", "15"))  # сек. ждём, пока все прогрузятся
+AUTO_START_DELAY = 15  # когда все зашли на сервер: разминка 15 сек, потом матч стартует сам
 WARMUP_SECONDS = int(os.getenv("WARMUP_SECONDS", "240"))     # разминка 4 минуты, потом матч стартует принудительно
-CHAT_PREFIX = os.getenv("CHAT_PREFIX", "[{PURPLE}VIBE MIX{Default}]")
 
 # Канал для результатов матчей (0 = бот сам найдёт канал, в названии которого есть "результаты")
 RESULTS_CHANNEL = int(os.getenv("RESULTS_CHANNEL_ID", "1565444339084038314"))
@@ -665,7 +664,6 @@ def load_on_server(match_id: int):
         f'matchzy_remote_log_url "{WEB_BASE_URL}/events"',
         'matchzy_remote_log_header_key "Authorization"',
         f'matchzy_remote_log_header_value "{EVENT_TOKEN}"',
-        f'matchzy_chat_prefix "{CHAT_PREFIX}"',
         # загрузка демо матча на веб-сервер бота (приходит после окончания карты)
         f'matchzy_demo_upload_url "{WEB_BASE_URL}/demo"',
         'matchzy_demo_upload_header_key "Authorization"',
@@ -1101,7 +1099,7 @@ async def warmup_timer(match_id: int):
     reported = set()
     first = True
     while S.phase == "playing" and S.match_id == match_id and not S.live and not S.auto_started:
-        await asyncio.sleep(5)
+        await asyncio.sleep(3)
         try:
             present, humans = await asyncio.to_thread(rcon_players)
         except Exception as exc:
@@ -1131,6 +1129,10 @@ async def warmup_timer(match_id: int):
             if full_since is None:
                 full_since = time.time()
                 log.info("Все %s игроков на сервере, старт через %s сек", need, AUTO_START_DELAY)
+                try:  # сообщение прямо в игру
+                    await asyncio.to_thread(rcon_raw, f"say Все игроки на сервере. Матч начнётся через {AUTO_START_DELAY} сек")
+                except Exception:
+                    pass
             elif time.time() - full_since >= AUTO_START_DELAY:
                 reason = "Все игроки на сервере"
         else:
