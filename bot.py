@@ -6,7 +6,7 @@ VIBE MIX FreePick 5x5: очередь -> готовность -> капитан�
 При Steam-верификации бот определяет FACEIT-уровень игрока и выдаёт роль «FACEIT LVL n».
 Результат матча: табло + MVP + статистика каждого игрока + ELO (+30 / -20) + кнопка «Скачать демо».
 """
-print("▶ bot.py v42 загружается...", flush=True)
+print("▶ bot.py v45 загружается...", flush=True)
 import asyncio
 from collections import deque
 import io
@@ -63,7 +63,7 @@ FACEIT_API_KEY = os.getenv("FACEIT_API_KEY", "").strip()
 # 1 = стартовый ELO в FreePick берётся из FACEIT ELO (только для тех, у кого ещё нет рейтинга)
 FACEIT_START_ELO = os.getenv("FACEIT_START_ELO", "0") == "1"
 
-TEST_MODE = os.getenv("TEST_MODE", "1") == "1"  # 1 = тест: хватает одного игрока, без драфта
+TEST_MODE = os.getenv("TEST_MODE", "0") == "1"  # 1 = тест: хватает одного игрока, без драфта
 TEAM_SIZE = 1 if TEST_MODE else 5
 NEED = 1 if TEST_MODE else TEAM_SIZE * 2
 PICK_TIMEOUT = 30            # секунд на пик/бан, потом выбор случайный
@@ -484,6 +484,8 @@ async def ready_check(channel, players: list[discord.Member]) -> bool:
         S.queue = ready_players          # готовые остаются в очереди
         S.active_ids.clear()
         S.draft_task = None
+    for m in absent:  # авто-бан за неготовность
+        await auto_ban(m, "ready", READY_REASON)
     await clear_chat()
     try:
         await channel.send("⏰ Не все нажали «Готов». Не нажавшие убраны, остальные остались в очереди: "
@@ -997,6 +999,17 @@ async def handle_disconnect(steamid: str):
         pass
 
 
+async def handle_return(data: dict):
+    """Игрок вернулся на сервер во время паузы: он больше не считается вышедшим."""
+    player = data.get("player") or {}
+    info = S.match_players.get(str(player.get("steamid", "")))
+    if not info or not S.paused:
+        return
+    S.absent.discard(info[0].id)
+    if not S.absent:
+        await resume_match("Все игроки вернулись на сервер")
+
+
 # SteamID, которым можно заходить на сервер во время матча без привязки (админы, комментаторы), через запятую
 ADMIN_STEAMIDS = {x.strip() for x in os.getenv("ADMIN_STEAMIDS", "").split(",") if x.strip()}
 
@@ -1236,6 +1249,7 @@ async def resume_match(reason: str):
     """Снимает паузу и закрывает чат перерыва."""
     if not S.paused:
         return
+    leavers = [m for m, _ in S.match_players.values() if m.id in S.absent]  # кто так и не вернулся
     S.paused = False
     S.absent.clear()
     if S.break_task and S.break_task is not asyncio.current_task():
@@ -1252,6 +1266,8 @@ async def resume_match(reason: str):
         except discord.HTTPException:
             pass
     asyncio.create_task(close_break(delay=30))
+    for m in leavers:  # авто-бан за выход из матча
+        await auto_ban(m, "leave", LEAVE_REASON)
 
 
 async def close_break(delay: int = 0):
@@ -1942,7 +1958,7 @@ async def post_fallback_result(mid: int, players: dict):
 # ----------------------------- БАНЫ (лог в Discord + сайт) -----------
 import html as _html
 
-BAN_LOG_CHANNEL = int(os.getenv("BAN_LOG_CHANNEL_ID", "0"))  # 0 = канал, в названии которого есть "баны"
+BAN_LOG_CHANNEL = int(os.getenv("BAN_LOG_CHANNEL_ID", "1566199370024620233"))  # 0 = канал, в названии которого есть "баны"
 
 _UNITS = {"m": 60, "min": 60, "м": 60, "мин": 60, "минут": 60,
           "h": 3600, "ч": 3600, "час": 3600, "часа": 3600, "часов": 3600,
@@ -2086,6 +2102,43 @@ async def do_unban(did: int, reason: str, by: str | None = None) -> bool:
     return True
 
 
+# ---- АВТО-БАН: не нажал «Готов» / вышел из матча. Срок растёт при повторах (за последние 30 дней).
+AUTOBAN = os.getenv("AUTOBAN", "1") == "1"   # 0 = выключить авто-бан
+AUTOBAN_LADDERS = {
+    "ready": os.getenv("AUTOBAN_READY_LADDER", "10m,30m,2h,1d"),
+    "leave": os.getenv("AUTOBAN_LEAVE_LADDER", "30m,2h,1d,3d,7d"),
+}
+AUTOBAN_WINDOW = 30 * 86400
+READY_REASON = "не нажал «Готов» при подборе матча"
+LEAVE_REASON = "вышел из матча и не вернулся"
+
+
+async def auto_ban(member, kind: str, reason: str):
+    """Автоматический бан от имени «Авто-бан». Администраторов не банит."""
+    from types import SimpleNamespace
+    if not AUTOBAN or not isinstance(member, discord.Member) or member.bot:
+        return
+    if member.guild_permissions.administrator or is_banned(member.id):
+        return
+    steps = [x for x in (parse_duration(v) for v in AUTOBAN_LADDERS[kind].split(",")) if x is not None] or [1800]
+    full = f"Авто-бан: {reason}"
+    n = db.execute("SELECT COUNT(*) FROM ban_log WHERE discord_id=? AND admin_id=0 AND reason=? AND created>?",
+                   (member.id, full, int(time.time()) - AUTOBAN_WINDOW)).fetchone()[0]
+    dur = steps[min(n, len(steps) - 1)]
+    try:
+        await do_ban(member, full, dur, SimpleNamespace(id=0, display_name="Авто-бан"))
+    except Exception:
+        log.exception("Не удалось выдать авто-бан %s", member)
+        return
+    log.info("Авто-бан %s: %s (%s)", member, reason, "навсегда" if not dur else fmt_dur(dur))
+    try:
+        await member.send(f"⛔ Вы получили авто-бан в FreePick ({'навсегда' if not dur else fmt_dur(dur)}): {reason}. "
+                          "При повторных нарушениях срок будет больше.")
+    except discord.HTTPException:
+        pass
+    return dur
+
+
 _ban_loop_started = False
 
 
@@ -2102,80 +2155,143 @@ async def ban_expiry_loop():
         await asyncio.sleep(60)
 
 
-# ---- страница со списком банов (/bans)
+# ---- страница со списком банов (/bans, /punishment): в стиле сайта vibeproject.kz
 BANS_PAGE = """<!doctype html><html lang="ru"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Список наказаний — VIBE MIX FreePick</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Наказания | VIBE MIX FreePick</title>
 <style>
-:root{color-scheme:dark}*{box-sizing:border-box}
+:root{color-scheme:dark;--bg:#090613;--card:rgba(18,14,34,.88);--line:rgba(255,255,255,.07);--mut:#9a97b0;--pur:#7c1fff}
+*{box-sizing:border-box}
 body{margin:0;min-height:100vh;font-family:Inter,system-ui,"Segoe UI",Roboto,Arial,sans-serif;color:#e8e6f2;
 background:radial-gradient(1100px 600px at 15% -10%,#2b1252 0%,transparent 60%),
-radial-gradient(900px 600px at 95% 5%,#14244f 0%,transparent 55%),#090613}
-.wrap{max-width:1280px;margin:0 auto;padding:32px 20px;display:grid;grid-template-columns:320px 1fr;gap:20px;align-items:start}
+radial-gradient(900px 600px at 95% 5%,#14244f 0%,transparent 55%),var(--bg)}
+.top{max-width:1280px;margin:0 auto;padding:18px 20px 0;display:flex;align-items:center;gap:14px}
+.logo{font-weight:800;letter-spacing:.5px;font-size:18px}.logo span{color:#a66bff}
+.nav{margin-left:auto;font-size:13px;color:var(--mut)}
+.wrap{max-width:1280px;margin:0 auto;padding:20px;display:grid;grid-template-columns:320px 1fr;gap:20px;align-items:start}
 @media(max-width:900px){.wrap{grid-template-columns:1fr}}
-.card{background:rgba(18,14,34,.86);border:1px solid rgba(255,255,255,.07);border-radius:16px;padding:20px}
-h2{margin:0 0 14px;font-size:18px}h3{margin:18px 0 10px;font-size:13px;color:#9a97b0;font-weight:500}
-.tag{display:inline-block;background:#5b21d6;color:#fff;border-radius:8px;padding:8px 18px;font-weight:600;font-size:14px;margin-right:6px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:20px}
+h2{margin:0 0 14px;font-size:18px}h3{margin:20px 0 10px;font-size:13px;color:var(--mut);font-weight:500}
+.tabs{display:flex;background:rgba(255,255,255,.05);border-radius:10px;padding:4px;gap:4px;flex-wrap:wrap}
+.tabs button{flex:1;min-width:70px;border:0;border-radius:8px;padding:9px 8px;background:transparent;color:#c9c6dd;
+font-size:13px;font-weight:600;cursor:pointer}
+.tabs button.on{background:var(--pur);color:#fff}
 input{width:100%;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);border-radius:10px;
 color:#e8e6f2;padding:11px 12px;font-size:14px;outline:none}input:focus{border-color:#7c3aed}
 .stat{display:flex;justify-content:space-between;padding:11px 12px;border-radius:8px;background:rgba(255,255,255,.04);margin-bottom:8px;font-size:14px}
 .stat b{color:#fff}
 .tw{overflow-x:auto}
-table{width:100%;border-collapse:separate;border-spacing:0 6px;min-width:640px}
-th{text-align:left;font-size:12px;color:#9a97b0;padding:6px 12px;font-weight:500}
+table{width:100%;border-collapse:separate;border-spacing:0 6px;min-width:680px}
+th{text-align:left;font-size:12px;color:var(--mut);padding:6px 12px;font-weight:500}
 td{background:rgba(255,255,255,.035);padding:10px 12px;font-size:14px}
+tr.r{cursor:pointer}tr.r:hover td{background:rgba(124,31,255,.12)}
 td:first-child{border-radius:10px 0 0 10px;width:44px;text-align:center}td:last-child{border-radius:0 10px 10px 0}
 .pl{display:flex;align-items:center;gap:10px}
-.pl img{width:30px;height:30px;border-radius:8px;object-fit:cover;background:#2a2640}
-.b{padding:3px 10px;border-radius:6px;font-size:12px;font-weight:600;white-space:nowrap}
+.pl img,.av{width:30px;height:30px;border-radius:8px;object-fit:cover;background:#2a2640;flex:none}
+.b{padding:3px 10px;border-radius:6px;font-size:12px;font-weight:600;white-space:nowrap;display:inline-block}
 .perm{background:rgba(237,66,69,.16);color:#ff5a5f}
 .done{background:rgba(87,242,135,.12);color:#57f287;text-decoration:line-through}
 .act{background:rgba(255,176,32,.16);color:#ffb020}
 .unb{background:#4b1fb8;color:#d9ccff}
-.empty{padding:30px;text-align:center;color:#9a97b0}
-</style></head><body><div class="wrap">
-<div class="card"><h2>Инфо</h2><span class="tag">Баны</span><span class="tag" style="background:#1f3a8a">FreePick</span>
-<h3>Найти нарушителя</h3><input id="q" placeholder="Ник, причина или админ" autocomplete="off">
+.empty{padding:30px;text-align:center;color:var(--mut)}
+.more{display:block;margin:12px auto 0;background:rgba(255,255,255,.06);border:1px solid var(--line);color:#e8e6f2;
+border-radius:10px;padding:10px 22px;cursor:pointer;font-size:14px}.more:hover{background:rgba(124,31,255,.2)}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.65);display:none;align-items:center;justify-content:center;padding:16px;z-index:9}
+.modal.on{display:flex}
+.box{background:#120e22;border:1px solid var(--line);border-radius:16px;padding:22px;max-width:520px;width:100%;max-height:90vh;overflow:auto}
+.box h2{display:flex;justify-content:space-between;align-items:center}
+.x{background:none;border:0;color:var(--mut);font-size:22px;cursor:pointer}
+.kv{display:grid;grid-template-columns:140px 1fr;gap:8px 12px;font-size:14px}.kv div:nth-child(odd){color:var(--mut)}
+.kv a{color:#a66bff;text-decoration:none;word-break:break-all}
+code{background:rgba(255,255,255,.06);padding:2px 6px;border-radius:6px;font-size:12px}
+</style></head><body>
+<div class="top"><div class="logo">VIBE <span>MIX</span> · FreePick</div><div class="nav">Блокировки</div></div>
+<div class="wrap">
+<div class="card"><h2>Инфо</h2>
+<h3>Фильтр наказаний</h3>
+<div class="tabs" id="tabs">
+<button data-f="all" class="on">Все</button><button data-f="active">Активные</button>
+<button data-f="perm">Навсегда</button><button data-f="ended">Снятые</button></div>
+<h3>Найти нарушителя</h3><input id="q" placeholder="Ник, SteamID, причина или админ" autocomplete="off">
 <h3>Статистика наказаний</h3>
-<div class="stat"><span>Всего банов</span><b>__TOTAL__</b></div>
-<div class="stat"><span>Активных банов</span><b>__ACTIVE__</b></div>
-<div class="stat"><span>Перманентных банов</span><b>__PERM__</b></div></div>
+<div class="stat"><span>Всего банов</span><b id="s_total">0</b></div>
+<div class="stat"><span>Активных банов</span><b id="s_active">0</b></div>
+<div class="stat"><span>Перманентных банов</span><b id="s_perm">0</b></div>
+<div class="stat"><span>Снятых банов</span><b id="s_ended">0</b></div></div>
 <div class="card"><h2>Список наказаний</h2><div class="tw"><table><thead><tr>
-<th>Тип</th><th>Игрок</th><th>Причина</th><th>Срок</th><th>Админ</th></tr></thead><tbody id="rows">__ROWS__</tbody></table>
-__EMPTY__</div></div></div>
+<th>Тип</th><th>Игрок</th><th>Причина</th><th>Срок</th><th>Админ</th></tr></thead><tbody id="rows"></tbody></table>
+<div class="empty" id="empty" style="display:none">Наказаний не найдено</div>
+<button class="more" id="more" style="display:none">Показать ещё</button></div></div></div>
+<div class="modal" id="modal"><div class="box"><h2><span>Подробности наказания</span><button class="x" id="close">×</button></h2>
+<div class="kv" id="kv"></div></div></div>
 <script>
-const q=document.getElementById('q');
-q.addEventListener('input',()=>{const v=q.value.toLowerCase();
-document.querySelectorAll('#rows tr').forEach(r=>{r.style.display=r.textContent.toLowerCase().includes(v)?'':'none'})});
+const D=__DATA__, NOW0=__NOW__, T0=Date.now();
+const now=()=>NOW0+Math.floor((Date.now()-T0)/1000);
+const st={f:'all',q:'',n:50};
+const $=id=>document.getElementById(id);
+function el(t,c,x){const e=document.createElement(t);if(c)e.className=c;if(x!==undefined)e.textContent=x;return e}
+function status(r){if(r.unbanned)return'unb';if(r.expires===0)return'perm';if(r.expires<=now())return'done';return'act'}
+function dur(s){const p=[];for(const[n,k]of[['д.',86400],['ч.',3600],['мин.',60]]){if(s>=k){p.push(Math.floor(s/k)+' '+n);s%=k}if(p.length==2)break}return p.join(' ')||'1 мин.'}
+function dt(t){return t?new Date(t*1000).toLocaleString('ru-RU'):'—'}
+function badge(r){const s=status(r),b=el('span','b '+s);
+ b.textContent=s=='unb'?'Разбанен':s=='perm'?'Навсегда':s=='done'?dur(r.expires-r.created):dur(r.expires-now());return b}
+function match(r){const q=st.q.toLowerCase(),s=status(r);
+ if(st.f=='active'&&!(s=='act'||s=='perm'))return false;
+ if(st.f=='perm'&&s!='perm')return false;
+ if(st.f=='ended'&&!(s=='done'||s=='unb'))return false;
+ if(!q)return true;
+ return[r.name,r.steam,r.reason,r.admin,String(r.did)].some(v=>(v||'').toLowerCase().includes(q))}
+function row(r){const tr=el('tr','r');
+ tr.append(el('td','',status(r)=='unb'?'✅':'🚫'));
+ const p=el('td'),w=el('div','pl');
+ if(r.avatar&&/^https:\\/\\//.test(r.avatar)){const i=new Image();i.src=r.avatar;i.loading='lazy';i.onerror=()=>{i.style.visibility='hidden'};w.append(i)}else w.append(el('div','av'));
+ w.append(el('span','',r.name||String(r.did)));p.append(w);tr.append(p);
+ tr.append(el('td','',r.reason||'—'));
+ const t=el('td');t.append(badge(r));tr.append(t);
+ tr.append(el('td','',r.admin||'—'));
+ tr.onclick=()=>open(r);return tr}
+function render(){
+ const all=D,m=all.filter(match);
+ $('s_total').textContent=all.length;
+ $('s_active').textContent=all.filter(r=>{const s=status(r);return s=='act'||s=='perm'}).length;
+ $('s_perm').textContent=all.filter(r=>status(r)=='perm').length;
+ $('s_ended').textContent=all.filter(r=>{const s=status(r);return s=='done'||s=='unb'}).length;
+ const body=$('rows');body.replaceChildren(...m.slice(0,st.n).map(row));
+ $('empty').style.display=m.length?'none':'block';
+ $('more').style.display=m.length>st.n?'block':'none'}
+function open(r){const kv=$('kv');kv.replaceChildren();
+ const add=(k,v)=>{kv.append(el('div','',k));const d=el('div');if(v instanceof Node)d.append(v);else d.textContent=v;kv.append(d)};
+ add('Игрок',r.name||'—');add('Discord ID',r.did);
+ if(r.steam){const a=el('a','',r.steam);a.href='https://steamcommunity.com/profiles/'+encodeURIComponent(r.steam);a.target='_blank';a.rel='noopener';add('SteamID',a)}
+ add('Причина',r.reason||'—');add('Статус',badge(r));
+ add('Выдан',dt(r.created));add('Истекает',r.expires?dt(r.expires):'Никогда');
+ add('Администратор',r.admin||'—');
+ if(r.unbanned){add('Разбанен',dt(r.unbanned));add('Кем',r.unban_by||'—');add('Причина разбана',r.unban_reason||'—')}
+ $('modal').classList.add('on')}
+$('close').onclick=()=>$('modal').classList.remove('on');
+$('modal').onclick=e=>{if(e.target.id=='modal')$('modal').classList.remove('on')};
+document.addEventListener('keydown',e=>{if(e.key=='Escape')$('modal').classList.remove('on')});
+$('q').oninput=e=>{st.q=e.target.value;st.n=50;render()};
+$('more').onclick=()=>{st.n+=50;render()};
+document.querySelectorAll('#tabs button').forEach(b=>b.onclick=()=>{
+ document.querySelectorAll('#tabs button').forEach(x=>x.classList.remove('on'));b.classList.add('on');
+ st.f=b.dataset.f;st.n=50;render()});
+render();setInterval(render,60000);
 </script></body></html>"""
 
 
 def render_bans_page(rows: list, now: int) -> str:
-    esc = _html.escape
-    total = len(rows)
-    active = sum(1 for r in rows if r[7] is None and (r[6] == 0 or r[6] > now))
-    perm = sum(1 for r in rows if r[7] is None and r[6] == 0)
-    out = []
-    for did, name, avatar, reason, admin, created, expires, unbanned in rows:
-        if unbanned:
-            badge = '<span class="b unb">Разбанен</span>'
-        elif expires == 0:
-            badge = '<span class="b perm">Навсегда</span>'
-        elif expires <= now:
-            badge = f'<span class="b done">{esc(fmt_dur(expires - created))}</span>'
-        else:
-            badge = f'<span class="b act">{esc(fmt_dur(expires - now))}</span>'
-        img = (f'<img src="{esc(avatar, quote=True)}" alt="" loading="lazy" '
-               f'onerror="this.style.visibility=\'hidden\'">') if avatar else ""
-        out.append(f'<tr><td>🚫</td><td><div class="pl">{img}<span>{esc(name or str(did))}</span></div></td>'
-                   f'<td>{esc(reason or "—")}</td><td>{badge}</td><td>{esc(admin or "—")}</td></tr>')
-    empty = '' if out else '<div class="empty">Наказаний пока нет</div>'
-    return (BANS_PAGE.replace("__TOTAL__", str(total)).replace("__ACTIVE__", str(active))
-            .replace("__PERM__", str(perm)).replace("__ROWS__", "".join(out)).replace("__EMPTY__", empty))
+    data = [{"did": did, "name": name, "avatar": avatar, "reason": reason, "admin": admin,
+             "created": created or 0, "expires": expires or 0, "unbanned": unbanned,
+             "steam": steam, "unban_reason": unban_reason, "unban_by": unban_by}
+            for (did, name, avatar, reason, admin, created, expires, unbanned,
+                 steam, unban_reason, unban_by) in rows]
+    payload = json.dumps(data, ensure_ascii=False).replace("<", "\\u003c").replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
+    return BANS_PAGE.replace("__DATA__", payload).replace("__NOW__", str(int(now)))
 
 
 async def h_bans(req: web.Request):
-    rows = db.execute("SELECT discord_id, name, avatar, reason, admin_name, created, expires, unbanned_at "
-                      "FROM ban_log ORDER BY created DESC LIMIT 500").fetchall()
+    rows = db.execute("SELECT discord_id, name, avatar, reason, admin_name, created, expires, unbanned_at, "
+                      "steamid64, unban_reason, unban_by FROM ban_log ORDER BY created DESC LIMIT 1000").fetchall()
     return web.Response(text=render_bans_page(rows, int(time.time())), content_type="text/html")
 
 
@@ -2284,6 +2400,7 @@ async def h_events(req: web.Request):
     elif same and ev == "player_connect":
         asyncio.create_task(handle_connect(data))
         asyncio.create_task(track_connect(data))
+        asyncio.create_task(handle_return(data))
     elif same and ev == "player_disconnect":
         player = data.get("player") or {}
         if not player.get("is_bot"):
@@ -2575,6 +2692,7 @@ class FreePickBot(commands.Bot):
             web.get(r"/match/{mid:\d+}.json", h_match),
             web.get("/connect", h_connect),
             web.get("/bans", h_bans),
+            web.get("/punishment", h_bans),
             web.post("/events", h_events),
             web.post("/demo", h_demo),
             web.get(r"/demo/{mid:\d+}", h_demo_get),
@@ -2600,6 +2718,7 @@ class FreePickBot(commands.Bot):
 
 intents = discord.Intents.default()
 intents.members = True  # включите Server Members Intent в Developer Portal
+intents.message_content = os.getenv("AUTOBAN_CHAT", "1") == "1"  # для авто-бана в чате: включите Message Content Intent (или AUTOBAN_CHAT=0)
 bot = FreePickBot(command_prefix="!", intents=intents)
 admin = app_commands.checks.has_permissions(administrator=True)
 
@@ -2921,6 +3040,113 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     await sync_queue()
 
 
+# ----------------------------- АВТО-БАН В ЧАТЕ -----------------------
+# Спам = бан 5 мин, оскорбление = бан 10 мин. Бан FreePick + тайм-аут в Discord на тот же срок.
+AUTOBAN_CHAT = os.getenv("AUTOBAN_CHAT", "1") == "1"       # 0 = выключить проверку чата
+SPAM_COUNT = int(os.getenv("SPAM_COUNT", "5"))              # столько сообщений ...
+SPAM_SECONDS = int(os.getenv("SPAM_SECONDS", "6"))          # ... за столько секунд = спам
+SPAM_SAME = int(os.getenv("SPAM_SAME", "3"))                # столько одинаковых сообщений за 20 сек = спам
+AUTOBAN_LADDERS["spam"] = os.getenv("AUTOBAN_SPAM_LADDER", "5m")
+AUTOBAN_LADDERS["insult"] = os.getenv("AUTOBAN_INSULT_LADDER", "10m")
+SPAM_REASON = "спам в чате"
+INSULT_REASON = "оскорбление в чате"
+AUTOBAN_IGNORE = {int(x) for x in os.getenv("AUTOBAN_IGNORE_CHANNELS", "").split(",") if x.strip().isdigit()}
+AUTOBAN_EXTRA = [w.strip().lower() for w in os.getenv("AUTOBAN_WORDS", "").split(",") if w.strip()]  # свои слова (корни)
+
+_PRE = r"(?:на|по|за|до|вы|раз|рас|от|при|под|пере|съ|объ|с|у|не|ни|о|в)?"
+_PREFIXED = [r"ху[йяеи]", r"пизд", r"пезд", r"еба[лнт]", r"ебл[аоуи]", r"ебу[чт]", r"ебис", r"ебн[ую]", r"ебак", r"ебал"]
+_STAND = [r"бляд", r"блят", r"блэт", r"сук[аиуе]$", r"сукин", r"сучк", r"сучар", r"мудак", r"мудил", r"мудозвон",
+          r"пидор", r"пидар", r"пидр", r"педик", r"педераст", r"гандон", r"гондон", r"(?:долб|далб)[ао]?еб",
+          r"дебил", r"дибил", r"идиот", r"кретин", r"имбецил", r"ублюд", r"выродок", r"мразь", r"мразот",
+          r"шлюх", r"шалав", r"залуп", r"чмо$", r"чмошн", r"даун$", r"уебок", r"уебан", r"урод$", r"уроды$",
+          r"тварь$", r"твари$", r"гнида", r"падла", r"паскуд", r"сволоч", r"скотин", r"говнюк", r"хуесос",
+          r"fuck", r"shit", r"bitch", r"retard", r"cunt", r"whore", r"slut", r"faggot"]
+_EXACT = {"бля", "еб", "ебать", "хуй", "нахуй", "нах", "пох", "похуй", "пиздец", "хер", "нахер"}
+for _w in AUTOBAN_EXTRA:
+    _PREFIXED.append(re.escape(_w))
+_RE_PRE = re.compile("^" + _PRE + "(?:" + "|".join(_PREFIXED) + ")")
+_RE_STAND = re.compile("^(?:" + "|".join(_STAND) + ")")
+_LAT2CYR = str.maketrans({"a": "а", "e": "е", "o": "о", "p": "р", "c": "с", "x": "х", "y": "у",
+                          "k": "к", "m": "м", "t": "т", "h": "н", "b": "в", "0": "о"})
+
+
+def _collapse(s: str) -> str:
+    return re.sub(r"(.)\1+", r"\1", s)  # «пиииздец» -> «пиздец»
+
+
+def is_insult(text: str) -> bool:
+    """Мат и оскорбления: учитывает буквы-двойники (латиница), растянутые буквы и слова через пробел."""
+    text = text.lower().replace("ё", "е")
+    raw = re.findall(r"[a-zа-я0-9]+", text)
+    toks, buf = [], ""
+    for t in raw:
+        if len(t) == 1:
+            buf += t
+        else:
+            if len(buf) >= 3:
+                toks.append(buf)
+            buf = ""
+            toks.append(t)
+    if len(buf) >= 3:
+        toks.append(buf)
+    for t in toks:
+        for v in {_collapse(t), _collapse(t.translate(_LAT2CYR))}:
+            if v in _EXACT or _RE_PRE.match(v) or _RE_STAND.match(v):
+                return True
+    return False
+
+
+_chat_hist: dict[int, deque] = {}  # user_id -> последние сообщения (время, текст, сообщение)
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot or not message.guild or not AUTOBAN or not AUTOBAN_CHAT:
+        return
+    member = message.author
+    if not isinstance(member, discord.Member) or message.channel.id in AUTOBAN_IGNORE:
+        return
+    perms = member.guild_permissions
+    if perms.administrator or perms.manage_messages:  # админов и модераторов не трогаем
+        return
+    now_t = time.time()
+    hist = _chat_hist.setdefault(member.id, deque(maxlen=20))
+    text = (message.content or "").strip().lower()
+    hist.append((now_t, text, message))
+
+    kind = reason = None
+    if text and is_insult(text):
+        kind, reason = "insult", INSULT_REASON
+        to_delete = [message]
+    else:
+        recent = [x for x in hist if now_t - x[0] <= SPAM_SECONDS]
+        same = [x for x in hist if text and x[1] == text and now_t - x[0] <= 20]
+        if len(recent) >= SPAM_COUNT or len(same) >= SPAM_SAME:
+            kind, reason = "spam", SPAM_REASON
+            to_delete = [x[2] for x in hist if now_t - x[0] <= 20]
+    if not kind:
+        return
+    hist.clear()
+    for m in to_delete:
+        try:
+            await m.delete()
+        except discord.HTTPException:
+            pass
+    dur = await auto_ban(member, kind, reason)
+    if dur is None:
+        return
+    from datetime import timedelta
+    try:  # тайм-аут в Discord на тот же срок (нужно право Moderate Members)
+        await member.timeout(timedelta(seconds=min(dur or 28 * 86400, 28 * 86400)), reason=f"Авто-бан: {reason}")
+    except discord.HTTPException:
+        log.warning("Не удалось выдать тайм-аут %s (нужно право Moderate Members, роль бота выше)", member)
+    try:
+        await message.channel.send(f"🚫 {member.mention} получил бан на {fmt_dur(dur) if dur else 'навсегда'}: {reason}.",
+                                   delete_after=15, allowed_mentions=discord.AllowedMentions.none())
+    except discord.HTTPException:
+        pass
+
+
 # ----------------------------- ЗАПУСК --------------------------------
 def say(msg: str):
     print(msg, flush=True)
@@ -2933,6 +3159,7 @@ def main():
     say(f"▶ DISCORD_TOKEN: {'задан, длина ' + str(len(token)) if token else 'НЕ ЗАДАН'}")
     say(f"▶ Порт веб-сервера: {WEB_PORT}, WEB_BASE_URL: {WEB_BASE_URL}")
     say(f"▶ TEST_MODE={TEST_MODE}, QUEUE_VC_ID={QUEUE_VC}, GUILD_ID={GUILD_ID}")
+    say(f"▶ Авто-бан: {'вкл' if AUTOBAN else 'выкл'}")
     say(f"▶ Автостарт: {'вкл' if AUTO_START else 'выкл'}, разминка {WARMUP_SECONDS} сек")
     say(f"▶ FACEIT: {'ключ задан' if FACEIT_API_KEY else 'FACEIT_API_KEY не задан (FACEIT-роли выключены)'}")
     say(f"▶ Демо сохраняются в: {DEMO_DIR}")
@@ -2951,7 +3178,7 @@ def main():
         say("❌ Неверный DISCORD_TOKEN. Пересоздайте токен в Discord Developer Portal -> Bot -> Reset Token.")
         raise SystemExit(1)
     except discord.errors.PrivilegedIntentsRequired:
-        say("❌ Не включён Server Members Intent: Developer Portal -> Bot -> Privileged Gateway Intents.")
+        say("❌ Не включены привилегированные Intents: Developer Portal -> Bot -> Privileged Gateway Intents -> включите Server Members Intent и Message Content Intent (либо задайте AUTOBAN_CHAT=0 в Render).")
         raise SystemExit(1)
     except Exception as exc:
         import traceback
