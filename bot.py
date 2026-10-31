@@ -665,7 +665,7 @@ def load_on_server(match_id: int):
         'matchzy_remote_log_header_key Authorization',
         f'matchzy_remote_log_header_value {EVENT_TOKEN}',
         # чистый префикс чата (без кавычек; пробел неразрывный, чтобы консоль не обрезала значение)
-        'matchzy_chat_prefix [{PURPLE}VIBE\u00a0MIX{Default}]',
+        'matchzy_chat_prefix [{PURPLE}VIBE MIX{Default}]',
         # загрузка демо матча на веб-сервер бота (приходит после окончания карты)
         f'matchzy_demo_upload_url {WEB_BASE_URL}/demo',
         'matchzy_demo_upload_header_key Authorization',
