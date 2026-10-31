@@ -1,11 +1,11 @@
 """
 ПАТЧ для bot.py: матч стартует сам, когда все игроки зашли на CS2-сервер (никто не пишет .ready).
-Заодно меняет префикс [VIBE] в чате MatchZy на [KZLP].
+Заодно меняет префикс [VIBE] в чате MatchZy на [VIBE MIX].
 
 ШАГ 1. В блок настроек (рядом с BREAK_SECONDS) добавьте:
     AUTO_START = os.getenv("AUTO_START", "1") == "1"            # 0 = выключить автостарт
     AUTO_START_DELAY = int(os.getenv("AUTO_START_DELAY", "15")) # сек. ждём, пока все прогрузятся
-    CHAT_PREFIX = os.getenv("CHAT_PREFIX", "[{Green}KZLP{Default}] ")
+    CHAT_PREFIX = os.getenv("CHAT_PREFIX", "[{PURPLE}VIBE MIX{Default}] ")
 
 ШАГ 2. В класс State, в __init__, добавьте две строки:
     self.connected: set[str] = set()     # steamid игроков матча, которые сейчас на сервере
