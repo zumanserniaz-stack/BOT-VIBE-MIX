@@ -6,8 +6,9 @@ VIBE MIX FreePick 5x5: очередь -> готовность -> капитан�
 При Steam-верификации бот определяет FACEIT-уровень игрока и выдаёт роль «FACEIT LVL n».
 Результат матча: табло + MVP + ELO (+30 / -20) + кнопка «Скачать демо».
 """
-print("▶ bot.py v34 загружается...", flush=True)
+print("▶ bot.py v36 загружается...", flush=True)
 import asyncio
+from collections import deque
 import io
 import json
 import logging
@@ -318,6 +319,8 @@ class State:
 
 
 S = State()
+last_round: dict[int, dict] = {}   # match_id -> последнее событие round_end (там статистика игроков)
+event_log = deque(maxlen=12)       # последние события MatchZy (для /fp_diag)
 snapshots: dict[int, dict] = {}  # match_id -> {steamid64: (игрок, команда)}: чтобы результат пришёл даже после сброса
 
 
@@ -1198,7 +1201,7 @@ async def clear_chat():
 async def reset_to_queue():
     # если сервер не прислал результат (ручной сброс, таймер), всё равно пишем итог в канал результатов
     if S.match_id and S.phase == "playing" and S.match_id not in posted_results:
-        await post_result({}, dict(S.match_players), S.match_id, note="manual")
+        await post_fallback_result(S.match_id, dict(S.match_players))
     await clear_voice_access()
     await clear_chat()
     await close_match_chat()
@@ -1618,9 +1621,10 @@ demo_urls: dict[int, str] = {}                 # match_id -> ссылка на �
 result_msgs: dict[int, discord.Message] = {}   # match_id -> сообщение с результатом (чтобы добавить кнопку демо позже)
 
 
-def demo_view(url: str) -> discord.ui.View:
+def demo_view(mid: int) -> discord.ui.View:
+    """Кнопка всегда есть в результате: ссылка ведёт на /demo/<id>, а там уже отдаётся файл (или «ещё грузится»)."""
     v = discord.ui.View()
-    v.add_item(discord.ui.Button(label="Скачать демку", emoji="⬇️", url=url))
+    v.add_item(discord.ui.Button(label="Скачать демку", emoji="⬇️", url=f"{WEB_BASE_URL}/demo/{mid}"))
     return v
 
 
@@ -1629,7 +1633,7 @@ def apply_elo(players: dict, win_n: int) -> dict:
     teams = {1: [], 2: []}
     for m, n in players.values():
         teams[n].append(m.id)
-    if not teams[1] or not teams[2]:
+    if not teams[1] and not teams[2]:
         return {}
     changes = {}
     for n, ids in teams.items():
@@ -1772,14 +1776,28 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
             e.add_field(name=title, value="\n".join(r[1] for r in rows) or "—", inline=False)
         kwargs = {"embed": e}
     try:
-        if mid in demo_urls:  # демо уже успело прийти
-            kwargs["view"] = demo_view(demo_urls[mid])
+        kwargs["view"] = demo_view(mid)  # кнопка демо сразу, файл подтянется, когда сервер его загрузит
         msg = await ch.send(**kwargs)
         result_msgs[mid] = msg
         log.info("Результат матча %s опубликован в #%s", mid, ch.name)
     except discord.HTTPException:
         posted_results.discard(mid)
         log.exception("Не удалось отправить результат (права бота: Send Messages, Embed Links, Attach Files)")
+
+
+async def post_fallback_result(mid: int, players: dict):
+    """map_result не пришёл: берём статистику из последнего round_end.
+    Если счёт уже финальный (13+ и разница 2+), победитель определяется по счёту и ELO начисляется."""
+    data = last_round.get(mid) or {}
+    note = "manual"
+    if data:
+        s1 = (data.get("team1") or {}).get("score") or 0
+        s2 = (data.get("team2") or {}).get("score") or 0
+        if max(s1, s2) >= 13 and abs(s1 - s2) >= 2:
+            data = dict(data)
+            data["winner"] = {"team": "team1" if s1 > s2 else "team2"}
+            note = ""
+    await post_result(data, players, mid, note=note)
 
 
 # ----------------------------- БАНЫ (лог в Discord + сайт) -----------
@@ -2064,10 +2082,25 @@ async def h_demo(req: web.Request):
         msg = result_msgs.get(mid)
         if msg:  # результат уже опубликован: добавляем кнопку к нему
             try:
-                await msg.edit(view=demo_view(url))
+                await msg.edit(view=demo_view(mid))
             except discord.HTTPException:
                 log.exception("Не удалось добавить кнопку демо к результату")
     return web.Response(text="ok")
+
+
+async def h_demo_get(req: web.Request):
+    """Скачивание демо по номеру матча: редирект на файл, если он уже загружен сервером."""
+    mid = req.match_info["mid"]
+    url = demo_urls.get(int(mid))
+    if not url and os.path.isdir(DEMO_DIR):
+        for f in sorted(os.listdir(DEMO_DIR), reverse=True):
+            if mid in f and ".dem" in f:
+                url = f"{WEB_BASE_URL}/demos/{f}"
+                break
+    if url:
+        raise web.HTTPFound(url)
+    return page("Демо ещё не готово",
+                "Сервер загружает демо после окончания матча. Попробуйте через минуту.", False)
 
 
 async def h_events(req: web.Request):
@@ -2081,10 +2114,17 @@ async def h_events(req: web.Request):
     log.info("MatchZy event: %s (matchid=%s)", data.get("event"), data.get("matchid"))
     ev = data.get("event")
     same = S.phase == "playing" and str(data.get("matchid")) == str(S.match_id)
+    event_log.append(f"{time.strftime('%H:%M:%S')} {ev} match={data.get('matchid')} {'ok' if same else 'не текущий матч'}")
     if ev == "series_end" and same:
         asyncio.create_task(reset_to_queue())
     elif same and ev == "going_live":
         S.live = True            # матч пошёл (после ножей): теперь выход игрока = перерыв
+    elif ev == "round_end":
+        try:
+            if data.get("team1"):
+                last_round[int(data.get("matchid"))] = data  # статистика на случай, если map_result не придёт
+        except (TypeError, ValueError):
+            pass
     elif ev == "map_result":
         if same:
             S.live = False       # карта закончилась: выходы игроков больше не считаем
@@ -2393,6 +2433,7 @@ class FreePickBot(commands.Bot):
             web.get("/bans", h_bans),
             web.post("/events", h_events),
             web.post("/demo", h_demo),
+            web.get(r"/demo/{mid:\d+}", h_demo_get),
             web.static("/demos", DEMO_DIR),
             web.get("/auth/steam", h_auth),
             web.get("/auth/steam/callback", h_auth_callback),
@@ -2621,10 +2662,11 @@ async def fp_diag_cmd(i: discord.Interaction):
     await i.response.defer(ephemeral=True)
     parts = [f"Сервер: `{SERVER_IP}:{SERVER_PORT}`, RCON_PASSWORD: {'задан' if RCON_PASSWORD else 'НЕ ЗАДАН'}",
              f"Матч: `{S.match_id}`, фаза `{S.phase}`, игроков матча {len(S.match_players)}"]
+    parts.append("**События MatchZy (последние)**\n```" + ("\n".join(list(event_log)[-8:]) or "ничего не приходило") + "```")
     for cmd in ("status", "get5_status"):
         try:
             resp = await asyncio.to_thread(rcon_raw, cmd)
-            parts.append(f"**{cmd}**\n```{resp.strip()[:650] or '(пусто)'}```")
+            parts.append(f"**{cmd}**\n```{resp.strip()[:420] or '(пусто)'}```")
         except Exception as exc:
             parts.append(f"**{cmd}**: ошибка `{type(exc).__name__}: {exc}`")
     await i.followup.send("\n".join(parts)[:1990], ephemeral=True)
