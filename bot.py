@@ -45,7 +45,7 @@ SERVER_PASSWORD = os.getenv("SERVER_PASSWORD", "")
 
 # Веб-сервер бота (его должен видеть CS2-сервер)
 WEB_PORT = int(os.getenv("PORT") or os.getenv("WEB_PORT", "55031"))
-WEB_BASE_URL = os.getenv("WEB_BASE_URL", "WEB_BASE_URL = https://bot-vibe-mix-1.onrender.com").rstrip("/")
+WEB_BASE_URL = os.getenv("WEB_BASE_URL", "https://bot-vibe-mix-1.onrender.com").rstrip("/")
 EVENT_TOKEN = os.getenv("EVENT_TOKEN") or secrets.token_urlsafe(24)  # секрет для событий MatchZy (если не задан, генерируется сам)
 
 # ID твоего Discord-сервера: команды появятся мгновенно (необязательно)
