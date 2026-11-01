@@ -2103,7 +2103,7 @@ async def do_unban(did: int, reason: str, by: str | None = None) -> bool:
 
 
 # ---- АВТО-БАН: не нажал «Готов» / вышел из матча. Срок растёт при повторах (за последние 30 дней).
-AUTOBAN = os.getenv("AUTOBAN", "1") == "1"   # 0 = выключить авто-бан
+AUTOBAN = os.getenv("AUTOBAN", "0") == "1"   # 0 = выключить авто-бан
 AUTOBAN_LADDERS = {
     "ready": os.getenv("AUTOBAN_READY_LADDER", "10m,30m,2h,1d"),
     "leave": os.getenv("AUTOBAN_LEAVE_LADDER", "30m,2h,1d,3d,7d"),
