@@ -1,14 +1,12 @@
 """
-VIBE MIX FreePick 5x5: очередь -> готовность -> капитаны -> пики игроков -> вето карт -> запуск матча на CS2 (MatchZy).
-После драфта бот САМ создаёт войсы Team 1 / Team 2 и перекидывает туда игроков (после матча войсы удаляются).
-Авто-старт матча: как только все игроки зашли на сервер, матч стартует сам; иначе после разминки (4 мин).
-Если во время драфта все игроки вышли из войса очереди, драфт отменяется и очередь сбрасывается.
+VIBE MIX FreePick 5x5: очередь -> капитаны -> пики игроков -> вето карт -> запуск матча на CS2 (MatchZy).
+После драфта игроки получают доступ в войс своей команды (Team 1 / Team 2) и перемещаются туда.
+Авто-старт: как только набралось нужное число игроков, драфт запускается сам.
 При Steam-верификации бот определяет FACEIT-уровень игрока и выдаёт роль «FACEIT LVL n».
-Результат матча: табло + MVP + статистика каждого игрока + ELO (+30 / -20) + кнопка «Скачать демо».
+Результат матча: табло + MVP + ELO + кнопка «Скачать демо».
 """
-print("▶ bot.py v45 загружается...", flush=True)
+print("▶ bot.py v26 загружается...", flush=True)
 import asyncio
-from collections import deque
 import io
 import json
 import logging
@@ -40,16 +38,20 @@ log = logging.getLogger("freepick")
 # CS2-сервер (RCON_PASSWORD обязательно задай в Render -> Environment)
 SERVER_IP = os.getenv("SERVER_IP", "45.86.81.37").strip()
 SERVER_PORT = int(os.getenv("SERVER_PORT", "55031"))
-RCON_PASSWORD = os.getenv("RCON_PASSWORD", "ArniAlash22062008Nurlan")
+RCON_PASSWORD = os.getenv("RCON_PASSWORD", "")
 SERVER_PASSWORD = os.getenv("SERVER_PASSWORD", "")
 
 # Веб-сервер бота (его должен видеть CS2-сервер)
 WEB_PORT = int(os.getenv("PORT") or os.getenv("WEB_PORT", "55031"))
-WEB_BASE_URL = os.getenv("WEB_BASE_URL", "https://bot-vibe-mix-1.onrender.com").rstrip("/")
+WEB_BASE_URL = os.getenv("WEB_BASE_URL", "https://bot-vibe-mix.onrender.com").rstrip("/")
 EVENT_TOKEN = os.getenv("EVENT_TOKEN") or secrets.token_urlsafe(24)  # секрет для событий MatchZy (если не задан, генерируется сам)
 
 # ID твоего Discord-сервера: команды появятся мгновенно (необязательно)
 GUILD_ID = int(os.getenv("GUILD_ID", "1548371779523837952"))
+
+# Голосовые каналы команд (0 = выключено)
+TEAM1_VC = int(os.getenv("TEAM1_VC_ID", "1565442747450659038"))
+TEAM2_VC = int(os.getenv("TEAM2_VC_ID", "1565442482425041016"))
 
 # Голосовой канал очереди: зашёл в него = встал в очередь, вышел = покинул (0 = только кнопки)
 QUEUE_VC = int(os.getenv("QUEUE_VC_ID", "1565440992574705734"))
@@ -68,14 +70,8 @@ TEAM_SIZE = 1 if TEST_MODE else 5
 NEED = 1 if TEST_MODE else TEAM_SIZE * 2
 PICK_TIMEOUT = 30            # секунд на пик/бан, потом выбор случайный
 CAPTAIN_TIMEOUT = 30         # секунд на выбор капитанов (кто не вызвался, назначается случайно)
-READY_TIMEOUT = int(os.getenv("READY_TIMEOUT", "60"))   # секунд на кнопку «Готов»
 MATCH_MAX_SECONDS = 600 if TEST_MODE else 2 * 3600  # автосброс, если series_end не пришёл
 BREAK_SECONDS = int(os.getenv("BREAK_SECONDS", "300"))  # сколько ждём вышедшего игрока, потом матч продолжается
-
-# Автостарт матча: все зашли на сервер -> через AUTO_START_DELAY сек матч стартует сам
-AUTO_START = os.getenv("AUTO_START", "1") == "1"            # 0 = выключить автостарт
-AUTO_START_DELAY = 15  # когда все зашли на сервер: разминка 15 сек, потом матч стартует сам
-WARMUP_SECONDS = int(os.getenv("WARMUP_SECONDS", "240"))     # разминка 4 минуты, потом матч стартует принудительно
 
 # Канал для результатов матчей (0 = бот сам найдёт канал, в названии которого есть "результаты")
 RESULTS_CHANNEL = int(os.getenv("RESULTS_CHANNEL_ID", "1565444339084038314"))
@@ -90,7 +86,7 @@ DB_PATH = os.getenv("DB_PATH", "freepick.db")
 DEMO_DIR = os.getenv("DEMO_DIR", "demos")
 
 MAPS = ["de_anubis", "de_mirage", "de_inferno", "de_nuke",
-        "de_ancient", "de_dust2", "de_overpass", "de_cache"]
+        "de_ancient", "de_dust2", "de_overpass"]
 
 # ----------------------------- БАЗА ДАННЫХ ---------------------------
 db = sqlite3.connect(DB_PATH)
@@ -113,8 +109,7 @@ db.execute("CREATE TABLE IF NOT EXISTS elo ("
 db.commit()
 
 ELO_START = 1000   # стартовый рейтинг
-ELO_WIN = 30       # +30 за победу
-ELO_LOSS = 20      # -20 за поражение
+ELO_K = 30         # сила изменения за матч
 ELO_MIN = 100      # ниже этого рейтинг не падает
 
 
@@ -154,7 +149,7 @@ _restore_done = False  # пока бэкап не прочитан, новый �
 
 
 def _dump() -> str:
-    keys = ("panel_channel", "panel_message", "team_vcs", "match_no")
+    keys = ("panel_channel", "panel_message", "team_access")
     data = {
         "links": db.execute("SELECT discord_id, steamid64 FROM links").fetchall(),
         "bans": db.execute("SELECT discord_id, reason, expires FROM bans").fetchall(),
@@ -297,46 +292,36 @@ class State:
         self.panel: discord.Message | None = None
         self.match_id: int | None = None
         self.matches: dict[int, dict] = {}
-        self.team_vcs: dict[int, int] = {}             # номер команды -> id временного войса
+        self.team_access: list[tuple[int, int]] = []   # (id канала, id игрока) с выданным доступом
         self.active_ids: set[int] = set()              # игроки текущего драфта/матча
         self.chat_msgs: list[discord.Message] = []     # сообщения драфта/матча, удаляются при сбросе
         self.match_players: dict[str, tuple[discord.Member, int]] = {}  # steamid64 -> (игрок, номер команды)
         self.captain_ids: set[int] = set()
         self.live = False                              # матч в живой фазе (после ножей)
-        self.ever_live = False                         # матч хотя бы раз дошёл до going_live (иначе пустой результат не пишем)
         self.paused = False                            # матч на паузе из-за вышедшего игрока
         self.absent: set[int] = set()                  # игроки, которые вышли с сервера
         self.break_channel: discord.TextChannel | None = None
         self.break_task: asyncio.Task | None = None
         self.break_lock = asyncio.Lock()
         self.match_channel: discord.TextChannel | None = None   # отдельный чат матча
-        self.draft_task: asyncio.Task | None = None    # задача драфта (чтобы отменить, если все вышли из войса)
-        self.draft_check = False                       # идёт проверка «все ли вышли из войса»
-        self.connected: set[str] = set()               # steamid игроков матча, которые сейчас на сервере
-        self.auto_started = False                      # автостарт уже запущен для этого матча
-        self.moving = False                            # идёт перемещение игроков в войсы команд (драфт не отменять)
         self.lock = asyncio.Lock()
 
 
 S = State()
-last_round: dict[int, dict] = {}   # match_id -> последнее событие round_end (там статистика игроков)
-event_log = deque(maxlen=12)       # последние события MatchZy (для /fp_diag)
-events_seen: set[int] = set()      # match_id, от которых сервер уже присылал события (значит, remote log настроен)
-snapshots: dict[int, dict] = {}  # match_id -> {steamid64: (игрок, команда)}: чтобы результат пришёл даже после сброса
 
 
 def save_access():
-    kv_set("team_vcs", json.dumps(S.team_vcs))
+    kv_set("team_access", json.dumps(S.team_access))
     schedule_backup()
 
 
 def load_access():
-    raw = kv_get("team_vcs")
+    raw = kv_get("team_access")
     if raw:
         try:
-            S.team_vcs = {int(k): int(v) for k, v in json.loads(raw).items()}
+            S.team_access = [tuple(x) for x in json.loads(raw)]
         except (ValueError, TypeError):
-            S.team_vcs = {}
+            S.team_access = []
 
 
 def pretty(map_name: str) -> str:
@@ -344,7 +329,7 @@ def pretty(map_name: str) -> str:
 
 
 def panel_embed() -> discord.Embed:
-    e = discord.Embed(title="Очередь — FreePick", color=0x2B2D31)
+    e = discord.Embed(title="Очередь — FreePick", color=0x5865F2)
     e.add_field(
         name="Настройки матча",
         value=("Режим: Соревновательный\nВыбор игроков: Капитаны\n"
@@ -424,80 +409,6 @@ class QueueView(discord.ui.View):
         await i.response.edit_message(embed=panel_embed(), view=self)
 
 
-# ----------------------------- ГОТОВНОСТЬ ----------------------------
-class ReadyView(discord.ui.View):
-    """Когда набрано 10 игроков, каждый должен нажать «Готов». Кто не нажал, выбывает из очереди."""
-
-    def __init__(self, players: list[discord.Member]):
-        super().__init__(timeout=READY_TIMEOUT)
-        self.players = players
-        self.ids = {m.id for m in players}
-        self.ready: set[int] = set()
-
-    def embed(self, title: str = "Матч найден!", color: int = 0x57F287) -> discord.Embed:
-        lines = [f"{'✅' if m.id in self.ready else '⏳'} {m.mention}" for m in self.players]
-        e = discord.Embed(title=title, color=color,
-                          description=f"Нажмите **Готов** в течение {READY_TIMEOUT} сек.\n\n" + "\n".join(lines))
-        e.set_footer(text=f"Готовы: {len(self.ready)} из {len(self.players)}")
-        return e
-
-    @discord.ui.button(label="Готов", emoji="✅", style=discord.ButtonStyle.success)
-    async def ok(self, i: discord.Interaction, b: discord.ui.Button):
-        if i.user.id not in self.ids:
-            return await i.response.send_message("Вы не участвуете в этом матче.", ephemeral=True)
-        self.ready.add(i.user.id)
-        if len(self.ready) == len(self.players):
-            await i.response.edit_message(embed=self.embed(), view=None)
-            self.stop()
-        else:
-            await i.response.edit_message(embed=self.embed(), view=self)
-
-
-async def ready_check(channel, players: list[discord.Member]) -> bool:
-    """True, если все нажали «Готов». Иначе матч отменяется, не нажавшие убираются из очереди."""
-    view = ReadyView(players)
-    msg = await track_send(channel, " ".join(m.mention for m in players),
-                           embed=view.embed(), view=view)
-    await view.wait()
-    if len(view.ready) == len(players):
-        return True
-
-    # ---- не все готовы: отмена ----
-    absent = [m for m in players if m.id not in view.ready]
-    ready_players = [m for m in players if m.id in view.ready]
-    try:
-        await msg.edit(embed=view.embed("Матч отменён", 0xED4245), view=None)
-    except discord.HTTPException:
-        pass
-    for m in absent:
-        if QUEUE_VC and m.voice and m.voice.channel and m.voice.channel.id == QUEUE_VC:
-            try:
-                await m.move_to(None)  # убираем из войса очереди
-            except discord.HTTPException:
-                pass
-        try:
-            await m.send("⏰ Вы не нажали «Готов» и были убраны из очереди. Зайдите снова, когда будете готовы.")
-        except discord.HTTPException:
-            pass
-    async with S.lock:
-        S.phase = "queue"
-        S.queue = ready_players          # готовые остаются в очереди
-        S.active_ids.clear()
-        S.draft_task = None
-    for m in absent:  # авто-бан за неготовность
-        await auto_ban(m, "ready", READY_REASON)
-    await clear_chat()
-    try:
-        await channel.send("⏰ Не все нажали «Готов». Не нажавшие убраны, остальные остались в очереди: "
-                           + ", ".join(m.mention for m in absent),
-                           delete_after=30, allowed_mentions=discord.AllowedMentions.none())
-    except discord.HTTPException:
-        pass
-    await refresh_panel()
-    await sync_queue()
-    return False
-
-
 # ----------------------------- ПИКИ И ВЕТО ---------------------------
 class CaptainView(discord.ui.View):
     """Игроки сами вызываются в капитаны: первые двое нажавших становятся капитанами."""
@@ -542,71 +453,23 @@ async def choose_captains(channel, players: list[discord.Member]) -> list[discor
     return caps
 
 
-def next_match_no() -> int:
-    n = int(kv_get("match_no") or 0) + 1
-    kv_set("match_no", n)
-    schedule_backup()
-    return n
-
-
-def draft_embed(no: int, teams, pool, cap=None, done: bool = False, last: str = "") -> discord.Embed:
-    """Табло драфта: две команды + свободные игроки."""
-    e = discord.Embed(title=f"Очередь — FreePick #{no}", color=0x2B2D31)
-    if done:
-        e.description = "# Драфт завершён\nКоманды собраны."
-    elif cap:
-        e.description = (f"# Выбор игроков\nХод капитана {cap.mention}: "
-                         f"выберите игрока кнопками ниже ({PICK_TIMEOUT} сек).")
-    for t in teams:
-        lines = [f"`{n:02d}` {m.mention}" for n, m in enumerate(t, 1)]
-        e.add_field(name=f"team_{t[0].display_name}"[:256], value="\n".join(lines), inline=True)
-    if pool:
-        free = [f"`{n:02d}` {m.mention}" for n, m in enumerate(pool, 1)]
-        e.add_field(name=f"Свободные игроки: {len(pool)}", value="\n".join(free), inline=False)
-    if last:
-        e.set_footer(text=last)
-    return e
-
-
-def veto_embed(no: int, maps: list, banned: list, cap=None, final: str = "", last: str = "") -> discord.Embed:
-    """Табло вето карт в том же стиле, что и очередь: нумерованный список + последнее действие внизу."""
-    e = discord.Embed(title=f"Очередь — FreePick #{no}", color=0x2B2D31)
-    if final:
-        e.description = f"# Карта выбрана\nИграем на **{pretty(final)}**."
-    else:
-        e.description = (f"# Вето карт\nХод капитана {cap.mention}: "
-                         f"забаньте карту кнопками ниже ({PICK_TIMEOUT} сек).")
-    e.add_field(name=f"Доступные карты: {len(maps)}",
-                value="\n".join(f"`{n:02d}` {pretty(m)}" for n, m in enumerate(maps, 1)), inline=True)
-    if banned:
-        e.add_field(name=f"Забанены: {len(banned)}",
-                    value="\n".join(f"`{n:02d}` ~~{pretty(m)}~~ · {c.display_name}"
-                                    for n, (m, c) in enumerate(banned, 1))[:1024], inline=True)
-    if last:
-        e.set_footer(text=last)
-    return e
-
-
 class PickView(discord.ui.View):
-    """Кнопка на каждого свободного игрока: «ник | ELO: 1000»."""
-
     def __init__(self, cap: discord.Member, pool: list[discord.Member]):
         super().__init__(timeout=PICK_TIMEOUT)
         self.cap, self.pool, self.picked = cap, pool, None
-        for m in pool:
-            btn = discord.ui.Button(label=f"{m.display_name[:55]} | ELO: {get_elo(m.id)}",
-                                    style=discord.ButtonStyle.secondary)
-            btn.callback = self._make_cb(m)
-            self.add_item(btn)
+        self.select = discord.ui.Select(
+            placeholder="Выберите игрока",
+            options=[discord.SelectOption(label=f"{m.display_name[:80]} · ELO {get_elo(m.id)}", value=str(m.id)) for m in pool],
+        )
+        self.select.callback = self.on_pick
+        self.add_item(self.select)
 
-    def _make_cb(self, member: discord.Member):
-        async def cb(i: discord.Interaction):
-            if i.user.id != self.cap.id:
-                return await i.response.send_message("Сейчас выбирает другой капитан.", ephemeral=True)
-            self.picked = member
-            await i.response.defer()
-            self.stop()
-        return cb
+    async def on_pick(self, i: discord.Interaction):
+        if i.user.id != self.cap.id:
+            return await i.response.send_message("Сейчас выбирает другой капитан.", ephemeral=True)
+        self.picked = next(m for m in self.pool if str(m.id) == self.select.values[0])
+        await i.response.defer()
+        self.stop()
 
 
 class VetoView(discord.ui.View):
@@ -650,10 +513,9 @@ def build_match(match_id: int, teams: list[list[discord.Member]], map_name: str)
 
 
 def _rcon_run(c, cmd: str):
-    """Ответ CS2 приходит в UTF-8: читаем его побайтно (latin-1) и затем декодируем как UTF-8,
-    чтобы не было ни ошибок декодирования, ни кракозябр."""
+    """Ответ CS2 иногда содержит не-UTF-8 байты: команда при этом уже выполнена, ошибку игнорируем."""
     try:
-        resp = c.run(cmd, encoding="latin-1")
+        return c.run(cmd, encoding="latin-1")
     except TypeError:  # старая версия библиотеки без параметра encoding
         try:
             return c.run(cmd)
@@ -661,23 +523,14 @@ def _rcon_run(c, cmd: str):
             return ""
     except UnicodeDecodeError:
         return ""
-    try:
-        return resp.encode("latin-1").decode("utf-8")
-    except (UnicodeEncodeError, UnicodeDecodeError):
-        return resp
 
 
 def load_on_server(match_id: int):
-    """Блокирующая функция: отправляет команды на CS2-сервер по RCON.
-    Значения со ссылками обязательно в кавычках: иначе консоль CS2 считает «//» комментарием и режет URL до «https:»."""
+    """Блокирующая функция: отправляет команды на CS2-сервер по RCON."""
     cmds = [
         f'matchzy_remote_log_url "{WEB_BASE_URL}/events"',
         'matchzy_remote_log_header_key "Authorization"',
         f'matchzy_remote_log_header_value "{EVENT_TOKEN}"',
-        'matchzy_chat_prefix [{PURPLE}VIBE MIX{Default}]',
-        # запись демо: в имени файла обязательно {MATCH_ID}, по нему кнопка «Скачать демку» находит файл
-        'matchzy_demo_path "MatchZy/"',
-        'matchzy_demo_name_format "{TIME}_{MATCH_ID}_{MAP}"',
         # загрузка демо матча на веб-сервер бота (приходит после окончания карты)
         f'matchzy_demo_upload_url "{WEB_BASE_URL}/demo"',
         'matchzy_demo_upload_header_key "Authorization"',
@@ -687,29 +540,8 @@ def load_on_server(match_id: int):
     with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
         _rcon_run(c, "get5_endmatch")  # сбросить прошлый матч, иначе MatchZy не загрузит новый
         time.sleep(1)
-        last = ""
-        for cmd in cmds:
-            last = _rcon_run(c, cmd) or ""
-    return last  # ответ сервера на matchzy_loadmatch_url (последняя команда)
-
-
-def set_event_cvars():
-    """Блокирующая функция: заново ставит адрес для событий и загрузки демо уже ПОСЛЕ загрузки матча
-    (MatchZy мог сбросить эти настройки при loadmatch). Возвращает то, что сервер отвечает на запрос remote_log_url."""
-    cmds = [
-        f'matchzy_remote_log_url "{WEB_BASE_URL}/events"',
-        'matchzy_remote_log_header_key "Authorization"',
-        f'matchzy_remote_log_header_value "{EVENT_TOKEN}"',
-        f'matchzy_demo_upload_url "{WEB_BASE_URL}/demo"',
-        'matchzy_demo_upload_header_key "Authorization"',
-        f'matchzy_demo_upload_header_value "{EVENT_TOKEN}"',
-        'matchzy_demo_path "MatchZy/"',
-        'matchzy_demo_name_format "{TIME}_{MATCH_ID}_{MAP}"',
-    ]
-    with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
         for cmd in cmds:
             _rcon_run(c, cmd)
-        return _rcon_run(c, "matchzy_remote_log_url") or ""
 
 
 def rcon_gamestate():
@@ -737,115 +569,57 @@ def rcon_pause(pause: bool):
             _rcon_run(c, fallback)
 
 
-def rcon_force_start() -> str:
-    """Блокирующая функция: принудительный старт матча MatchZy (как админская команда .start)."""
-    with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
-        return _rcon_run(c, "css_start") or ""
-
-
-def rcon_force_ready() -> str:
-    """Запасной вариант старта: все игроки сразу «готовы» (как .forceready)."""
-    with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
-        return _rcon_run(c, "css_forceready") or ""
-
-
-def rcon_players():
-    """Блокирующая функция: (SteamID64 игроков из status, число людей на сервере).
-    CS2 в status не показывает SteamID, поэтому главное число людей из строки «players : N humans»."""
-    with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
-        resp = _rcon_run(c, "status") or ""
-    ids = {str(76561197960265728 + int(a)) for a in re.findall(r"\[U:1:(\d+)\]", resp)}
-    m = re.search(r"players\s*:\s*(\d+)\s+humans", resp)
-    humans = int(m.group(1)) if m else 0
-    global _status_logged
-    if not m and not _status_logged:
-        _status_logged = True
-        log.info("RCON status: не найдена строка с числом игроков, ответ сервера: %r", resp[:400])
-    return ids, humans
-
-
-_status_logged = False
-
-
-def rcon_raw(cmd: str) -> str:
-    """Блокирующая функция: выполняет любую RCON-команду и возвращает ответ (для /fp_diag)."""
-    with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
-        return _rcon_run(c, cmd) or ""
-
-
 # ----------------------------- ВОЙСЫ КОМАНД --------------------------
 async def move_to_voice(guild: discord.Guild, teams):
-    """Создаёт категорию «VIBE — team_A VS team_B» с двумя войсами (по одному на команду) и перекидывает туда игроков."""
-    await clear_voice_access()  # на случай, если остались войсы от прошлого матча
-    names = [f"team_{t[0].display_name}" if t else f"team_{n}" for n, t in enumerate(teams, 1)]
-    cat_name = f"VIBE MIX — {names[0]} VS {names[1]}"[:100]
-    base_cat = S.panel.channel.category if S.panel else None
-    category = None
-    try:
-        category = await guild.create_category(
-            cat_name,
-            overwrites={
-                guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=False),
-                guild.me: discord.PermissionOverwrite(view_channel=True, connect=True,
-                                                      move_members=True, manage_channels=True),
-            },
-            reason="FreePick: категория матча")
-        S.team_vcs[0] = category.id  # ключ 0 = категория
-        save_access()
-    except discord.HTTPException:
-        log.exception("Не удалось создать категорию матча (нужно право Manage Channels)")
-    for n, team in enumerate(teams, 1):
-        if not team:
+    """Выдаёт игрокам доступ в войс их команды (Team 1 / Team 2) и перекидывает их туда."""
+    await clear_voice_access()  # на случай, если остались доступы от прошлого матча
+    for vc_id, team in ((TEAM1_VC, teams[0]), (TEAM2_VC, teams[1])):
+        if not vc_id:
             continue
-        ow = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=False),
-            guild.me: discord.PermissionOverwrite(view_channel=True, connect=True,
-                                                  move_members=True, manage_channels=True),
-        }
-        for m in team:
-            mem = guild.get_member(m.id)
-            if mem:
-                ow[mem] = discord.PermissionOverwrite(view_channel=True, connect=True, speak=True)
-        try:
-            ch = await guild.create_voice_channel(names[n - 1][:100], overwrites=ow,
-                                                  category=category or base_cat,
-                                                  reason="FreePick: войс команды")
-        except discord.HTTPException:
-            log.exception("Не удалось создать войс Team %s (нужны права Manage Channels и Move Members)", n)
+        ch = guild.get_channel(vc_id)
+        if not ch:
+            log.warning("Голосовой канал %s не найден", vc_id)
             continue
-        S.team_vcs[n] = ch.id
-        save_access()  # сохраняем сразу: если бот упадёт, войс удалится при следующем старте
         for m in team:
-            mem = guild.get_member(m.id)
-            if mem and mem.voice:
+            member = guild.get_member(m.id)
+            if not member:
+                continue
+            # 1) доступ в канал
+            try:
+                await ch.set_permissions(member, view_channel=True, connect=True, speak=True,
+                                         reason="FreePick: игрок матча")
+                S.team_access.append((vc_id, member.id))
+            except discord.HTTPException:
+                log.exception("Не удалось выдать доступ %s в войс %s", member, vc_id)
+                continue
+            # 2) перекидываем, если он сейчас в любом войсе
+            if member.voice:
                 try:
-                    await mem.move_to(ch)
+                    await member.move_to(ch)
                 except discord.HTTPException:
-                    log.exception("Не удалось переместить %s", mem)
+                    log.exception("Не удалось переместить %s", member)
     save_access()
 
 
 async def clear_voice_access():
-    """После матча удаляет войсы и категорию (игроков из войсов возвращает в войс очереди)."""
-    if not S.team_vcs:
+    """Забирает доступ в командные войсы после матча."""
+    if not S.team_access:
         return
-    vcs, S.team_vcs = dict(S.team_vcs), {}  # обнуляем сразу, чтобы on_voice_state_update не гнал игроков обратно
-    queue_ch = bot.get_channel(QUEUE_VC) if QUEUE_VC else None
-    order = [v for k, v in vcs.items() if k != 0] + ([vcs[0]] if 0 in vcs else [])  # категория удаляется последней
-    for cid in order:
-        ch = bot.get_channel(cid)
+    for vc_id, member_id in list(S.team_access):
+        ch = bot.get_channel(vc_id)
         if not ch:
             continue
-        if queue_ch and isinstance(ch, discord.VoiceChannel):
-            for m in list(ch.members):
-                try:
-                    await m.move_to(queue_ch)
-                except discord.HTTPException:
-                    pass
+        member = ch.guild.get_member(member_id)
+        if not member:
+            try:
+                member = await ch.guild.fetch_member(member_id)
+            except discord.HTTPException:
+                continue  # игрока уже нет на сервере
         try:
-            await ch.delete(reason="FreePick: матч окончен")
+            await ch.set_permissions(member, overwrite=None, reason="FreePick: матч окончен")
         except discord.HTTPException:
-            log.exception("Не удалось удалить войс/категорию матча")
+            log.exception("Не удалось забрать доступ в войс")
+    S.team_access.clear()
     save_access()
 
 
@@ -999,17 +773,6 @@ async def handle_disconnect(steamid: str):
         pass
 
 
-async def handle_return(data: dict):
-    """Игрок вернулся на сервер во время паузы: он больше не считается вышедшим."""
-    player = data.get("player") or {}
-    info = S.match_players.get(str(player.get("steamid", "")))
-    if not info or not S.paused:
-        return
-    S.absent.discard(info[0].id)
-    if not S.absent:
-        await resume_match("Все игроки вернулись на сервер")
-
-
 # SteamID, которым можно заходить на сервер во время матча без привязки (админы, комментаторы), через запятую
 ADMIN_STEAMIDS = {x.strip() for x in os.getenv("ADMIN_STEAMIDS", "").split(",") if x.strip()}
 
@@ -1040,205 +803,6 @@ async def handle_connect(data: dict):
             pass
 
 
-# ----------------------------- АВТОСТАРТ -----------------------------
-async def wait_loaded(match_id: int):
-    """Ждёт до 30 сек, пока сервер не покажет наш matchid (после loadmatch сервер может менять карту).
-    Возвращает (True/False, описание). Если get5_status не распознан, матч не блокируем."""
-    info = "нет ответа от сервера"
-    for _ in range(15):
-        await asyncio.sleep(2)
-        try:
-            raw = await asyncio.to_thread(rcon_raw, "get5_status")
-        except Exception as exc:  # во время смены карты RCON может быть недоступен
-            info = type(exc).__name__
-            continue
-        st = re.search(r'"gamestate"\s*:\s*"(\w+)"', raw)
-        mi = re.search(r'"matchid"\s*:\s*"?(\w+)"?', raw)
-        if not st and not mi:
-            return True, "get5_status не распознан"
-        if mi and mi.group(1) == str(match_id) and st and st.group(1) != "none":
-            return True, ""
-        info = f"gamestate={st.group(1) if st else '?'}, matchid={mi.group(1) if mi else '?'}"
-    return False, info
-
-
-async def verify_load(match_id: int, load_resp: str):
-    """Через 8 сек спрашивает у сервера, загрузился ли матч. Если нет, пишет причину в чат матча."""
-    await asyncio.sleep(8)
-    if S.phase != "playing" or S.match_id != match_id:
-        return
-    try:
-        raw = await asyncio.to_thread(rcon_raw, "get5_status")
-    except Exception as exc:
-        raw = f"{type(exc).__name__}: {exc}"
-    st = re.search(r'"gamestate"\s*:\s*"(\w+)"', raw)
-    mi = re.search(r'"matchid"\s*:\s*"?(\w+)"?', raw)
-    state, loaded = (st.group(1) if st else None), (mi.group(1) if mi else None)
-    log.info("Проверка загрузки матча %s: gamestate=%s, matchid на сервере=%s", match_id, state, loaded)
-    if state not in (None, "none") and loaded == str(match_id):
-        return
-    ch = match_chat()
-    if ch:
-        try:
-            await ch.send(f"⚠ Сервер не загрузил матч #{match_id} (gamestate: `{state}`, matchid на сервере: `{loaded}`).\n"
-                          f"Ответ на loadmatch: `{(load_resp or '—').strip()[:200]}`\n"
-                          "Проверьте, что карта есть на сервере, и откройте ссылку матча в браузере: "
-                          f"{WEB_BASE_URL}/match/{match_id}.json")
-        except discord.HTTPException:
-            pass
-
-
-STARTED_STATES = {"knife", "waiting_for_knife_decision", "going_live", "live", "pending_restore"}
-
-
-def match_chat():
-    return S.match_channel or (S.panel.channel if S.panel else None)
-
-
-async def force_start(match_id: int, reason: str) -> bool:
-    """Принудительно стартует матч (без .ready). True = матч стартовал (или уже идёт)."""
-    if S.phase != "playing" or S.match_id != match_id or S.live or S.auto_started:
-        return True
-    S.auto_started = True
-    ch = match_chat()
-    if ch:
-        try:
-            await ch.send(f"✅ {reason}. Матч стартует, писать .ready не нужно.", delete_after=60)
-        except discord.HTTPException:
-            pass
-    resp = resp2 = ""
-    state = None
-    failed = False
-    try:
-        state0 = await asyncio.to_thread(rcon_gamestate)
-        if state0 in STARTED_STATES:  # матч уже идёт
-            S.ever_live = True
-            return True
-        resp = await asyncio.to_thread(rcon_force_start)
-        await asyncio.sleep(6)
-        state = await asyncio.to_thread(rcon_gamestate)
-        if state is not None and state not in STARTED_STATES:  # css_start не помог: пробуем forceready
-            resp2 = await asyncio.to_thread(rcon_force_ready)
-            await asyncio.sleep(6)
-            state = await asyncio.to_thread(rcon_gamestate)
-        log.info("Автостарт матча %s: состояние %s, css_start=%r, css_forceready=%r",
-                 match_id, state, resp[:200], resp2[:200])
-    except Exception as exc:
-        failed = True
-        resp = f"{type(exc).__name__}: {exc}"
-        log.exception("Не удалось автоматически стартовать матч")
-    if not failed and (state in STARTED_STATES or state is None):
-        if state in STARTED_STATES:
-            S.ever_live = True
-        return True
-    S.auto_started = False
-    if ch:
-        try:
-            await ch.send(f"⚠ Автостарт не сработал. Состояние матча на сервере: `{state}`.\n"
-                          f"Ответ css_start: `{resp[:150] or '—'}`\nОтвет css_forceready: `{resp2[:150] or '—'}`\n"
-                          "Админ может нажать /fp_start или проверить сервер командой /fp_diag.",
-                          delete_after=180)
-        except discord.HTTPException:
-            pass
-    return False
-
-
-async def track_connect(data: dict):
-    """Игрок зашёл на сервер: если на сервере уже все игроки матча, запускаем автостарт."""
-    player = data.get("player") or {}
-    sid = str(player.get("steamid", ""))
-    if player.get("is_bot") or sid not in S.match_players:
-        return
-    S.connected.add(sid)
-    log.info("На сервере %s из %s игроков матча", len(S.connected), len(S.match_players))
-    if AUTO_START and not S.auto_started and not S.live and len(S.connected) >= len(S.match_players):
-        mid = S.match_id
-        await asyncio.sleep(AUTO_START_DELAY)  # даём всем догрузиться
-        if S.match_id == mid and len(S.connected) >= len(S.match_players):
-            await force_start(mid, "Все игроки на сервере")
-
-
-async def warmup_timer(match_id: int):
-    """Каждые 3 сек спрашивает у сервера (RCON status), кто на нём сидит, и не зависит от событий MatchZy.
-    Все игроки на сервере -> старт через AUTO_START_DELAY. Иначе через WARMUP_SECONDS после первого входа."""
-    t0 = None          # когда зашёл первый игрок
-    full_since = None  # когда на сервере стали все
-    tries = 0
-    reported = set()
-    said = set()
-    first = True
-    warned_events = False
-    while S.phase == "playing" and S.match_id == match_id and not S.live and not S.auto_started:
-        await asyncio.sleep(3)
-        try:
-            present, humans = await asyncio.to_thread(rcon_players)
-        except Exception as exc:
-            msg = f"{type(exc).__name__}: {exc}"
-            log.warning("RCON status не удался: %s", msg)
-            if msg not in reported:  # сообщаем в чат матча один раз для каждой ошибки
-                reported.add(msg)
-                ch = match_chat()
-                if ch:
-                    try:
-                        await ch.send(f"⚠ Бот не может связаться с CS2-сервером по RCON (`{msg}`). "
-                                      "Проверьте RCON_PASSWORD, SERVER_IP и SERVER_PORT в Render.",
-                                      delete_after=300)
-                    except discord.HTTPException:
-                        pass
-            continue
-        S.connected = {sid for sid in S.match_players if sid in present}
-        if first:
-            first = False
-            log.info("RCON status: людей на сервере %s (SteamID в status: %s)", humans, len(present))
-        need = len(S.match_players)
-        n_here = max(len(S.connected), humans)  # сколько людей на сервере
-        if n_here and t0 is None:
-            t0 = time.time()
-        if t0 and not warned_events and time.time() - t0 >= 30 and match_id not in events_seen:
-            warned_events = True
-            wch = match_chat()
-            if wch:
-                try:
-                    await wch.send("⚠ От сервера не приходят события MatchZy: результат и демо автоматически не появятся. "
-                                   "Админу: проверьте /fp_diag (matchzy_remote_log_url) и что "
-                                   f"{WEB_BASE_URL}/events доступен с CS2-сервера.", delete_after=300)
-                except discord.HTTPException:
-                    pass
-        reason = None
-        if AUTO_START and need and n_here >= need:
-            if full_since is None:
-                full_since = time.time()
-                log.info("Все %s игроков на сервере, старт через %s сек", need, AUTO_START_DELAY)
-                try:  # сообщение прямо в игру
-                    await asyncio.to_thread(rcon_raw, f"say Все игроки на сервере. Матч начнётся через {AUTO_START_DELAY} сек")
-                except Exception:
-                    pass
-            elif time.time() - full_since >= AUTO_START_DELAY:
-                reason = "Все игроки на сервере"
-            if full_since is not None:  # обратный отсчёт в чат игры
-                left = AUTO_START_DELAY - (time.time() - full_since)
-                for mark in (10, 5):
-                    if left <= mark and mark not in said:
-                        said.add(mark)
-                        try:
-                            await asyncio.to_thread(rcon_raw, f"say Матч начнётся через {mark} сек")
-                        except Exception:
-                            pass
-        else:
-            full_since = None
-            said.clear()
-        if not reason and t0 and time.time() - t0 >= WARMUP_SECONDS:
-            reason = "Разминка закончилась"
-        if reason:
-            if await force_start(match_id, reason):
-                return
-            tries += 1
-            if tries >= 3:
-                return
-            full_since = None
-            await asyncio.sleep(20)
-
-
 async def break_timer():
     await asyncio.sleep(BREAK_SECONDS)
     if S.paused:
@@ -1249,7 +813,6 @@ async def resume_match(reason: str):
     """Снимает паузу и закрывает чат перерыва."""
     if not S.paused:
         return
-    leavers = [m for m, _ in S.match_players.values() if m.id in S.absent]  # кто так и не вернулся
     S.paused = False
     S.absent.clear()
     if S.break_task and S.break_task is not asyncio.current_task():
@@ -1266,8 +829,6 @@ async def resume_match(reason: str):
         except discord.HTTPException:
             pass
     asyncio.create_task(close_break(delay=30))
-    for m in leavers:  # авто-бан за выход из матча
-        await auto_ban(m, "leave", LEAVE_REASON)
 
 
 async def close_break(delay: int = 0):
@@ -1322,28 +883,23 @@ async def clear_chat():
 
 
 async def reset_to_queue():
-    # если сервер не прислал результат (ручной сброс, таймер), пишем итог, но только если матч реально стартовал
-    if S.match_id and S.phase == "playing" and S.match_id not in posted_results and S.ever_live:
-        await post_fallback_result(S.match_id, dict(S.match_players))
+    # если сервер не прислал результат (ручной сброс, таймер), всё равно пишем итог в канал результатов
+    if S.match_id and S.phase == "playing" and S.match_id not in posted_results:
+        await post_result({}, dict(S.match_players), S.match_id, note="manual")
     await clear_voice_access()
     await clear_chat()
     await close_match_chat()
     await close_break()
     S.live = False
-    S.ever_live = False
     S.paused = False
     S.absent.clear()
     S.match_players = {}
     S.captain_ids = set()
-    S.connected = set()
-    S.auto_started = False
-    S.moving = False
     async with S.lock:
         S.phase = "queue"
         S.queue.clear()
         S.match_id = None
         S.active_ids.clear()
-        S.draft_task = None
     await sync_queue()
     await refresh_panel()
 
@@ -1378,33 +934,6 @@ async def sync_queue():
         asyncio.create_task(run_match(origin, players))
 
 
-async def check_draft_empty():
-    """Во время драфта: если все игроки вышли из войса очереди, драфт отменяется и очередь сбрасывается."""
-    if S.draft_check or S.moving:
-        return
-    S.draft_check = True
-    try:
-        await asyncio.sleep(5)  # даём шанс переподключиться
-        if S.phase != "draft" or not QUEUE_VC or S.moving:
-            return
-        ch = bot.get_channel(QUEUE_VC)
-        if not ch or any(m.id in S.active_ids for m in ch.members):
-            return
-        log.warning("Все игроки вышли из войса очереди во время драфта: сброс")
-        task = S.draft_task
-        if task and not task.done() and task is not asyncio.current_task():
-            task.cancel()
-        if S.panel:
-            try:
-                await S.panel.channel.send("⚠ Все игроки вышли из войса, драфт отменён. Очередь сброшена.",
-                                           delete_after=30)
-            except discord.HTTPException:
-                pass
-        await reset_to_queue()
-    finally:
-        S.draft_check = False
-
-
 async def watch_match(match_id: int):
     """Страховка: если событие series_end не дошло до бота, узнаём у сервера, что матч закончился."""
     await asyncio.sleep(90)
@@ -1420,8 +949,6 @@ async def watch_match(match_id: int):
         if state in active:
             seen_active = True
             ended = 0
-            if state in STARTED_STATES:
-                S.ever_live = True  # матч реально идёт, даже если события MatchZy не доходят до бота
         elif state == "post_game" or (state == "none" and seen_active):
             ended += 1
         else:
@@ -1442,67 +969,52 @@ async def auto_reset(match_id: int):
 
 
 async def draft(channel, players):
-    no = next_match_no()
     caps = await choose_captains(channel, players)  # капитаны вызываются сами
     pool = [m for m in players if m not in caps]
     teams = [[caps[0]], [caps[1]]]
 
-    # ---- пики игроков: одно сообщение, которое обновляется после каждого выбора ----
+    # ---- пики игроков (по очереди) ----
     turn = 0
-    msg = None
-    last = ""
     while len(pool) > 1:
         cap = caps[turn]
         view = PickView(cap, pool)
-        emb = draft_embed(no, teams, pool, cap, last=last)
-        if msg is None:
-            msg = await track_send(channel, embed=emb, view=view)
-        else:
-            await msg.edit(embed=emb, view=view)
+        msg = await track_send(channel, f"{cap.mention}, выберите игрока ({PICK_TIMEOUT} сек)", view=view)
         await view.wait()
-        picked = view.picked or random.choice(pool)  # не успел: случайный игрок
+        picked = view.picked or random.choice(pool)
         pool.remove(picked)
         teams[turn].append(picked)
-        last = f"{cap.display_name} выбрал {picked.display_name}"
+        await msg.edit(content=f"{cap.mention} выбрал {picked.mention}", view=None)
         turn ^= 1
     teams[turn].append(pool[0])  # последний игрок достаётся автоматически
-    await msg.edit(embed=draft_embed(no, teams, [], done=True, last=last), view=None)
 
-    # ---- вето карт: одно сообщение в стиле очереди, обновляется после каждого бана ----
+    # ---- вето карт ----
     maps = MAPS.copy()
-    banned_list = []
     turn = 0
-    vmsg = None
-    last = ""
     while len(maps) > 1:
         cap = caps[turn]
         view = VetoView(cap, maps)
-        emb = veto_embed(no, maps, banned_list, cap, last=last)
-        if vmsg is None:
-            vmsg = await track_send(channel, embed=emb, view=view)
-        else:
-            await vmsg.edit(embed=emb, view=view)
+        left = ", ".join(pretty(m) for m in maps)
+        msg = await track_send(
+            channel,
+            f"🗺 {cap.mention}, забаньте карту ({PICK_TIMEOUT} сек)\nОсталось: {left}",
+            view=view)
         await view.wait()
         banned = view.banned or random.choice(maps)
         maps.remove(banned)
-        banned_list.append((banned, cap))
-        last = f"{cap.display_name} забанил карту {pretty(banned)}"
+        await msg.edit(content=f"❌ {cap.mention} забанил **{pretty(banned)}**", view=None)
         turn ^= 1
     map_name = maps[0]
-    await vmsg.edit(embed=veto_embed(no, maps, banned_list, final=map_name, last=last), view=None)
+    await track_send(channel, f"✅ Выбрана карта: **{pretty(map_name)}**")
     return teams, map_name
 
 
 async def run_match(channel: discord.abc.Messageable, players: list[discord.Member]):
     origin = channel  # общий канал очереди: туда пишем ошибки
-    S.draft_task = asyncio.current_task()  # чтобы драфт можно было отменить, если все вышли из войса
     try:
         S.active_ids = {m.id for m in players}
-        if not TEST_MODE and not await ready_check(channel, players):
-            return  # не все нажали «Готов»: очередь уже сброшена внутри ready_check
         chat = await open_match_chat(channel, players)
         if chat:
-            channel = chat  # драфт, вето и карточка матча идут в отдельном чате
+            channel = chat  # драфт, вето и карточка матча идут в отдельный чат
         else:
             # чат создать не удалось: сообщаем о наборе в общем канале и в ЛС
             await track_send(channel, f"🎯 Набрано {NEED} игроков! " +
@@ -1514,66 +1026,44 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
         else:
             teams, map_name = await draft(channel, players)
 
-        # ---- войсы команд: сразу после деления на две команды (в названиях ники капитанов) ----
-        S.moving = True
-        if hasattr(channel, "guild") and channel.guild:
-            await move_to_voice(channel.guild, teams)
-
         # ---- запуск на сервере ----
         match_id = int(time.time())
         S.matches[match_id] = build_match(match_id, teams, map_name)
         S.match_players = {get_steam(m.id): (m, n) for n, t in enumerate(teams, 1) for m in t}
         S.captain_ids = {t[0].id for t in teams if t}
-        snapshots[match_id] = dict(S.match_players)
         S.live = False
-        S.ever_live = False
         S.match_id = match_id
-        S.connected = set()
-        S.auto_started = False
-        load_resp = await asyncio.to_thread(load_on_server, match_id)
-        log.info("Ответ сервера на loadmatch: %r", (load_resp or "")[:300])
-
-        # честная проверка: если сервер матч не принял, не говорим «Матч готов»
-        loaded, info = await wait_loaded(match_id)
-        if not loaded:
-            raise RuntimeError(f"сервер не загрузил матч ({info}). Ответ: {(load_resp or '—').strip()[:150]}")
-        try:  # события и демо: ставим заново после загрузки матча
-            cur = await asyncio.to_thread(set_event_cvars)
-            log.info("matchzy_remote_log_url после загрузки матча: %r", cur.strip()[:200])
-        except Exception:
-            log.exception("Не удалось повторно задать адрес событий MatchZy")
+        await asyncio.to_thread(load_on_server, match_id)
 
         S.phase = "playing"
-        S.moving = False
         S.queue.clear()
         await refresh_panel()
         asyncio.create_task(auto_reset(match_id))
         asyncio.create_task(watch_match(match_id))
-        asyncio.create_task(warmup_timer(match_id))
-        asyncio.create_task(verify_load(match_id, load_resp))
 
         connect = f"connect {SERVER_IP}:{SERVER_PORT}"
         if SERVER_PASSWORD:
             connect += f"; password {SERVER_PASSWORD}"
-        e = discord.Embed(title=f"Матч #{match_id} готов — {pretty(map_name)}", color=0x2B2D31)
+        e = discord.Embed(title=f"Матч #{match_id} готов — {pretty(map_name)}", color=0x57F287)
         for n, t in enumerate(teams, 1):
             e.add_field(name=f"Team {n}" + (f" ({t[0].display_name})" if t else ""),
                         value="\n".join(m.mention for m in t) or "—")
         e.add_field(name="Важно",
                     value="Заходите с **привязанного Steam-аккаунта**: команда выдаётся автоматически по SteamID. "
-                          "Матч стартует сам, когда все зайдут на сервер. Подробности пришли в личные сообщения.",
+                          "Подробности пришли вам в личные сообщения.",
                     inline=False)
         e.add_field(name="Подключение (консоль CS2)", value=f"```{connect}```", inline=False)
         link_view = MatchView()
         await track_send(channel, embed=e, view=link_view)
         asyncio.create_task(notify_players(teams, map_name, match_id))
 
+        # ---- доступ в войсы Team 1 / Team 2 и перемещение ----
+        if hasattr(channel, "guild") and channel.guild:
+            await move_to_voice(channel.guild, teams)
+
     except Exception as exc:  # любая ошибка: возвращаем систему в очередь
         log.exception("Ошибка при запуске матча")
-        try:
-            await origin.send(f"❌ Не удалось запустить матч: `{exc}`\nОчередь сброшена, зайдите в войс очереди заново.")
-        except discord.HTTPException:
-            pass
+        await origin.send(f"❌ Не удалось запустить матч: `{exc}`\nОчередь сброшена, нажмите «Играть» заново.")
         await reset_to_queue()
 
 
@@ -1697,14 +1187,10 @@ def render_result_card(map_name: str, s1, s2, team_rows: dict, mvp: dict,
             cy = y + 34
             d.ellipse((x0 + 22, cy - 8, x0 + 38, cy + 8), fill=col)
             d.text((x0 + 52, cy), fit(r["name"], f_name, 205), font=f_name, fill=white, anchor="lm")
-            if mvp is None:  # статистики нет: прочерки
-                for dx in (150, 85, 20):
-                    d.text((x0 + PW - dx, cy), "–", font=f_stat, fill=gray, anchor="rm")
-            else:
-                kd = r["k"] / r["d"] if r["d"] else float(r["k"])
-                d.text((x0 + PW - 150, cy), f"{r['k']}-{r['d']}", font=f_stat, fill=gray, anchor="rm")
-                d.text((x0 + PW - 85, cy), f"{kd:.2f}", font=f_stat, fill=gray, anchor="rm")
-                d.text((x0 + PW - 20, cy), f"{r['hs']}%", font=f_stat, fill=gray, anchor="rm")
+            kd = r["k"] / r["d"] if r["d"] else float(r["k"])
+            d.text((x0 + PW - 150, cy), f"{r['k']}-{r['d']}", font=f_stat, fill=gray, anchor="rm")
+            d.text((x0 + PW - 85, cy), f"{kd:.2f}", font=f_stat, fill=gray, anchor="rm")
+            d.text((x0 + PW - 20, cy), f"{r['hs']}%", font=f_stat, fill=gray, anchor="rm")
             d.line((x0 + 18, y + 71, x0 + PW - 18, y + 71), fill=(60, 70, 96), width=1)
             y += 76
 
@@ -1722,18 +1208,18 @@ def render_result_card(map_name: str, s1, s2, team_rows: dict, mvp: dict,
             av = None
     if av is None:
         av = Image.new("RGBA", (2 * R, 2 * R), (40, 48, 72, 255))
-        ImageDraw.Draw(av).text((R, R), ((mvp["name"][:1] if mvp else "") or "?").upper(), font=get_font(70), fill=white, anchor="mm")
+        ImageDraw.Draw(av).text((R, R), (mvp["name"][:1] or "?").upper(), font=get_font(70), fill=white, anchor="mm")
     mask = Image.new("L", (2 * R, 2 * R), 0)
     ImageDraw.Draw(mask).ellipse((0, 0, 2 * R - 1, 2 * R - 1), fill=255)
     ring.paste(av, (6, 6), mask)
     img.alpha_composite(ring, (cx - R - 6, 62))
     d = ImageDraw.Draw(img)
-    d.text((cx, 258), "MVP" if mvp else "ИТОГ", font=get_font(50), fill=GOLD, anchor="mm")
-    d.text((cx, 304), fit(mvp["name"] if mvp else "Матч завершён", get_font(24), 250), font=get_font(24), fill=white, anchor="mm")
+    d.text((cx, 258), "MVP", font=get_font(50), fill=GOLD, anchor="mm")
+    d.text((cx, 304), fit(mvp["name"], get_font(24), 250), font=get_font(24), fill=white, anchor="mm")
     f_score = get_font(72)
-    d.text((cx - 78, 380), str(s1) if s1 is not None else "–", font=f_score, fill=BLUE, anchor="mm")
+    d.text((cx - 78, 380), str(s1), font=f_score, fill=BLUE, anchor="mm")
     d.text((cx, 380), "–", font=get_font(40), fill=gray, anchor="mm")
-    d.text((cx + 78, 380), str(s2) if s2 is not None else "–", font=f_score, fill=ORANGE, anchor="mm")
+    d.text((cx + 78, 380), str(s2), font=f_score, fill=ORANGE, anchor="mm")
     d.text((cx, 462), f"КАРТА: {map_name.replace('de_', '').upper()}", font=get_font(24), fill=gray, anchor="mm")
 
     out = io.BytesIO()
@@ -1763,24 +1249,25 @@ demo_urls: dict[int, str] = {}                 # match_id -> ссылка на �
 result_msgs: dict[int, discord.Message] = {}   # match_id -> сообщение с результатом (чтобы добавить кнопку демо позже)
 
 
-def demo_view(mid: int) -> discord.ui.View:
-    """Кнопка всегда есть в результате: ссылка ведёт на /demo/<id>, а там уже отдаётся файл (или «ещё грузится»)."""
+def demo_view(url: str) -> discord.ui.View:
     v = discord.ui.View()
-    v.add_item(discord.ui.Button(label="Скачать демку", emoji="⬇️", url=f"{WEB_BASE_URL}/demo/{mid}"))
+    v.add_item(discord.ui.Button(label="Скачать демо", emoji="⬇️", url=url))
     return v
 
 
 def apply_elo(players: dict, win_n: int) -> dict:
-    """Победителям +ELO_WIN (30), проигравшим -ELO_LOSS (20). Возвращает {discord_id: (было, стало)}."""
+    """Пересчитывает ELO по среднему рейтингу команд. Возвращает {discord_id: (было, стало)}."""
     teams = {1: [], 2: []}
     for m, n in players.values():
         teams[n].append(m.id)
-    if not teams[1] and not teams[2]:
+    if not teams[1] or not teams[2]:
         return {}
+    avg = {n: sum(get_elo(i) for i in ids) / len(ids) for n, ids in teams.items()}
     changes = {}
     for n, ids in teams.items():
+        expected = 1 / (1 + 10 ** ((avg[3 - n] - avg[n]) / 400))
         won = 1 if n == win_n else 0
-        delta = ELO_WIN if won else -ELO_LOSS
+        delta = round(ELO_K * (won - expected))
         for i in ids:
             old = get_elo(i)
             new = max(ELO_MIN, old + delta)
@@ -1795,9 +1282,9 @@ def apply_elo(players: dict, win_n: int) -> dict:
 
 
 async def post_result(data: dict, players: dict, match_id, note: str = ""):
-    """Публикует итог матча в канал результатов: карточка-табло + MVP + статистика и ELO каждого игрока + демо.
+    """Публикует итог матча в канал результатов: карточка-табло + MVP + ELO + демо.
     Без статистики сервера пишет простой список составов (с текущим ELO игроков).
-    note: непустая строка = победитель неизвестен (ELO не меняется)."""
+    note: непустая строка = матч завершён вручную/по таймеру (ELO не меняется, на экран ничего не выводится)."""
     try:
         mid = int(match_id)
     except (TypeError, ValueError):
@@ -1817,7 +1304,7 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
     raw_map = (cfg.get("maplist") or ["?"])[0]
     total_rounds = (s1 or 0) + (s2 or 0)
 
-    # ELO меняем только если известен победитель
+    # ELO меняем только если известен победитель (при ручном завершении рейтинг не трогаем)
     changes = {}
     if win in ("team1", "team2") and not note:
         changes = apply_elo(players, 1 if win == "team1" else 2)
@@ -1854,54 +1341,28 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
                 pass
         try:
             card = await asyncio.to_thread(render_result_card, raw_map, s1 or 0, s2 or 0,
-                                           team_rows, mvp, avatar, ("TEAM A", "TEAM B"))
+                                           team_rows, mvp, avatar, ("TEAM 1", "TEAM 2"))
         except Exception:
             log.exception("Не удалось нарисовать карточку (установлен ли Pillow?)")
 
-    if not all_rows:  # статистики нет (матч завершён вручную): всё равно рисуем табло, но только с составами
-        fb = {n: [{"name": m.display_name, "member": m, "k": 0, "d": 0, "a": 0, "adr": 0, "hs": 0}
-                  for m, tn in players.values() if tn == n] for n in (1, 2)}
-        if fb[1] or fb[2]:
-            try:
-                card = await asyncio.to_thread(render_result_card, raw_map, s1, s2, fb, None, None,
-                                               ("TEAM A", "TEAM B"))
-            except Exception:
-                log.exception("Не удалось нарисовать карточку (установлен ли Pillow?)")
-
-    if card:
+    if card and mvp:
         names = [(cfg.get(f"team{n}") or {}).get("name", f"Team {n}") for n in (1, 2)]
         lines = []
         if win in ("team1", "team2"):
             wn = 1 if win == "team1" else 2
             ws, ls = (s1, s2) if wn == 1 else (s2, s1)
-            lines.append(f"**Победитель:** 🏆 {names[wn - 1]} (Счёт: {ws} - {ls})")
+            lines.append(f"**Победитель:** 🏆 {names[wn - 1]} (Счёт: {ws}-{ls})")
         elif s1 is not None and s2 is not None:
-            lines.append(f"**Матч завершён** (Счёт: {s1} - {s2})")
-        if not lines:
-            lines.append("**Матч завершён**")
-        if mvp:
-            lines.append("")
-            lines.append(f"🏅 **MVP — {mvp['name']}** · {mvp['k']}/{mvp['d']}/{mvp['a']} · "
-                         f"{mvp['adr']} ADR · {mvp['hs']}% HS")
+            lines.append(f"**Матч завершён** (Счёт: {s1}-{s2})")
+        lines.append("")
+        lines.append(f"🏅 **MVP — {mvp['name']}** · {mvp['k']}/{mvp['d']}/{mvp['a']} · "
+                     f"{mvp['adr']} ADR · {mvp['hs']}% HS")
         e = discord.Embed(title=f"Match #{mid} — РЕЗУЛЬТАТЫ", description="\n".join(lines), color=0xF1C40F)
         e.set_image(url="attachment://result.png")
-        # статистика и ELO каждого игрока по командам
-        for n in (1, 2):
-            lines_t = []
-            for r in team_rows[n]:
-                tag = ""
-                if r["member"] and r["member"].id in changes:
-                    old, new = changes[r["member"].id]
-                    tag = f" · **{new}** ({new - old:+d} ELO)"
-                who = r["member"].mention if r["member"] else r["name"]
-                lines_t.append(f"{who} `{r['k']}/{r['d']}/{r['a']}` · ADR {r['adr']} · HS {r['hs']}%{tag}")
-            if not lines_t:  # статистики нет: показываем состав и ELO
-                lines_t = [m.mention + (f" · **{changes[m.id][1]}** ({changes[m.id][1] - changes[m.id][0]:+d} ELO)"
-                                        if m.id in changes else "")
-                           for m, tn in players.values() if tn == n]
-            tsc = (t1, t2)[n - 1].get("score")
-            e.add_field(name=f"Team {n}" + (f" — {tsc}" if tsc is not None else ""),
-                        value="\n".join(lines_t)[:1024] or "—", inline=False)
+        if changes:
+            elo_lines = [f"{m.mention}: {changes[m.id][1]} ({changes[m.id][1] - changes[m.id][0]:+d})"
+                         for m, n in sorted(players.values(), key=lambda x: x[1]) if m.id in changes]
+            e.add_field(name="📈 ELO", value="\n".join(elo_lines)[:1024], inline=False)
         e.set_footer(text=f"Карта: {raw_map} · Сыграно раундов: {total_rounds}")
         kwargs = {"embed": e, "file": discord.File(io.BytesIO(card), filename="result.png")}
     else:
@@ -1910,7 +1371,7 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
             if did in changes:
                 old, new = changes[did]
                 return f" · ELO {new} ({new - old:+d})"
-            return f" · ELO {get_elo(did)}"  # изменения нет: показываем текущий рейтинг
+            return f" · ELO {get_elo(did)}"  # изменения нет (матч завершён вручную): показываем текущий рейтинг
 
         lines = []
         if s1 is not None and s2 is not None:
@@ -1931,7 +1392,8 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
             e.add_field(name=title, value="\n".join(r[1] for r in rows) or "—", inline=False)
         kwargs = {"embed": e}
     try:
-        kwargs["view"] = demo_view(mid)  # кнопка демо сразу, файл подтянется, когда сервер его загрузит
+        if mid in demo_urls:  # демо уже успело прийти
+            kwargs["view"] = demo_view(demo_urls[mid])
         msg = await ch.send(**kwargs)
         result_msgs[mid] = msg
         log.info("Результат матча %s опубликован в #%s", mid, ch.name)
@@ -1940,25 +1402,10 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
         log.exception("Не удалось отправить результат (права бота: Send Messages, Embed Links, Attach Files)")
 
 
-async def post_fallback_result(mid: int, players: dict):
-    """map_result не пришёл: берём статистику из последнего round_end.
-    Победителем считается тот, кто ведёт по счёту: ELO начисляется (+30 / -20). При ничьей ELO не меняется."""
-    data = last_round.get(mid) or {}
-    note = "manual"
-    if data:
-        s1 = (data.get("team1") or {}).get("score") or 0
-        s2 = (data.get("team2") or {}).get("score") or 0
-        if s1 != s2:  # побеждает тот, кто ведёт по счёту (ничья: ELO не меняется)
-            data = dict(data)
-            data["winner"] = {"team": "team1" if s1 > s2 else "team2"}
-            note = ""
-    await post_result(data, players, mid, note=note)
-
-
 # ----------------------------- БАНЫ (лог в Discord + сайт) -----------
 import html as _html
 
-BAN_LOG_CHANNEL = int(os.getenv("BAN_LOG_CHANNEL_ID", "1566199370024620233"))  # 0 = канал, в названии которого есть "баны"
+BAN_LOG_CHANNEL = int(os.getenv("BAN_LOG_CHANNEL_ID", "0"))  # 0 = канал, в названии которого есть "баны"
 
 _UNITS = {"m": 60, "min": 60, "м": 60, "мин": 60, "минут": 60,
           "h": 3600, "ч": 3600, "час": 3600, "часа": 3600, "часов": 3600,
@@ -2102,43 +1549,6 @@ async def do_unban(did: int, reason: str, by: str | None = None) -> bool:
     return True
 
 
-# ---- АВТО-БАН: не нажал «Готов» / вышел из матча. Срок растёт при повторах (за последние 30 дней).
-AUTOBAN = os.getenv("AUTOBAN", "0") == "1"   # 0 = выключить авто-бан
-AUTOBAN_LADDERS = {
-    "ready": os.getenv("AUTOBAN_READY_LADDER", "10m,30m,2h,1d"),
-    "leave": os.getenv("AUTOBAN_LEAVE_LADDER", "30m,2h,1d,3d,7d"),
-}
-AUTOBAN_WINDOW = 30 * 86400
-READY_REASON = "не нажал «Готов» при подборе матча"
-LEAVE_REASON = "вышел из матча и не вернулся"
-
-
-async def auto_ban(member, kind: str, reason: str):
-    """Автоматический бан от имени «Авто-бан». Администраторов не банит."""
-    from types import SimpleNamespace
-    if not AUTOBAN or not isinstance(member, discord.Member) or member.bot:
-        return
-    if member.guild_permissions.administrator or is_banned(member.id):
-        return
-    steps = [x for x in (parse_duration(v) for v in AUTOBAN_LADDERS[kind].split(",")) if x is not None] or [1800]
-    full = f"Авто-бан: {reason}"
-    n = db.execute("SELECT COUNT(*) FROM ban_log WHERE discord_id=? AND admin_id=0 AND reason=? AND created>?",
-                   (member.id, full, int(time.time()) - AUTOBAN_WINDOW)).fetchone()[0]
-    dur = steps[min(n, len(steps) - 1)]
-    try:
-        await do_ban(member, full, dur, SimpleNamespace(id=0, display_name="Авто-бан"))
-    except Exception:
-        log.exception("Не удалось выдать авто-бан %s", member)
-        return
-    log.info("Авто-бан %s: %s (%s)", member, reason, "навсегда" if not dur else fmt_dur(dur))
-    try:
-        await member.send(f"⛔ Вы получили авто-бан в FreePick ({'навсегда' if not dur else fmt_dur(dur)}): {reason}. "
-                          "При повторных нарушениях срок будет больше.")
-    except discord.HTTPException:
-        pass
-    return dur
-
-
 _ban_loop_started = False
 
 
@@ -2155,143 +1565,80 @@ async def ban_expiry_loop():
         await asyncio.sleep(60)
 
 
-# ---- страница со списком банов (/bans, /punishment): в стиле сайта vibeproject.kz
+# ---- страница со списком банов (/bans)
 BANS_PAGE = """<!doctype html><html lang="ru"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Наказания | VIBE MIX FreePick</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Список наказаний — VIBE MIX FreePick</title>
 <style>
-:root{color-scheme:dark;--bg:#090613;--card:rgba(18,14,34,.88);--line:rgba(255,255,255,.07);--mut:#9a97b0;--pur:#7c1fff}
-*{box-sizing:border-box}
+:root{color-scheme:dark}*{box-sizing:border-box}
 body{margin:0;min-height:100vh;font-family:Inter,system-ui,"Segoe UI",Roboto,Arial,sans-serif;color:#e8e6f2;
 background:radial-gradient(1100px 600px at 15% -10%,#2b1252 0%,transparent 60%),
-radial-gradient(900px 600px at 95% 5%,#14244f 0%,transparent 55%),var(--bg)}
-.top{max-width:1280px;margin:0 auto;padding:18px 20px 0;display:flex;align-items:center;gap:14px}
-.logo{font-weight:800;letter-spacing:.5px;font-size:18px}.logo span{color:#a66bff}
-.nav{margin-left:auto;font-size:13px;color:var(--mut)}
-.wrap{max-width:1280px;margin:0 auto;padding:20px;display:grid;grid-template-columns:320px 1fr;gap:20px;align-items:start}
+radial-gradient(900px 600px at 95% 5%,#14244f 0%,transparent 55%),#090613}
+.wrap{max-width:1280px;margin:0 auto;padding:32px 20px;display:grid;grid-template-columns:320px 1fr;gap:20px;align-items:start}
 @media(max-width:900px){.wrap{grid-template-columns:1fr}}
-.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:20px}
-h2{margin:0 0 14px;font-size:18px}h3{margin:20px 0 10px;font-size:13px;color:var(--mut);font-weight:500}
-.tabs{display:flex;background:rgba(255,255,255,.05);border-radius:10px;padding:4px;gap:4px;flex-wrap:wrap}
-.tabs button{flex:1;min-width:70px;border:0;border-radius:8px;padding:9px 8px;background:transparent;color:#c9c6dd;
-font-size:13px;font-weight:600;cursor:pointer}
-.tabs button.on{background:var(--pur);color:#fff}
+.card{background:rgba(18,14,34,.86);border:1px solid rgba(255,255,255,.07);border-radius:16px;padding:20px}
+h2{margin:0 0 14px;font-size:18px}h3{margin:18px 0 10px;font-size:13px;color:#9a97b0;font-weight:500}
+.tag{display:inline-block;background:#5b21d6;color:#fff;border-radius:8px;padding:8px 18px;font-weight:600;font-size:14px;margin-right:6px}
 input{width:100%;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);border-radius:10px;
 color:#e8e6f2;padding:11px 12px;font-size:14px;outline:none}input:focus{border-color:#7c3aed}
 .stat{display:flex;justify-content:space-between;padding:11px 12px;border-radius:8px;background:rgba(255,255,255,.04);margin-bottom:8px;font-size:14px}
 .stat b{color:#fff}
 .tw{overflow-x:auto}
-table{width:100%;border-collapse:separate;border-spacing:0 6px;min-width:680px}
-th{text-align:left;font-size:12px;color:var(--mut);padding:6px 12px;font-weight:500}
+table{width:100%;border-collapse:separate;border-spacing:0 6px;min-width:640px}
+th{text-align:left;font-size:12px;color:#9a97b0;padding:6px 12px;font-weight:500}
 td{background:rgba(255,255,255,.035);padding:10px 12px;font-size:14px}
-tr.r{cursor:pointer}tr.r:hover td{background:rgba(124,31,255,.12)}
 td:first-child{border-radius:10px 0 0 10px;width:44px;text-align:center}td:last-child{border-radius:0 10px 10px 0}
 .pl{display:flex;align-items:center;gap:10px}
-.pl img,.av{width:30px;height:30px;border-radius:8px;object-fit:cover;background:#2a2640;flex:none}
-.b{padding:3px 10px;border-radius:6px;font-size:12px;font-weight:600;white-space:nowrap;display:inline-block}
+.pl img{width:30px;height:30px;border-radius:8px;object-fit:cover;background:#2a2640}
+.b{padding:3px 10px;border-radius:6px;font-size:12px;font-weight:600;white-space:nowrap}
 .perm{background:rgba(237,66,69,.16);color:#ff5a5f}
 .done{background:rgba(87,242,135,.12);color:#57f287;text-decoration:line-through}
 .act{background:rgba(255,176,32,.16);color:#ffb020}
 .unb{background:#4b1fb8;color:#d9ccff}
-.empty{padding:30px;text-align:center;color:var(--mut)}
-.more{display:block;margin:12px auto 0;background:rgba(255,255,255,.06);border:1px solid var(--line);color:#e8e6f2;
-border-radius:10px;padding:10px 22px;cursor:pointer;font-size:14px}.more:hover{background:rgba(124,31,255,.2)}
-.modal{position:fixed;inset:0;background:rgba(0,0,0,.65);display:none;align-items:center;justify-content:center;padding:16px;z-index:9}
-.modal.on{display:flex}
-.box{background:#120e22;border:1px solid var(--line);border-radius:16px;padding:22px;max-width:520px;width:100%;max-height:90vh;overflow:auto}
-.box h2{display:flex;justify-content:space-between;align-items:center}
-.x{background:none;border:0;color:var(--mut);font-size:22px;cursor:pointer}
-.kv{display:grid;grid-template-columns:140px 1fr;gap:8px 12px;font-size:14px}.kv div:nth-child(odd){color:var(--mut)}
-.kv a{color:#a66bff;text-decoration:none;word-break:break-all}
-code{background:rgba(255,255,255,.06);padding:2px 6px;border-radius:6px;font-size:12px}
-</style></head><body>
-<div class="top"><div class="logo">VIBE <span>MIX</span> · FreePick</div><div class="nav">Блокировки</div></div>
-<div class="wrap">
-<div class="card"><h2>Инфо</h2>
-<h3>Фильтр наказаний</h3>
-<div class="tabs" id="tabs">
-<button data-f="all" class="on">Все</button><button data-f="active">Активные</button>
-<button data-f="perm">Навсегда</button><button data-f="ended">Снятые</button></div>
-<h3>Найти нарушителя</h3><input id="q" placeholder="Ник, SteamID, причина или админ" autocomplete="off">
+.empty{padding:30px;text-align:center;color:#9a97b0}
+</style></head><body><div class="wrap">
+<div class="card"><h2>Инфо</h2><span class="tag">Баны</span><span class="tag" style="background:#1f3a8a">FreePick</span>
+<h3>Найти нарушителя</h3><input id="q" placeholder="Ник, причина или админ" autocomplete="off">
 <h3>Статистика наказаний</h3>
-<div class="stat"><span>Всего банов</span><b id="s_total">0</b></div>
-<div class="stat"><span>Активных банов</span><b id="s_active">0</b></div>
-<div class="stat"><span>Перманентных банов</span><b id="s_perm">0</b></div>
-<div class="stat"><span>Снятых банов</span><b id="s_ended">0</b></div></div>
+<div class="stat"><span>Всего банов</span><b>__TOTAL__</b></div>
+<div class="stat"><span>Активных банов</span><b>__ACTIVE__</b></div>
+<div class="stat"><span>Перманентных банов</span><b>__PERM__</b></div></div>
 <div class="card"><h2>Список наказаний</h2><div class="tw"><table><thead><tr>
-<th>Тип</th><th>Игрок</th><th>Причина</th><th>Срок</th><th>Админ</th></tr></thead><tbody id="rows"></tbody></table>
-<div class="empty" id="empty" style="display:none">Наказаний не найдено</div>
-<button class="more" id="more" style="display:none">Показать ещё</button></div></div></div>
-<div class="modal" id="modal"><div class="box"><h2><span>Подробности наказания</span><button class="x" id="close">×</button></h2>
-<div class="kv" id="kv"></div></div></div>
+<th>Тип</th><th>Игрок</th><th>Причина</th><th>Срок</th><th>Админ</th></tr></thead><tbody id="rows">__ROWS__</tbody></table>
+__EMPTY__</div></div></div>
 <script>
-const D=__DATA__, NOW0=__NOW__, T0=Date.now();
-const now=()=>NOW0+Math.floor((Date.now()-T0)/1000);
-const st={f:'all',q:'',n:50};
-const $=id=>document.getElementById(id);
-function el(t,c,x){const e=document.createElement(t);if(c)e.className=c;if(x!==undefined)e.textContent=x;return e}
-function status(r){if(r.unbanned)return'unb';if(r.expires===0)return'perm';if(r.expires<=now())return'done';return'act'}
-function dur(s){const p=[];for(const[n,k]of[['д.',86400],['ч.',3600],['мин.',60]]){if(s>=k){p.push(Math.floor(s/k)+' '+n);s%=k}if(p.length==2)break}return p.join(' ')||'1 мин.'}
-function dt(t){return t?new Date(t*1000).toLocaleString('ru-RU'):'—'}
-function badge(r){const s=status(r),b=el('span','b '+s);
- b.textContent=s=='unb'?'Разбанен':s=='perm'?'Навсегда':s=='done'?dur(r.expires-r.created):dur(r.expires-now());return b}
-function match(r){const q=st.q.toLowerCase(),s=status(r);
- if(st.f=='active'&&!(s=='act'||s=='perm'))return false;
- if(st.f=='perm'&&s!='perm')return false;
- if(st.f=='ended'&&!(s=='done'||s=='unb'))return false;
- if(!q)return true;
- return[r.name,r.steam,r.reason,r.admin,String(r.did)].some(v=>(v||'').toLowerCase().includes(q))}
-function row(r){const tr=el('tr','r');
- tr.append(el('td','',status(r)=='unb'?'✅':'🚫'));
- const p=el('td'),w=el('div','pl');
- if(r.avatar&&/^https:\\/\\//.test(r.avatar)){const i=new Image();i.src=r.avatar;i.loading='lazy';i.onerror=()=>{i.style.visibility='hidden'};w.append(i)}else w.append(el('div','av'));
- w.append(el('span','',r.name||String(r.did)));p.append(w);tr.append(p);
- tr.append(el('td','',r.reason||'—'));
- const t=el('td');t.append(badge(r));tr.append(t);
- tr.append(el('td','',r.admin||'—'));
- tr.onclick=()=>open(r);return tr}
-function render(){
- const all=D,m=all.filter(match);
- $('s_total').textContent=all.length;
- $('s_active').textContent=all.filter(r=>{const s=status(r);return s=='act'||s=='perm'}).length;
- $('s_perm').textContent=all.filter(r=>status(r)=='perm').length;
- $('s_ended').textContent=all.filter(r=>{const s=status(r);return s=='done'||s=='unb'}).length;
- const body=$('rows');body.replaceChildren(...m.slice(0,st.n).map(row));
- $('empty').style.display=m.length?'none':'block';
- $('more').style.display=m.length>st.n?'block':'none'}
-function open(r){const kv=$('kv');kv.replaceChildren();
- const add=(k,v)=>{kv.append(el('div','',k));const d=el('div');if(v instanceof Node)d.append(v);else d.textContent=v;kv.append(d)};
- add('Игрок',r.name||'—');add('Discord ID',r.did);
- if(r.steam){const a=el('a','',r.steam);a.href='https://steamcommunity.com/profiles/'+encodeURIComponent(r.steam);a.target='_blank';a.rel='noopener';add('SteamID',a)}
- add('Причина',r.reason||'—');add('Статус',badge(r));
- add('Выдан',dt(r.created));add('Истекает',r.expires?dt(r.expires):'Никогда');
- add('Администратор',r.admin||'—');
- if(r.unbanned){add('Разбанен',dt(r.unbanned));add('Кем',r.unban_by||'—');add('Причина разбана',r.unban_reason||'—')}
- $('modal').classList.add('on')}
-$('close').onclick=()=>$('modal').classList.remove('on');
-$('modal').onclick=e=>{if(e.target.id=='modal')$('modal').classList.remove('on')};
-document.addEventListener('keydown',e=>{if(e.key=='Escape')$('modal').classList.remove('on')});
-$('q').oninput=e=>{st.q=e.target.value;st.n=50;render()};
-$('more').onclick=()=>{st.n+=50;render()};
-document.querySelectorAll('#tabs button').forEach(b=>b.onclick=()=>{
- document.querySelectorAll('#tabs button').forEach(x=>x.classList.remove('on'));b.classList.add('on');
- st.f=b.dataset.f;st.n=50;render()});
-render();setInterval(render,60000);
+const q=document.getElementById('q');
+q.addEventListener('input',()=>{const v=q.value.toLowerCase();
+document.querySelectorAll('#rows tr').forEach(r=>{r.style.display=r.textContent.toLowerCase().includes(v)?'':'none'})});
 </script></body></html>"""
 
 
 def render_bans_page(rows: list, now: int) -> str:
-    data = [{"did": did, "name": name, "avatar": avatar, "reason": reason, "admin": admin,
-             "created": created or 0, "expires": expires or 0, "unbanned": unbanned,
-             "steam": steam, "unban_reason": unban_reason, "unban_by": unban_by}
-            for (did, name, avatar, reason, admin, created, expires, unbanned,
-                 steam, unban_reason, unban_by) in rows]
-    payload = json.dumps(data, ensure_ascii=False).replace("<", "\\u003c").replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
-    return BANS_PAGE.replace("__DATA__", payload).replace("__NOW__", str(int(now)))
+    esc = _html.escape
+    total = len(rows)
+    active = sum(1 for r in rows if r[7] is None and (r[6] == 0 or r[6] > now))
+    perm = sum(1 for r in rows if r[7] is None and r[6] == 0)
+    out = []
+    for did, name, avatar, reason, admin, created, expires, unbanned in rows:
+        if unbanned:
+            badge = '<span class="b unb">Разбанен</span>'
+        elif expires == 0:
+            badge = '<span class="b perm">Навсегда</span>'
+        elif expires <= now:
+            badge = f'<span class="b done">{esc(fmt_dur(expires - created))}</span>'
+        else:
+            badge = f'<span class="b act">{esc(fmt_dur(expires - now))}</span>'
+        img = (f'<img src="{esc(avatar, quote=True)}" alt="" loading="lazy" '
+               f'onerror="this.style.visibility=\'hidden\'">') if avatar else ""
+        out.append(f'<tr><td>🚫</td><td><div class="pl">{img}<span>{esc(name or str(did))}</span></div></td>'
+                   f'<td>{esc(reason or "—")}</td><td>{badge}</td><td>{esc(admin or "—")}</td></tr>')
+    empty = '' if out else '<div class="empty">Наказаний пока нет</div>'
+    return (BANS_PAGE.replace("__TOTAL__", str(total)).replace("__ACTIVE__", str(active))
+            .replace("__PERM__", str(perm)).replace("__ROWS__", "".join(out)).replace("__EMPTY__", empty))
 
 
 async def h_bans(req: web.Request):
-    rows = db.execute("SELECT discord_id, name, avatar, reason, admin_name, created, expires, unbanned_at, "
-                      "steamid64, unban_reason, unban_by FROM ban_log ORDER BY created DESC LIMIT 1000").fetchall()
+    rows = db.execute("SELECT discord_id, name, avatar, reason, admin_name, created, expires, unbanned_at "
+                      "FROM ban_log ORDER BY created DESC LIMIT 500").fetchall()
     return web.Response(text=render_bans_page(rows, int(time.time())), content_type="text/html")
 
 
@@ -2337,25 +1684,10 @@ async def h_demo(req: web.Request):
         msg = result_msgs.get(mid)
         if msg:  # результат уже опубликован: добавляем кнопку к нему
             try:
-                await msg.edit(view=demo_view(mid))
+                await msg.edit(view=demo_view(url))
             except discord.HTTPException:
                 log.exception("Не удалось добавить кнопку демо к результату")
     return web.Response(text="ok")
-
-
-async def h_demo_get(req: web.Request):
-    """Скачивание демо по номеру матча: редирект на файл, если он уже загружен сервером."""
-    mid = req.match_info["mid"]
-    url = demo_urls.get(int(mid))
-    if not url and os.path.isdir(DEMO_DIR):
-        for f in sorted(os.listdir(DEMO_DIR), reverse=True):
-            if mid in f and ".dem" in f:
-                url = f"{WEB_BASE_URL}/demos/{f}"
-                break
-    if url:
-        raise web.HTTPFound(url)
-    return page("Демо ещё не готово",
-                "Сервер загружает демо после окончания матча. Попробуйте через минуту.", False)
 
 
 async def h_events(req: web.Request):
@@ -2368,43 +1700,20 @@ async def h_events(req: web.Request):
         return web.Response(status=400)
     log.info("MatchZy event: %s (matchid=%s)", data.get("event"), data.get("matchid"))
     ev = data.get("event")
-    try:
-        events_seen.add(int(data.get("matchid")))
-    except (TypeError, ValueError):
-        pass
     same = S.phase == "playing" and str(data.get("matchid")) == str(S.match_id)
-    event_log.append(f"{time.strftime('%H:%M:%S')} {ev} match={data.get('matchid')} {'ok' if same else 'не текущий матч'}")
     if ev == "series_end" and same:
         asyncio.create_task(reset_to_queue())
     elif same and ev == "going_live":
         S.live = True            # матч пошёл (после ножей): теперь выход игрока = перерыв
-        S.ever_live = True       # матч реально стартовал: если его сбросят вручную, результат опубликуем
-    elif ev == "round_end":
-        try:
-            if data.get("team1"):
-                last_round[int(data.get("matchid"))] = data  # статистика на случай, если map_result не придёт
-        except (TypeError, ValueError):
-            pass
-    elif ev == "map_result":
-        if same:
-            S.live = False       # карта закончилась: выходы игроков больше не считаем
-        try:
-            mid = int(data.get("matchid"))
-        except (TypeError, ValueError):
-            mid = None
-        snap = snapshots.get(mid)  # снимок игроков сохранён при старте: результат придёт, даже если матч уже сброшен
-        if snap and mid not in posted_results:
-            asyncio.create_task(post_result(data, dict(snap), mid))
-        else:
-            log.warning("map_result для матча %s: нет снимка игроков или результат уже опубликован", mid)
+    elif same and ev == "map_result":
+        S.live = False           # карта закончилась: выходы игроков больше не считаем
+        # снимок игроков берём сразу: series_end может сбросить матч раньше, чем отправится результат
+        asyncio.create_task(post_result(data, dict(S.match_players), S.match_id))
     elif same and ev == "player_connect":
         asyncio.create_task(handle_connect(data))
-        asyncio.create_task(track_connect(data))
-        asyncio.create_task(handle_return(data))
     elif same and ev == "player_disconnect":
         player = data.get("player") or {}
         if not player.get("is_bot"):
-            S.connected.discard(str(player.get("steamid", "")))
             asyncio.create_task(handle_disconnect(str(player.get("steamid", ""))))
     return web.Response(text="ok")
 
@@ -2692,10 +2001,8 @@ class FreePickBot(commands.Bot):
             web.get(r"/match/{mid:\d+}.json", h_match),
             web.get("/connect", h_connect),
             web.get("/bans", h_bans),
-            web.get("/punishment", h_bans),
             web.post("/events", h_events),
             web.post("/demo", h_demo),
-            web.get(r"/demo/{mid:\d+}", h_demo_get),
             web.static("/demos", DEMO_DIR),
             web.get("/auth/steam", h_auth),
             web.get("/auth/steam/callback", h_auth_callback),
@@ -2718,7 +2025,6 @@ class FreePickBot(commands.Bot):
 
 intents = discord.Intents.default()
 intents.members = True  # включите Server Members Intent в Developer Portal
-intents.message_content = os.getenv("AUTOBAN_CHAT", "1") == "1"  # для авто-бана в чате: включите Message Content Intent (или AUTOBAN_CHAT=0)
 bot = FreePickBot(command_prefix="!", intents=intents)
 admin = app_commands.checks.has_permissions(administrator=True)
 
@@ -2900,45 +2206,7 @@ async def unban_cmd(i: discord.Interaction, member: discord.User, reason: str = 
 async def endmatch_cmd(i: discord.Interaction):
     await i.response.defer(ephemeral=True)
     await reset_to_queue()
-    await i.followup.send("Очередь сброшена, временные войсы команд удалены.", ephemeral=True)
-
-
-@bot.tree.command(name="fp_start", description="(админ) Принудительно стартовать текущий матч на сервере")
-@app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
-@admin
-async def fp_start_cmd(i: discord.Interaction):
-    if S.phase != "playing" or not S.match_id:
-        return await i.response.send_message("Сейчас нет матча на сервере.", ephemeral=True)
-    await i.response.defer(ephemeral=True)
-    S.auto_started = False
-    ok = await force_start(S.match_id, f"{i.user.display_name} запустил матч")
-    await i.followup.send("✅ Команда старта отправлена." if ok else "⚠ Сервер не стартовал матч, смотрите сообщение в чате матча.",
-                          ephemeral=True)
-
-
-@bot.tree.command(name="fp_diag", description="(админ) Проверить связь с CS2-сервером (RCON)")
-@app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
-@admin
-async def fp_diag_cmd(i: discord.Interaction):
-    await i.response.defer(ephemeral=True)
-    parts = [f"Сервер: `{SERVER_IP}:{SERVER_PORT}`, RCON_PASSWORD: {'задан' if RCON_PASSWORD else 'НЕ ЗАДАН'}",
-             f"Матч: `{S.match_id}`, фаза `{S.phase}`, игроков матча {len(S.match_players)}"]
-    parts.append("**События MatchZy (последние)**\n```" + ("\n".join(list(event_log)[-8:]) or "ничего не приходило") + "```")
-    for cv in ("matchzy_remote_log_url", "matchzy_demo_upload_url"):
-        try:
-            resp = await asyncio.to_thread(rcon_raw, cv)
-            parts.append(f"`{cv}`: `{resp.strip()[:110] or '(пусто)'}`")
-        except Exception as exc:
-            parts.append(f"`{cv}`: ошибка `{type(exc).__name__}`")
-    for cmd in ("status", "get5_status"):
-        try:
-            resp = await asyncio.to_thread(rcon_raw, cmd)
-            parts.append(f"**{cmd}**\n```{resp.strip()[:300] or '(пусто)'}```")
-        except Exception as exc:
-            parts.append(f"**{cmd}**: ошибка `{type(exc).__name__}: {exc}`")
-    await i.followup.send("\n".join(parts)[:1990], ephemeral=True)
+    await i.followup.send("Очередь сброшена, доступы в войсы команд забраны.", ephemeral=True)
 
 
 async def find_panel():
@@ -2969,8 +2237,8 @@ async def on_ready():
         asyncio.create_task(ban_expiry_loop())
     asyncio.create_task(restore_from_dms())  # доберём тех, кого нет в бэкапе (из ЛС бота)
     load_access()
-    # Если бот перезапустился во время матча, а матча уже нет — удаляем старые войсы команд
-    if S.team_vcs and S.phase != "playing":
+    # Если бот перезапустился во время матча, а матча уже нет — снимаем старые доступы
+    if S.team_access and S.phase != "playing":
         await clear_voice_access()
     # Восстанавливаем панель после перезапуска
     ch_id, msg_id = kv_get("panel_channel"), kv_get("panel_message")
@@ -3000,7 +2268,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     # Во время матча игрока, зашедшего в любой войс, сразу перекидываем в войс его команды
     if after.channel and S.phase == "playing":
         team_n = next((n for m, n in S.match_players.values() if m.id == member.id), None)
-        vc_id = S.team_vcs.get(team_n, 0) if team_n else 0
+        vc_id = (TEAM1_VC if team_n == 1 else TEAM2_VC) if team_n else 0
         if vc_id and after.channel.id != vc_id:
             target = member.guild.get_channel(vc_id)
             if target:
@@ -3016,9 +2284,6 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     now = bool(after.channel and after.channel.id == QUEUE_VC)
     if was == now:
         return
-    # Во время драфта: если все игроки вышли из войса очереди, драфт отменяется (проверка с задержкой)
-    if was and not now and S.phase == "draft":
-        asyncio.create_task(check_draft_empty())
     if now:
         err = None
         if is_banned(member.id):
@@ -3040,113 +2305,6 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     await sync_queue()
 
 
-# ----------------------------- АВТО-БАН В ЧАТЕ -----------------------
-# Спам = бан 5 мин, оскорбление = бан 10 мин. Бан FreePick + тайм-аут в Discord на тот же срок.
-AUTOBAN_CHAT = os.getenv("AUTOBAN_CHAT", "1") == "1"       # 0 = выключить проверку чата
-SPAM_COUNT = int(os.getenv("SPAM_COUNT", "5"))              # столько сообщений ...
-SPAM_SECONDS = int(os.getenv("SPAM_SECONDS", "6"))          # ... за столько секунд = спам
-SPAM_SAME = int(os.getenv("SPAM_SAME", "3"))                # столько одинаковых сообщений за 20 сек = спам
-AUTOBAN_LADDERS["spam"] = os.getenv("AUTOBAN_SPAM_LADDER", "5m")
-AUTOBAN_LADDERS["insult"] = os.getenv("AUTOBAN_INSULT_LADDER", "10m")
-SPAM_REASON = "спам в чате"
-INSULT_REASON = "оскорбление в чате"
-AUTOBAN_IGNORE = {int(x) for x in os.getenv("AUTOBAN_IGNORE_CHANNELS", "").split(",") if x.strip().isdigit()}
-AUTOBAN_EXTRA = [w.strip().lower() for w in os.getenv("AUTOBAN_WORDS", "").split(",") if w.strip()]  # свои слова (корни)
-
-_PRE = r"(?:на|по|за|до|вы|раз|рас|от|при|под|пере|съ|объ|с|у|не|ни|о|в)?"
-_PREFIXED = [r"ху[йяеи]", r"пизд", r"пезд", r"еба[лнт]", r"ебл[аоуи]", r"ебу[чт]", r"ебис", r"ебн[ую]", r"ебак", r"ебал"]
-_STAND = [r"бляд", r"блят", r"блэт", r"сук[аиуе]$", r"сукин", r"сучк", r"сучар", r"мудак", r"мудил", r"мудозвон",
-          r"пидор", r"пидар", r"пидр", r"педик", r"педераст", r"гандон", r"гондон", r"(?:долб|далб)[ао]?еб",
-          r"дебил", r"дибил", r"идиот", r"кретин", r"имбецил", r"ублюд", r"выродок", r"мразь", r"мразот",
-          r"шлюх", r"шалав", r"залуп", r"чмо$", r"чмошн", r"даун$", r"уебок", r"уебан", r"урод$", r"уроды$",
-          r"тварь$", r"твари$", r"гнида", r"падла", r"паскуд", r"сволоч", r"скотин", r"говнюк", r"хуесос",
-          r"fuck", r"shit", r"bitch", r"retard", r"cunt", r"whore", r"slut", r"faggot"]
-_EXACT = {"бля", "еб", "ебать", "хуй", "нахуй", "нах", "пох", "похуй", "пиздец", "хер", "нахер"}
-for _w in AUTOBAN_EXTRA:
-    _PREFIXED.append(re.escape(_w))
-_RE_PRE = re.compile("^" + _PRE + "(?:" + "|".join(_PREFIXED) + ")")
-_RE_STAND = re.compile("^(?:" + "|".join(_STAND) + ")")
-_LAT2CYR = str.maketrans({"a": "а", "e": "е", "o": "о", "p": "р", "c": "с", "x": "х", "y": "у",
-                          "k": "к", "m": "м", "t": "т", "h": "н", "b": "в", "0": "о"})
-
-
-def _collapse(s: str) -> str:
-    return re.sub(r"(.)\1+", r"\1", s)  # «пиииздец» -> «пиздец»
-
-
-def is_insult(text: str) -> bool:
-    """Мат и оскорбления: учитывает буквы-двойники (латиница), растянутые буквы и слова через пробел."""
-    text = text.lower().replace("ё", "е")
-    raw = re.findall(r"[a-zа-я0-9]+", text)
-    toks, buf = [], ""
-    for t in raw:
-        if len(t) == 1:
-            buf += t
-        else:
-            if len(buf) >= 3:
-                toks.append(buf)
-            buf = ""
-            toks.append(t)
-    if len(buf) >= 3:
-        toks.append(buf)
-    for t in toks:
-        for v in {_collapse(t), _collapse(t.translate(_LAT2CYR))}:
-            if v in _EXACT or _RE_PRE.match(v) or _RE_STAND.match(v):
-                return True
-    return False
-
-
-_chat_hist: dict[int, deque] = {}  # user_id -> последние сообщения (время, текст, сообщение)
-
-
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot or not message.guild or not AUTOBAN or not AUTOBAN_CHAT:
-        return
-    member = message.author
-    if not isinstance(member, discord.Member) or message.channel.id in AUTOBAN_IGNORE:
-        return
-    perms = member.guild_permissions
-    if perms.administrator or perms.manage_messages:  # админов и модераторов не трогаем
-        return
-    now_t = time.time()
-    hist = _chat_hist.setdefault(member.id, deque(maxlen=20))
-    text = (message.content or "").strip().lower()
-    hist.append((now_t, text, message))
-
-    kind = reason = None
-    if text and is_insult(text):
-        kind, reason = "insult", INSULT_REASON
-        to_delete = [message]
-    else:
-        recent = [x for x in hist if now_t - x[0] <= SPAM_SECONDS]
-        same = [x for x in hist if text and x[1] == text and now_t - x[0] <= 20]
-        if len(recent) >= SPAM_COUNT or len(same) >= SPAM_SAME:
-            kind, reason = "spam", SPAM_REASON
-            to_delete = [x[2] for x in hist if now_t - x[0] <= 20]
-    if not kind:
-        return
-    hist.clear()
-    for m in to_delete:
-        try:
-            await m.delete()
-        except discord.HTTPException:
-            pass
-    dur = await auto_ban(member, kind, reason)
-    if dur is None:
-        return
-    from datetime import timedelta
-    try:  # тайм-аут в Discord на тот же срок (нужно право Moderate Members)
-        await member.timeout(timedelta(seconds=min(dur or 28 * 86400, 28 * 86400)), reason=f"Авто-бан: {reason}")
-    except discord.HTTPException:
-        log.warning("Не удалось выдать тайм-аут %s (нужно право Moderate Members, роль бота выше)", member)
-    try:
-        await message.channel.send(f"🚫 {member.mention} получил бан на {fmt_dur(dur) if dur else 'навсегда'}: {reason}.",
-                                   delete_after=15, allowed_mentions=discord.AllowedMentions.none())
-    except discord.HTTPException:
-        pass
-
-
 # ----------------------------- ЗАПУСК --------------------------------
 def say(msg: str):
     print(msg, flush=True)
@@ -3159,8 +2317,6 @@ def main():
     say(f"▶ DISCORD_TOKEN: {'задан, длина ' + str(len(token)) if token else 'НЕ ЗАДАН'}")
     say(f"▶ Порт веб-сервера: {WEB_PORT}, WEB_BASE_URL: {WEB_BASE_URL}")
     say(f"▶ TEST_MODE={TEST_MODE}, QUEUE_VC_ID={QUEUE_VC}, GUILD_ID={GUILD_ID}")
-    say(f"▶ Авто-бан: {'вкл' if AUTOBAN else 'выкл'}")
-    say(f"▶ Автостарт: {'вкл' if AUTO_START else 'выкл'}, разминка {WARMUP_SECONDS} сек")
     say(f"▶ FACEIT: {'ключ задан' if FACEIT_API_KEY else 'FACEIT_API_KEY не задан (FACEIT-роли выключены)'}")
     say(f"▶ Демо сохраняются в: {DEMO_DIR}")
     if not token:
@@ -3178,7 +2334,7 @@ def main():
         say("❌ Неверный DISCORD_TOKEN. Пересоздайте токен в Discord Developer Portal -> Bot -> Reset Token.")
         raise SystemExit(1)
     except discord.errors.PrivilegedIntentsRequired:
-        say("❌ Не включены привилегированные Intents: Developer Portal -> Bot -> Privileged Gateway Intents -> включите Server Members Intent и Message Content Intent (либо задайте AUTOBAN_CHAT=0 в Render).")
+        say("❌ Не включён Server Members Intent: Developer Portal -> Bot -> Privileged Gateway Intents.")
         raise SystemExit(1)
     except Exception as exc:
         import traceback
