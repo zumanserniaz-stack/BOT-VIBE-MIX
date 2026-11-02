@@ -4,13 +4,15 @@ VIBE MIX FreePick 5x5: очередь -> готовность -> капитан�
 Авто-старт матча: как только все игроки зашли на сервер, матч стартует сам; иначе после разминки (4 мин).
 Если во время драфта все игроки вышли из войса очереди, драфт отменяется и очередь сбрасывается.
 При Steam-верификации бот определяет FACEIT-уровень игрока и выдаёт роль «FACEIT LVL n».
-Результат матча: табло + MVP + статистика каждого игрока + ELO (+30 / -20) + кнопка «Скачать демо».
+Результат матча: табло (K / D / K/D каждого игрока) + MVP + ELO (+30 / -20) + кнопка «Скачать демо».
 
+v47: на табло результата у каждого игрока видно убийства (K), смерти (D) и K/D. Если сервер не прислал итоговую
+     статистику, бот считает убийства и смерти сам по событиям player_death.
+     RCON_PASSWORD больше не хранится в коде: задайте его в Render -> Environment.
 v46: новые команды /match stop, /match stat, /profile, /mute, /unmute, /clan (create, accept, info, invite,
      kick, leave, list, menu), /clearrole. Статистика матчей, кланы и ELO входят в бэкап.
-     RCON_PASSWORD больше не хранится в коде: задайте его в Render -> Environment.
 """
-print("▶ bot.py v46 загружается...", flush=True)
+print("▶ bot.py v47 загружается...", flush=True)
 import asyncio
 from collections import deque
 import io
@@ -330,6 +332,58 @@ last_round: dict[int, dict] = {}   # match_id -> последнее событи
 event_log = deque(maxlen=12)       # последние события MatchZy (для /fp_diag)
 events_seen: set[int] = set()      # match_id, от которых сервер уже присылал события (значит, remote log настроен)
 snapshots: dict[int, dict] = {}  # match_id -> {steamid64: (игрок, команда)}: чтобы результат пришёл даже после сброса
+live_stats: dict[int, dict] = {}   # match_id -> {steamid64: {"k","d","a","hs"}}: убийства/смерти, посчитанные по player_death
+
+
+def tally_death(data: dict):
+    """Считает убийства, смерти, помощи и хедшоты по событию player_death (запасной источник статистики)."""
+    try:
+        mid = int(data.get("matchid"))
+    except (TypeError, ValueError):
+        return
+    t = live_stats.setdefault(mid, {})
+
+    def slot(sid):
+        return t.setdefault(str(sid), {"k": 0, "d": 0, "a": 0, "hs": 0})
+
+    def sid_of(p):
+        sid = str((p or {}).get("steamid", "") or "")
+        return sid if sid and sid != "0" else ""
+
+    victim, attacker = sid_of(data.get("player")), sid_of(data.get("attacker"))
+    if victim:
+        slot(victim)["d"] += 1
+    suicide = bool(data.get("suicide")) or (attacker and attacker == victim)
+    if attacker and not suicide and not data.get("friendly_fire"):
+        slot(attacker)["k"] += 1
+        if data.get("headshot"):
+            slot(attacker)["hs"] += 1
+    asst = data.get("assist")
+    if isinstance(asst, dict) and not asst.get("friendly_fire"):
+        ap = sid_of(asst.get("player") if isinstance(asst.get("player"), dict) else asst)
+        if ap:
+            slot(ap)["a"] += 1
+
+
+def build_from_tally(mid: int, players: dict, last: dict) -> dict:
+    """Если в данных сервера нет статистики игроков, берём ту, что накопили по player_death."""
+    last = dict(last or {})
+    if (last.get("team1") or {}).get("players") or (last.get("team2") or {}).get("players"):
+        return last  # у сервера есть своя статистика (с уроном), её не трогаем
+    tally = live_stats.get(mid)
+    if not tally:
+        return last
+    teams = {1: [], 2: []}
+    for sid, (m, n) in players.items():
+        st = tally.get(str(sid), {"k": 0, "d": 0, "a": 0, "hs": 0})
+        teams[n].append({"steamid": str(sid), "name": m.display_name,
+                         "stats": {"kills": st["k"], "deaths": st["d"], "assists": st["a"],
+                                   "damage": 0, "headshot_kills": st["hs"]}})
+    for n in (1, 2):
+        t = dict(last.get(f"team{n}") or {})
+        t["players"] = teams[n]
+        last[f"team{n}"] = t
+    return last
 
 
 def save_access():
@@ -1645,7 +1699,8 @@ async def ensure_fonts():
 
 def render_result_card(map_name: str, s1, s2, team_rows: dict, mvp: dict,
                        mvp_avatar: bytes | None, names: tuple) -> bytes:
-    """Рисует картинку-табло матча (как в популярных ботах). Блокирующая: вызывать через to_thread."""
+    """Рисует картинку-табло матча. У каждого игрока три колонки: K (убийства), D (смерти), K/D.
+    Блокирующая: вызывать через to_thread."""
     from PIL import Image, ImageDraw, ImageFilter, ImageEnhance
 
     W, H = 1300, 540
@@ -1686,8 +1741,10 @@ def render_result_card(map_name: str, s1, s2, team_rows: dict, mvp: dict,
     img = Image.alpha_composite(img, ov)
     d = ImageDraw.Draw(img)
 
-    f_head, f_name, f_stat = get_font(26), get_font(24), get_font(22, "regular")
+    f_head, f_name, f_stat, f_lab = get_font(26), get_font(24), get_font(23), get_font(17)
     gray, white = (200, 206, 220), (245, 247, 252)
+    GOOD, BAD = (110, 225, 140), (255, 120, 120)
+    COLS = (170, 105, 22)  # правый край колонок K, D, K/D (отступ от правого края панели)
 
     def fit(text: str, font, max_w: int) -> str:
         if d.textlength(text, font=font) <= max_w:
@@ -1699,21 +1756,23 @@ def render_result_card(map_name: str, s1, s2, team_rows: dict, mvp: dict,
     for n, x0 in panels.items():
         col = colors[n]
         d.text((x0 + PW // 2, PY0 + 34), names[n - 1], font=f_head, fill=col, anchor="mm")
-        y = PY0 + 70
+        for dx, lab in zip(COLS, ("K", "D", "K/D")):  # подписи колонок
+            d.text((x0 + PW - dx, PY0 + 76), lab, font=f_lab, fill=col, anchor="rm")
+        y = PY0 + 90
         for r in team_rows.get(n, [])[:5]:
-            cy = y + 34
+            cy = y + 32
             d.ellipse((x0 + 22, cy - 8, x0 + 38, cy + 8), fill=col)
-            d.text((x0 + 52, cy), fit(r["name"], f_name, 205), font=f_name, fill=white, anchor="lm")
+            d.text((x0 + 52, cy), fit(r["name"], f_name, 200), font=f_name, fill=white, anchor="lm")
             if mvp is None:  # статистики нет: прочерки
-                for dx in (150, 85, 20):
+                for dx in COLS:
                     d.text((x0 + PW - dx, cy), "–", font=f_stat, fill=gray, anchor="rm")
             else:
                 kd = r["k"] / r["d"] if r["d"] else float(r["k"])
-                d.text((x0 + PW - 150, cy), f"{r['k']}-{r['d']}", font=f_stat, fill=gray, anchor="rm")
-                d.text((x0 + PW - 85, cy), f"{kd:.2f}", font=f_stat, fill=gray, anchor="rm")
-                d.text((x0 + PW - 20, cy), f"{r['hs']}%", font=f_stat, fill=gray, anchor="rm")
-            d.line((x0 + 18, y + 71, x0 + PW - 18, y + 71), fill=(60, 70, 96), width=1)
-            y += 76
+                d.text((x0 + PW - COLS[0], cy), str(r["k"]), font=f_stat, fill=white, anchor="rm")
+                d.text((x0 + PW - COLS[1], cy), str(r["d"]), font=f_stat, fill=gray, anchor="rm")
+                d.text((x0 + PW - COLS[2], cy), f"{kd:.2f}", font=f_stat, fill=GOOD if kd >= 1 else BAD, anchor="rm")
+            d.line((x0 + 18, y + 66, x0 + PW - 18, y + 66), fill=(60, 70, 96), width=1)
+            y += 70
 
     # --- центр: аватар MVP, счёт, карта
     cx = W // 2
@@ -1737,11 +1796,14 @@ def render_result_card(map_name: str, s1, s2, team_rows: dict, mvp: dict,
     d = ImageDraw.Draw(img)
     d.text((cx, 258), "MVP" if mvp else "ИТОГ", font=get_font(50), fill=GOLD, anchor="mm")
     d.text((cx, 304), fit(mvp["name"] if mvp else "Матч завершён", get_font(24), 250), font=get_font(24), fill=white, anchor="mm")
+    if mvp:  # K-D-K/D самого MVP под ником
+        mkd = mvp["k"] / mvp["d"] if mvp["d"] else float(mvp["k"])
+        d.text((cx, 336), f"{mvp['k']} / {mvp['d']}  ·  K/D {mkd:.2f}", font=get_font(20, "regular"), fill=gray, anchor="mm")
     f_score = get_font(72)
-    d.text((cx - 78, 380), str(s1) if s1 is not None else "–", font=f_score, fill=BLUE, anchor="mm")
-    d.text((cx, 380), "–", font=get_font(40), fill=gray, anchor="mm")
-    d.text((cx + 78, 380), str(s2) if s2 is not None else "–", font=f_score, fill=ORANGE, anchor="mm")
-    d.text((cx, 462), f"КАРТА: {map_name.replace('de_', '').upper()}", font=get_font(24), fill=gray, anchor="mm")
+    d.text((cx - 78, 395), str(s1) if s1 is not None else "–", font=f_score, fill=BLUE, anchor="mm")
+    d.text((cx, 395), "–", font=get_font(40), fill=gray, anchor="mm")
+    d.text((cx + 78, 395), str(s2) if s2 is not None else "–", font=f_score, fill=ORANGE, anchor="mm")
+    d.text((cx, 470), f"КАРТА: {map_name.replace('de_', '').upper()}", font=get_font(24), fill=gray, anchor="mm")
 
     out = io.BytesIO()
     img.convert("RGB").save(out, "PNG")
@@ -1802,8 +1864,8 @@ def apply_elo(players: dict, win_n: int) -> dict:
 
 
 async def post_result(data: dict, players: dict, match_id, note: str = ""):
-    """Публикует итог матча в канал результатов: карточка-табло + MVP + статистика и ELO каждого игрока + демо.
-    Без статистики сервера пишет простой список составов (с текущим ELO игроков).
+    """Публикует итог матча в канал результатов: карточка-табло + MVP + статистика (K/D/A, K/D, ADR, HS) и ELO
+    каждого игрока + демо. Без статистики сервера пишет простой список составов (с текущим ELO игроков).
     note: непустая строка = победитель неизвестен (ELO не меняется)."""
     try:
         mid = int(match_id)
@@ -1817,6 +1879,7 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
         log.warning("Канал результатов не найден (задай RESULTS_CHANNEL_ID)")
         posted_results.discard(mid)
         return
+    data = build_from_tally(mid, players, data)  # если у сервера нет статистики игроков, берём свою (по player_death)
     t1, t2 = data.get("team1") or {}, data.get("team2") or {}
     s1, s2 = t1.get("score"), t2.get("score")
     win = (data.get("winner") or {}).get("team")
@@ -1861,7 +1924,7 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
             except discord.HTTPException:
                 pass
         try:
-            card = await asyncio.to_thread(render_result_card, raw_map, s1 or 0, s2 or 0,
+            card = await asyncio.to_thread(render_result_card, raw_map, s1, s2,
                                            team_rows, mvp, avatar, ("TEAM A", "TEAM B"))
         except Exception:
             log.exception("Не удалось нарисовать карточку (установлен ли Pillow?)")
@@ -1888,9 +1951,10 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
         if not lines:
             lines.append("**Матч завершён**")
         if mvp:
+            mkd = mvp["k"] / mvp["d"] if mvp["d"] else float(mvp["k"])
             lines.append("")
             lines.append(f"🏅 **MVP — {mvp['name']}** · {mvp['k']}/{mvp['d']}/{mvp['a']} · "
-                         f"{mvp['adr']} ADR · {mvp['hs']}% HS")
+                         f"K/D {mkd:.2f}" + (f" · {mvp['adr']} ADR" if mvp["adr"] else "") + f" · {mvp['hs']}% HS")
         e = discord.Embed(title=f"Match #{mid} — РЕЗУЛЬТАТЫ", description="\n".join(lines), color=0xF1C40F)
         e.set_image(url="attachment://result.png")
         # статистика и ELO каждого игрока по командам
@@ -1902,7 +1966,9 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
                     old, new = changes[r["member"].id]
                     tag = f" · **{new}** ({new - old:+d} ELO)"
                 who = r["member"].mention if r["member"] else r["name"]
-                lines_t.append(f"{who} `{r['k']}/{r['d']}/{r['a']}` · ADR {r['adr']} · HS {r['hs']}%{tag}")
+                kd = r["k"] / r["d"] if r["d"] else float(r["k"])
+                lines_t.append(f"{who} `{r['k']}/{r['d']}/{r['a']}` · K/D {kd:.2f}"
+                               + (f" · ADR {r['adr']}" if r["adr"] else "") + f" · HS {r['hs']}%{tag}")
             if not lines_t:  # статистики нет: показываем состав и ELO
                 lines_t = [m.mention + (f" · **{changes[m.id][1]}** ({changes[m.id][1] - changes[m.id][0]:+d} ELO)"
                                         if m.id in changes else "")
@@ -1929,8 +1995,9 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
         e.description = "\n".join(lines) or "Матч завершён."
         for n in (1, 2):
             rows = [(r["k"], f"{r['member'].mention if r['member'] else r['name']}: "
-                             f"**{r['k']}/{r['d']}/{r['a']}** · ADR {r['adr']}"
-                             f"{elo_tag(r['member'].id) if r['member'] else ''}")
+                             f"**{r['k']}/{r['d']}/{r['a']}**"
+                             + (f" · ADR {r['adr']}" if r["adr"] else "")
+                             + f"{elo_tag(r['member'].id) if r['member'] else ''}")
                     for r in team_rows[n]]
             if not rows:  # статистики нет: показываем хотя бы состав команды
                 rows = [(0, m.mention + elo_tag(m.id)) for m, tn in players.values() if tn == n]
@@ -1942,6 +2009,7 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
         kwargs["view"] = demo_view(mid)  # кнопка демо сразу, файл подтянется, когда сервер его загрузит
         msg = await ch.send(**kwargs)
         result_msgs[mid] = msg
+        live_stats.pop(mid, None)  # убийства/смерти уже в результате
         log.info("Результат матча %s опубликован в #%s", mid, ch.name)
     except discord.HTTPException:
         posted_results.discard(mid)
@@ -1949,8 +2017,8 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
 
 
 async def post_fallback_result(mid: int, players: dict):
-    """map_result не пришёл: берём статистику из последнего round_end.
-    Победителем считается тот, кто ведёт по счёту: ELO начисляется (+30 / -20). При ничьей ELO не меняется."""
+    """map_result не пришёл: берём статистику из последнего round_end (а убийства/смерти при необходимости из
+    player_death). Победителем считается тот, кто ведёт по счёту: ELO начисляется (+30 / -20). При ничьей ELO не меняется."""
     data = last_round.get(mid) or {}
     note = "manual"
     if data:
@@ -2387,6 +2455,9 @@ async def h_events(req: web.Request):
     elif same and ev == "going_live":
         S.live = True            # матч пошёл (после ножей): теперь выход игрока = перерыв
         S.ever_live = True       # матч реально стартовал: если его сбросят вручную, результат опубликуем
+    elif ev == "player_death":
+        if same and S.live:      # считаем убийства/смерти только в живой фазе (без ножей и разминки)
+            tally_death(data)
     elif ev == "round_end":
         try:
             if data.get("team1"):
@@ -3305,7 +3376,8 @@ async def match_stat(i: discord.Interaction, match_id: int = None, member: disco
             for did, team, k, d, a, adr, hs, won, has in rows:
                 if team != n:
                     continue
-                st = f" `{k}/{d}/{a}` · ADR {adr} · HS {hs}%" if has else ""
+                kd = k / d if d else float(k)
+                st = (f" `{k}/{d}/{a}` · K/D {kd:.2f}" + (f" · ADR {adr}" if adr else "") + f" · HS {hs}%") if has else ""
                 lines.append(f"<@{did}>{st}")
             e.add_field(name=f"Team {n}", value="\n".join(lines)[:1024] or "—", inline=False)
         e.set_footer(text=f"Сыграно: {time.strftime('%d.%m.%Y %H:%M', time.localtime(created or 0))}")
@@ -3354,7 +3426,7 @@ async def profile_cmd(i: discord.Interaction, member: discord.Member = None):
     e.add_field(name="Матчи", value=f"{w}W / {l}L\nВинрейт {wr}%", inline=True)
     if n:
         kd = k / d if d else float(k)
-        e.add_field(name="Статистика", value=f"K/D {kd:.2f} · ADR {adr:.0f} · HS {hs:.0f}%\n"
+        e.add_field(name="Статистика", value=f"K/D {kd:.2f}" + (f" · ADR {adr:.0f}" if adr else "") + f" · HS {hs:.0f}%\n"
                                               f"Убийств {k} · Смертей {d} · Помощей {a}", inline=False)
     else:
         e.add_field(name="Статистика", value="Пока нет данных по убийствам", inline=False)
