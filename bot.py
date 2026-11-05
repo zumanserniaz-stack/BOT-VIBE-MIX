@@ -4,15 +4,20 @@ VIBE MIX FreePick 5x5: очередь -> готовность -> капитан�
 Авто-старт матча: как только все игроки зашли на сервер, матч стартует сам; иначе после разминки (4 мин).
 Если во время драфта все игроки вышли из войса очереди, драфт отменяется и очередь сбрасывается.
 При Steam-верификации бот определяет FACEIT-уровень игрока и выдаёт роль «FACEIT LVL n».
-Результат матча: табло (K / D / K/D каждого игрока) + MVP + ELO (+30 / -20) + кнопка «Скачать демо».
+Результат матча: табло (K / D / K/D каждого игрока) на фоне картинки карты + MVP + ELO (+30 / -20) + кнопка «Скачать демо».
 
-v47: на табло результата у каждого игрока видно убийства (K), смерти (D) и K/D. Если сервер не прислал итоговую
-     статистику, бот считает убийства и смерти сам по событиям player_death.
-     RCON_PASSWORD больше не хранится в коде: задайте его в Render -> Environment.
-v46: новые команды /match stop, /match stat, /profile, /mute, /unmute, /clan (create, accept, info, invite,
+v48: - K/D на табло считается надёжно: убийства и смерти берутся из событий player_death (даже если сервер не прислал
+       итоговую статистику); подсчёт начинается с going_live, всё до него (нож, разминка) отбрасывается.
+     - Убийство тиммейта гранатой/молотовом: пули своих не ранят, гранаты и молотов ранят (friendly fire только от гранат);
+       за убийство тиммейта игра снимает штраф ($300, параметр TK_PENALTY), в чат сервера уходит сообщение [TK].
+     - На фоне табло результата картинка карты (скачивается автоматически, можно положить свою в папку maps/).
+     - Сообщения в игровой чат сервера на русском теперь отправляются корректно (UTF-8).
+v47: на табло результата у каждого игрока видно убийства (K), смерти (D) и K/D.
+v46: команды /match stop, /match stat, /profile, /mute, /unmute, /clan (create, accept, info, invite,
      kick, leave, list, menu), /clearrole. Статистика матчей, кланы и ELO входят в бэкап.
+     RCON_PASSWORD не хранится в коде: задайте его в Render -> Environment.
 """
-print("▶ bot.py v47 загружается...", flush=True)
+print("▶ bot.py v48 загружается...", flush=True)
 import asyncio
 from collections import deque
 import io
@@ -84,6 +89,13 @@ AUTO_START = os.getenv("AUTO_START", "1") == "1"            # 0 = выключи
 AUTO_START_DELAY = 15  # когда все зашли на сервер: разминка 15 сек, потом матч стартует сам
 WARMUP_SECONDS = int(os.getenv("WARMUP_SECONDS", "240"))     # разминка 4 минуты, потом матч стартует принудительно
 
+# Огонь по своим (friendly fire) только от гранат и молотова; пули своих не ранят.
+# За убийство тиммейта игра сама снимает штраф TK_PENALTY долларов с убийцы.
+GRENADE_FF = os.getenv("GRENADE_FF", "1") == "1"            # 0 = не трогать настройки friendly fire на сервере
+TK_PENALTY = int(os.getenv("TK_PENALTY", "300"))            # штраф в $ за убийство тиммейта
+FF_GRENADE = os.getenv("FF_GRENADE", "0.85")                # доля урона гранаты по своим (0..1)
+FF_OTHER = os.getenv("FF_OTHER", "0.4")                     # доля урона молотова/прочего по своим (0..1)
+
 # Канал для результатов матчей (0 = бот сам найдёт канал, в названии которого есть "результаты")
 RESULTS_CHANNEL = int(os.getenv("RESULTS_CHANNEL_ID", "1565444339084038314"))
 
@@ -95,6 +107,14 @@ DB_PATH = os.getenv("DB_PATH", "freepick.db")
 
 # Папка для демо матчей (на Render без диска файлы стираются при деплое; с диском: DEMO_DIR=/data/demos)
 DEMO_DIR = os.getenv("DEMO_DIR", "demos")
+
+# Картинки карт для фона табло. Свою картинку можно положить в папку maps/ (de_dust2.png / .jpg) — она в приоритете.
+MAP_DIR = os.getenv("MAP_DIR", "maps")
+MAP_IMAGE_URLS = [u.strip() for u in os.getenv("MAP_IMAGE_URLS", "").split("|") if u.strip()] or [
+    "https://raw.githubusercontent.com/ghostcap-gaming/cs2-map-images/main/cs2/{map}.png",
+    "https://raw.githubusercontent.com/DigitalFriends/cs2-map-images/main/cs2/{map}.png",
+    "https://raw.githubusercontent.com/MurkyYT/cs2-map-icons/main/images/thumbs/{map}_1_png.png",
+]
 
 MAPS = ["de_anubis", "de_mirage", "de_inferno", "de_nuke",
         "de_ancient", "de_dust2", "de_overpass", "de_cache"]
@@ -332,11 +352,36 @@ last_round: dict[int, dict] = {}   # match_id -> последнее событи
 event_log = deque(maxlen=12)       # последние события MatchZy (для /fp_diag)
 events_seen: set[int] = set()      # match_id, от которых сервер уже присылал события (значит, remote log настроен)
 snapshots: dict[int, dict] = {}  # match_id -> {steamid64: (игрок, команда)}: чтобы результат пришёл даже после сброса
-live_stats: dict[int, dict] = {}   # match_id -> {steamid64: {"k","d","a","hs"}}: убийства/смерти, посчитанные по player_death
+live_stats: dict[int, dict] = {}   # match_id -> {steamid64: {"k","d","a","hs","tk"}}: убийства/смерти, посчитанные по player_death
+death_events: dict[int, int] = {}  # match_id -> сколько событий player_death пришло (для /fp_diag)
+
+GRENADE_WORDS = ("hegrenade", "grenade", "molotov", "incgrenade", "incendiary", "inferno")
+
+
+def weapon_name(data: dict) -> str:
+    w = data.get("weapon")
+    if isinstance(w, dict):
+        w = w.get("name") or w.get("id") or ""
+    return str(w or "").lower()
+
+
+def sid_of(p) -> str:
+    sid = str((p or {}).get("steamid", "") or "") if isinstance(p, dict) else ""
+    return sid if sid and sid != "0" else ""
+
+
+def is_grenade_tk(data: dict) -> bool:
+    """Игрок убил тиммейта гранатой или молотовом."""
+    if not data.get("friendly_fire"):
+        return False
+    atk, vic = sid_of(data.get("attacker")), sid_of(data.get("player"))
+    if not atk or atk == vic:
+        return False
+    return any(w in weapon_name(data) for w in GRENADE_WORDS)
 
 
 def tally_death(data: dict):
-    """Считает убийства, смерти, помощи и хедшоты по событию player_death (запасной источник статистики)."""
+    """Считает убийства, смерти, помощи, хедшоты и убийства тиммейтов по событию player_death."""
     try:
         mid = int(data.get("matchid"))
     except (TypeError, ValueError):
@@ -344,20 +389,19 @@ def tally_death(data: dict):
     t = live_stats.setdefault(mid, {})
 
     def slot(sid):
-        return t.setdefault(str(sid), {"k": 0, "d": 0, "a": 0, "hs": 0})
-
-    def sid_of(p):
-        sid = str((p or {}).get("steamid", "") or "")
-        return sid if sid and sid != "0" else ""
+        return t.setdefault(str(sid), {"k": 0, "d": 0, "a": 0, "hs": 0, "tk": 0})
 
     victim, attacker = sid_of(data.get("player")), sid_of(data.get("attacker"))
     if victim:
         slot(victim)["d"] += 1
     suicide = bool(data.get("suicide")) or (attacker and attacker == victim)
-    if attacker and not suicide and not data.get("friendly_fire"):
-        slot(attacker)["k"] += 1
-        if data.get("headshot"):
-            slot(attacker)["hs"] += 1
+    if attacker and not suicide:
+        if data.get("friendly_fire"):
+            slot(attacker)["tk"] += 1   # убийство тиммейта: в киллы не идёт
+        else:
+            slot(attacker)["k"] += 1
+            if data.get("headshot"):
+                slot(attacker)["hs"] += 1
     asst = data.get("assist")
     if isinstance(asst, dict) and not asst.get("friendly_fire"):
         ap = sid_of(asst.get("player") if isinstance(asst.get("player"), dict) else asst)
@@ -365,20 +409,29 @@ def tally_death(data: dict):
             slot(ap)["a"] += 1
 
 
+def _server_has_stats(last: dict) -> bool:
+    for n in (1, 2):
+        for p in (last.get(f"team{n}") or {}).get("players") or []:
+            st = p.get("stats") or {}
+            if st.get("kills") or st.get("deaths") or st.get("damage"):
+                return True
+    return False
+
+
 def build_from_tally(mid: int, players: dict, last: dict) -> dict:
-    """Если в данных сервера нет статистики игроков, берём ту, что накопили по player_death."""
+    """Если сервер не прислал статистику игроков (или она пустая), берём ту, что накопили по player_death."""
     last = dict(last or {})
-    if (last.get("team1") or {}).get("players") or (last.get("team2") or {}).get("players"):
+    if _server_has_stats(last):
         return last  # у сервера есть своя статистика (с уроном), её не трогаем
     tally = live_stats.get(mid)
     if not tally:
         return last
     teams = {1: [], 2: []}
     for sid, (m, n) in players.items():
-        st = tally.get(str(sid), {"k": 0, "d": 0, "a": 0, "hs": 0})
+        st = tally.get(str(sid), {})
         teams[n].append({"steamid": str(sid), "name": m.display_name,
-                         "stats": {"kills": st["k"], "deaths": st["d"], "assists": st["a"],
-                                   "damage": 0, "headshot_kills": st["hs"]}})
+                         "stats": {"kills": st.get("k", 0), "deaths": st.get("d", 0), "assists": st.get("a", 0),
+                                   "damage": 0, "headshot_kills": st.get("hs", 0), "team_kills": st.get("tk", 0)}})
     for n in (1, 2):
         t = dict(last.get(f"team{n}") or {})
         t["players"] = teams[n]
@@ -690,6 +743,20 @@ class VetoView(discord.ui.View):
 
 
 # ----------------------------- МАТЧ ----------------------------------
+def ff_cvars() -> dict:
+    """Настройки friendly fire: пули своих не ранят, гранаты и молотов ранят, за убийство тиммейта штраф."""
+    if not GRENADE_FF:
+        return {}
+    return {
+        "mp_friendlyfire": "1",
+        "ff_damage_reduction_bullets": "0",
+        "ff_damage_reduction_grenade": str(FF_GRENADE),
+        "ff_damage_reduction_other": str(FF_OTHER),
+        "mp_playercashawards": "1",
+        "cash_player_killed_teammate": f"-{TK_PENALTY}",
+    }
+
+
 def build_match(match_id: int, teams: list[list[discord.Member]], map_name: str) -> dict:
     def team(t):
         name = f"team_{t[0].display_name}" if t else "team_test"
@@ -706,26 +773,32 @@ def build_match(match_id: int, teams: list[list[discord.Member]], map_name: str)
         "clinch_series": True,
         "team1": team(teams[0]),
         "team2": team(teams[1]),
-        "cvars": {"hostname": "VIBE MIX FreePick"},
+        "cvars": {"hostname": "VIBE MIX FreePick", **ff_cvars()},
     }
 
 
-def _rcon_run(c, cmd: str):
-    """Ответ CS2 приходит в UTF-8: читаем его побайтно (latin-1) и затем декодируем как UTF-8,
-    чтобы не было ни ошибок декодирования, ни кракозябр."""
+def _fix_text(s: str) -> str:
+    """Ответ CS2 приходит в UTF-8, а читается как latin-1: возвращаем нормальные буквы."""
     try:
-        resp = c.run(cmd, encoding="latin-1")
+        return s.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return s
+
+
+def _rcon_run(c, cmd: str):
+    """Команды только из ASCII отправляем как latin-1, команды с русским текстом (say ...) как UTF-8.
+    Ответ сервера (UTF-8) читаем побайтно и декодируем, чтобы не было ни ошибок, ни кракозябр."""
+    enc = "latin-1" if cmd.isascii() else "utf-8"
+    try:
+        resp = c.run(cmd, encoding=enc)
     except TypeError:  # старая версия библиотеки без параметра encoding
         try:
             return c.run(cmd)
-        except UnicodeDecodeError:
+        except (UnicodeDecodeError, UnicodeEncodeError):
             return ""
     except UnicodeDecodeError:
         return ""
-    try:
-        return resp.encode("latin-1").decode("utf-8")
-    except (UnicodeEncodeError, UnicodeDecodeError):
-        return resp
+    return _fix_text(resp) if enc == "latin-1" else resp
 
 
 def load_on_server(match_id: int):
@@ -743,8 +816,9 @@ def load_on_server(match_id: int):
         f'matchzy_demo_upload_url "{WEB_BASE_URL}/demo"',
         'matchzy_demo_upload_header_key "Authorization"',
         f'matchzy_demo_upload_header_value "{EVENT_TOKEN}"',
-        f'matchzy_loadmatch_url "{WEB_BASE_URL}/match/{match_id}.json"',
     ]
+    cmds += [f"{k} {v}" for k, v in ff_cvars().items()]  # огонь по своим от гранат + штраф за убийство тиммейта
+    cmds.append(f'matchzy_loadmatch_url "{WEB_BASE_URL}/match/{match_id}.json"')
     with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
         _rcon_run(c, "get5_endmatch")  # сбросить прошлый матч, иначе MatchZy не загрузит новый
         time.sleep(1)
@@ -767,6 +841,7 @@ def set_event_cvars():
         'matchzy_demo_path "MatchZy/"',
         'matchzy_demo_name_format "{TIME}_{MATCH_ID}_{MAP}"',
     ]
+    cmds += [f"{k} {v}" for k, v in ff_cvars().items()]  # MatchZy мог вернуть свои значения при загрузке матча
     with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
         for cmd in cmds:
             _rcon_run(c, cmd)
@@ -832,6 +907,23 @@ def rcon_raw(cmd: str) -> str:
     """Блокирующая функция: выполняет любую RCON-команду и возвращает ответ (для /fp_diag)."""
     with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
         return _rcon_run(c, cmd) or ""
+
+
+def rcon_say(text: str):
+    """Блокирующая функция: сообщение в общий чат сервера."""
+    text = re.sub(r"[;\"\r\n]", " ", text)[:200]
+    with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
+        _rcon_run(c, f"say {text}")
+
+
+async def announce_tk(data: dict):
+    """Игрок убил тиммейта гранатой/молотовом: пишем об этом в чат сервера (штраф снимает сама игра)."""
+    atk = (data.get("attacker") or {}).get("name") or "?"
+    vic = (data.get("player") or {}).get("name") or "?"
+    try:
+        await asyncio.to_thread(rcon_say, f"[TK] {atk} убил тиммейта {vic} гранатой: штраф -${TK_PENALTY}")
+    except Exception:
+        log.exception("Не удалось отправить сообщение о TK на сервер")
 
 
 # ----------------------------- ВОЙСЫ КОМАНД --------------------------
@@ -1586,6 +1678,7 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
         S.match_players = {get_steam(m.id): (m, n) for n, t in enumerate(teams, 1) for m in t}
         S.captain_ids = {t[0].id for t in teams if t}
         snapshots[match_id] = dict(S.match_players)
+        live_stats.pop(match_id, None)
         S.live = False
         S.ever_live = False
         S.match_id = match_id
@@ -1612,6 +1705,7 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
         asyncio.create_task(watch_match(match_id))
         asyncio.create_task(warmup_timer(match_id))
         asyncio.create_task(verify_load(match_id, load_resp))
+        asyncio.create_task(ensure_map_image(map_name))  # заранее готовим картинку карты для табло результата
 
         connect = f"connect {SERVER_IP}:{SERVER_PORT}"
         if SERVER_PASSWORD:
@@ -1624,6 +1718,10 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
                     value="Заходите с **привязанного Steam-аккаунта**: команда выдаётся автоматически по SteamID. "
                           "Матч стартует сам, когда все зайдут на сервер. Подробности пришли в личные сообщения.",
                     inline=False)
+        if GRENADE_FF:
+            e.add_field(name="Гранаты и молотов ранят своих",
+                        value=f"Пули по своим не проходят. Убил тиммейта гранатой или молотовом: штраф **-${TK_PENALTY}**.",
+                        inline=False)
         e.add_field(name="Подключение (консоль CS2)", value=f"```{connect}```", inline=False)
         link_view = MatchView()
         await track_send(channel, embed=e, view=link_view)
@@ -1697,30 +1795,70 @@ async def ensure_fonts():
             log.warning("Не удалось скачать шрифт %s (задай FONT_PATH / FONT_PATH_BOLD)", kind)
 
 
+# ---- картинки карт для фона табло
+def find_map_image(map_name: str):
+    for ext in ("png", "jpg", "jpeg", "webp"):
+        path = os.path.join(MAP_DIR, f"{map_name}.{ext}")
+        if os.path.exists(path):
+            return path
+    return None
+
+
+async def ensure_map_image(map_name: str):
+    """Возвращает путь к картинке карты. Если её нет в папке maps/, скачивает из открытых репозиториев."""
+    path = find_map_image(map_name)
+    if path or not map_name or map_name == "?":
+        return path
+    os.makedirs(MAP_DIR, exist_ok=True)
+    for tpl in MAP_IMAGE_URLS:
+        url = tpl.format(map=map_name)
+        try:
+            async with aiohttp.ClientSession() as ses:
+                async with ses.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
+                    if r.status != 200:
+                        continue
+                    body = await r.read()
+            if len(body) > 8_000_000 or not (body.startswith(b"\x89PNG") or body.startswith(b"\xff\xd8")):
+                continue  # это не картинка
+            ext = "png" if body.startswith(b"\x89PNG") else "jpg"
+            path = os.path.join(MAP_DIR, f"{map_name}.{ext}")
+            with open(path, "wb") as f:
+                f.write(body)
+            log.info("Картинка карты %s скачана: %s", map_name, url)
+            return path
+        except Exception:
+            log.warning("Не удалось скачать картинку карты %s с %s", map_name, url)
+    log.warning("Картинка карты %s не найдена: положите её в папку %s/ (например %s.png)", map_name, MAP_DIR, map_name)
+    return None
+
+
+async def prefetch_map_images():
+    for m in MAPS:
+        await ensure_map_image(m)
+
+
 def render_result_card(map_name: str, s1, s2, team_rows: dict, mvp: dict,
                        mvp_avatar: bytes | None, names: tuple) -> bytes:
-    """Рисует картинку-табло матча. У каждого игрока три колонки: K (убийства), D (смерти), K/D.
+    """Рисует картинку-табло матча на фоне картинки карты. У каждого игрока три колонки: K (убийства), D (смерти), K/D.
     Блокирующая: вызывать через to_thread."""
     from PIL import Image, ImageDraw, ImageFilter, ImageEnhance
 
     W, H = 1300, 540
     BLUE, ORANGE, GOLD = (76, 142, 255), (255, 176, 32), (255, 205, 60)
 
-    # --- фон: картинка карты (maps/de_xxx.jpg) или тёмный градиент
+    # --- фон: картинка карты (maps/de_xxx.png|jpg) или тёмный градиент
     bg = None
-    for ext in ("jpg", "jpeg", "png", "webp"):
-        path = f"maps/{map_name}.{ext}"
-        if os.path.exists(path):
-            try:
-                src = Image.open(path).convert("RGB")
-                k = max(W / src.width, H / src.height)
-                src = src.resize((int(src.width * k) + 1, int(src.height * k) + 1))
-                l, t = (src.width - W) // 2, (src.height - H) // 2
-                bg = src.crop((l, t, l + W, t + H)).filter(ImageFilter.GaussianBlur(3))
-                bg = ImageEnhance.Brightness(bg).enhance(0.42)
-            except Exception:
-                bg = None
-            break
+    path = find_map_image(map_name)
+    if path:
+        try:
+            src = Image.open(path).convert("RGB")
+            k = max(W / src.width, H / src.height)
+            src = src.resize((int(src.width * k) + 1, int(src.height * k) + 1))
+            l, t = (src.width - W) // 2, (src.height - H) // 2
+            bg = src.crop((l, t, l + W, t + H)).filter(ImageFilter.GaussianBlur(2))
+            bg = ImageEnhance.Brightness(bg).enhance(0.62)
+        except Exception:
+            bg = None
     if bg is None:
         bg = Image.new("RGB", (W, H))
         px = ImageDraw.Draw(bg)
@@ -1735,14 +1873,14 @@ def render_result_card(map_name: str, s1, s2, team_rows: dict, mvp: dict,
     panels = {1: 30, 2: W - 30 - PW}
     colors = {1: BLUE, 2: ORANGE}
     for n, x0 in panels.items():
-        od.rounded_rectangle((x0, PY0, x0 + PW, PY1), 18, fill=(8, 12, 26, 195), outline=colors[n] + (160,), width=2)
-        od.rounded_rectangle((x0 + 90, PY0 + 12, x0 + PW - 90, PY0 + 56), 10, fill=(6, 10, 22, 220),
+        od.rounded_rectangle((x0, PY0, x0 + PW, PY1), 18, fill=(8, 12, 26, 175), outline=colors[n] + (170,), width=2)
+        od.rounded_rectangle((x0 + 90, PY0 + 12, x0 + PW - 90, PY0 + 56), 10, fill=(6, 10, 22, 225),
                              outline=colors[n] + (255,), width=2)
     img = Image.alpha_composite(img, ov)
     d = ImageDraw.Draw(img)
 
     f_head, f_name, f_stat, f_lab = get_font(26), get_font(24), get_font(23), get_font(17)
-    gray, white = (200, 206, 220), (245, 247, 252)
+    gray, white = (210, 215, 228), (245, 247, 252)
     GOOD, BAD = (110, 225, 140), (255, 120, 120)
     COLS = (170, 105, 22)  # правый край колонок K, D, K/D (отступ от правого края панели)
 
@@ -1771,7 +1909,7 @@ def render_result_card(map_name: str, s1, s2, team_rows: dict, mvp: dict,
                 d.text((x0 + PW - COLS[0], cy), str(r["k"]), font=f_stat, fill=white, anchor="rm")
                 d.text((x0 + PW - COLS[1], cy), str(r["d"]), font=f_stat, fill=gray, anchor="rm")
                 d.text((x0 + PW - COLS[2], cy), f"{kd:.2f}", font=f_stat, fill=GOOD if kd >= 1 else BAD, anchor="rm")
-            d.line((x0 + 18, y + 66, x0 + PW - 18, y + 66), fill=(60, 70, 96), width=1)
+            d.line((x0 + 18, y + 66, x0 + PW - 18, y + 66), fill=(70, 80, 106), width=1)
             y += 70
 
     # --- центр: аватар MVP, счёт, карта
@@ -1864,7 +2002,7 @@ def apply_elo(players: dict, win_n: int) -> dict:
 
 
 async def post_result(data: dict, players: dict, match_id, note: str = ""):
-    """Публикует итог матча в канал результатов: карточка-табло + MVP + статистика (K/D/A, K/D, ADR, HS) и ELO
+    """Публикует итог матча в канал результатов: карточка-табло на фоне карты + MVP + статистика (K/D/A, K/D, ADR, HS) и ELO
     каждого игрока + демо. Без статистики сервера пишет простой список составов (с текущим ELO игроков).
     note: непустая строка = победитель неизвестен (ELO не меняется)."""
     try:
@@ -1886,6 +2024,7 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
     cfg = S.matches.get(mid) or {}
     raw_map = (cfg.get("maplist") or ["?"])[0]
     total_rounds = (s1 or 0) + (s2 or 0)
+    await ensure_map_image(raw_map)  # картинка карты для фона табло
 
     # ELO меняем только если известен победитель
     changes = {}
@@ -1907,6 +2046,7 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
                 "member": member, "k": k, "d": d, "a": a,
                 "adr": round(st.get("damage", 0) / rounds),
                 "hs": round(st.get("headshot_kills", 0) * 100 / k) if k else 0,
+                "tk": st.get("team_kills", 0) or 0,
             })
         rows.sort(key=lambda r: (-r["k"], -r["adr"]))
         team_rows[n] = rows
@@ -1968,7 +2108,8 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
                 who = r["member"].mention if r["member"] else r["name"]
                 kd = r["k"] / r["d"] if r["d"] else float(r["k"])
                 lines_t.append(f"{who} `{r['k']}/{r['d']}/{r['a']}` · K/D {kd:.2f}"
-                               + (f" · ADR {r['adr']}" if r["adr"] else "") + f" · HS {r['hs']}%{tag}")
+                               + (f" · ADR {r['adr']}" if r["adr"] else "") + f" · HS {r['hs']}%"
+                               + (f" · TK {r['tk']}" if r.get("tk") else "") + tag)
             if not lines_t:  # статистики нет: показываем состав и ELO
                 lines_t = [m.mention + (f" · **{changes[m.id][1]}** ({changes[m.id][1] - changes[m.id][0]:+d} ELO)"
                                         if m.id in changes else "")
@@ -2449,15 +2590,30 @@ async def h_events(req: web.Request):
     except (TypeError, ValueError):
         pass
     same = S.phase == "playing" and str(data.get("matchid")) == str(S.match_id)
-    event_log.append(f"{time.strftime('%H:%M:%S')} {ev} match={data.get('matchid')} {'ok' if same else 'не текущий матч'}")
+    if ev != "player_death":  # смерти приходят очень часто, в журнал диагностики их не пишем
+        event_log.append(f"{time.strftime('%H:%M:%S')} {ev} match={data.get('matchid')} {'ok' if same else 'не текущий матч'}")
     if ev == "series_end" and same:
         asyncio.create_task(reset_to_queue())
-    elif same and ev == "going_live":
-        S.live = True            # матч пошёл (после ножей): теперь выход игрока = перерыв
-        S.ever_live = True       # матч реально стартовал: если его сбросят вручную, результат опубликуем
+    elif ev == "going_live":
+        try:
+            gmid = int(data.get("matchid"))
+        except (TypeError, ValueError):
+            gmid = None
+        if gmid in snapshots:
+            live_stats[gmid] = {}    # всё, что накопилось до старта (нож, разминка), отбрасываем
+        if same:
+            S.live = True            # матч пошёл (после ножей): теперь выход игрока = перерыв
+            S.ever_live = True       # матч реально стартовал: если его сбросят вручную, результат опубликуем
     elif ev == "player_death":
-        if same and S.live:      # считаем убийства/смерти только в живой фазе (без ножей и разминки)
+        try:
+            dmid = int(data.get("matchid"))
+        except (TypeError, ValueError):
+            dmid = None
+        if dmid in snapshots:        # считаем смерти любого нашего матча, не зависим от S.live/same
+            death_events[dmid] = death_events.get(dmid, 0) + 1
             tally_death(data)
+            if same and is_grenade_tk(data):
+                asyncio.create_task(announce_tk(data))
     elif ev == "round_end":
         try:
             if data.get("team1"):
@@ -2763,6 +2919,7 @@ class FreePickBot(commands.Bot):
         self.add_view(VerifyView())
         self.add_view(BanLogView())
         await ensure_fonts()  # шрифт с кириллицей для картинки результата
+        asyncio.create_task(prefetch_map_images())  # картинки карт для фона табло
 
         os.makedirs(DEMO_DIR, exist_ok=True)
         app = web.Application(client_max_size=1024 ** 3)  # демо CS2 может весить сотни МБ
@@ -3004,11 +3161,17 @@ async def fp_diag_cmd(i: discord.Interaction):
     await i.response.defer(ephemeral=True)
     parts = [f"Сервер: `{SERVER_IP}:{SERVER_PORT}`, RCON_PASSWORD: {'задан' if RCON_PASSWORD else 'НЕ ЗАДАН'}",
              f"Матч: `{S.match_id}`, фаза `{S.phase}`, игроков матча {len(S.match_players)}"]
+    if S.match_id:
+        tl = live_stats.get(S.match_id) or {}
+        parts.append(f"Статистика по player_death: событий {death_events.get(S.match_id, 0)}, "
+                     f"убийств {sum(v['k'] for v in tl.values())}, смертей {sum(v['d'] for v in tl.values())}, "
+                     f"TK {sum(v.get('tk', 0) for v in tl.values())}")
     parts.append("**События MatchZy (последние)**\n```" + ("\n".join(list(event_log)[-8:]) or "ничего не приходило") + "```")
-    for cv in ("matchzy_remote_log_url", "matchzy_demo_upload_url"):
+    for cv in ("matchzy_remote_log_url", "matchzy_demo_upload_url", "mp_friendlyfire",
+               "ff_damage_reduction_bullets", "cash_player_killed_teammate"):
         try:
             resp = await asyncio.to_thread(rcon_raw, cv)
-            parts.append(f"`{cv}`: `{resp.strip()[:110] or '(пусто)'}`")
+            parts.append(f"`{cv}`: `{resp.strip()[:90] or '(пусто)'}`")
         except Exception as exc:
             parts.append(f"`{cv}`: ошибка `{type(exc).__name__}`")
     for cmd in ("status", "get5_status"):
@@ -3938,8 +4101,9 @@ def main():
     say(f"▶ TEST_MODE={TEST_MODE}, QUEUE_VC_ID={QUEUE_VC}, GUILD_ID={GUILD_ID}")
     say(f"▶ Авто-бан: {'вкл' if AUTOBAN else 'выкл'}")
     say(f"▶ Автостарт: {'вкл' if AUTO_START else 'выкл'}, разминка {WARMUP_SECONDS} сек")
+    say(f"▶ Гранаты ранят своих: {'вкл, штраф за убийство тиммейта $' + str(TK_PENALTY) if GRENADE_FF else 'выкл'}")
     say(f"▶ FACEIT: {'ключ задан' if FACEIT_API_KEY else 'FACEIT_API_KEY не задан (FACEIT-роли выключены)'}")
-    say(f"▶ Демо сохраняются в: {DEMO_DIR}")
+    say(f"▶ Демо сохраняются в: {DEMO_DIR}, картинки карт: {MAP_DIR}")
     if not token:
         say("❌ Не задана переменная DISCORD_TOKEN (Render -> Environment)")
         raise SystemExit(1)
