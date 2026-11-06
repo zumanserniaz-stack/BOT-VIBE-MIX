@@ -3058,15 +3058,48 @@ async def fp_steam_cmd(i: discord.Interaction):
 @bot.tree.command(name="fp_link", description="(админ) Привязать SteamID64 игроку вручную")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
+@app_commands.describe(member="Кому привязать Steam",
+                       steamid64="SteamID64 (17 цифр, начинается с 7656119)",
+                       transfer="Steam уже привязан к другому Discord (потерян): перенести его сюда вместе с ELO")
 @admin
-async def fp_link_cmd(i: discord.Interaction, member: discord.Member, steamid64: str):
+async def fp_link_cmd(i: discord.Interaction, member: discord.Member, steamid64: str, transfer: bool = False):
     steamid64 = steamid64.strip()
     if not re.fullmatch(r"7656119\d{10}", steamid64):
         return await i.response.send_message("Неверный SteamID64.", ephemeral=True)
     row = db.execute("SELECT discord_id FROM links WHERE steamid64=?", (steamid64,)).fetchone()
-    if row and row[0] != member.id:
-        return await i.response.send_message("Этот SteamID уже привязан к другому аккаунту.", ephemeral=True)
+    old_owner = row[0] if row and row[0] != member.id else None
+    if old_owner and not transfer:
+        return await i.response.send_message(
+            f"Этот SteamID уже привязан к <@{old_owner}> (`{old_owner}`).\n"
+            "Если тот Discord-аккаунт потерян, повторите команду с параметром `transfer: True`: "
+            "привязка и ELO перейдут к новому аккаунту.",
+            ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+    if old_owner and (old_owner in S.active_ids or member.id in S.active_ids):
+        return await i.response.send_message(
+            "Сейчас идёт драфт или матч с участием одного из аккаунтов. Повторите после матча.", ephemeral=True)
     await i.response.defer(ephemeral=True)
+    moved = ""
+    if old_owner:
+        db.execute("DELETE FROM links WHERE discord_id=?", (old_owner,))
+        old_elo = db.execute("SELECT 1 FROM elo WHERE discord_id=?", (old_owner,)).fetchone()
+        new_elo = db.execute("SELECT 1 FROM elo WHERE discord_id=?", (member.id,)).fetchone()
+        if old_elo and not new_elo:  # ELO и статистика переходят к новому аккаунту
+            db.execute("UPDATE elo SET discord_id=? WHERE discord_id=?", (member.id, old_owner))
+            try:
+                db.execute("UPDATE match_stats SET discord_id=? WHERE discord_id=?", (member.id, old_owner))
+            except sqlite3.IntegrityError:
+                log.warning("Не удалось перенести match_stats с %s на %s", old_owner, member.id)
+            moved = " ELO и статистика перенесены."
+        old_member = i.guild.get_member(old_owner)  # старый аккаунт ещё на сервере: снимаем роли
+        if old_member:
+            if VERIFIED_ROLE:
+                role = i.guild.get_role(VERIFIED_ROLE)
+                if role and role in old_member.roles:
+                    try:
+                        await old_member.remove_roles(role, reason="Steam перенесён на другой аккаунт")
+                    except discord.HTTPException:
+                        pass
+            await remove_faceit_roles(old_member)
     db.execute("INSERT OR REPLACE INTO links VALUES (?, ?)", (member.id, steamid64))
     db.commit()
     schedule_backup()
@@ -3074,7 +3107,9 @@ async def fp_link_cmd(i: discord.Interaction, member: discord.Member, steamid64:
     fc = await apply_faceit(member, steamid64)
     await i.followup.send(
         f"✅ {member.mention}: Steam `{steamid64}` привязан."
-        + (f" FACEIT LVL {fc['level']}." if fc else ""), ephemeral=True)
+        + (f" Снят с <@{old_owner}>." if old_owner else "") + moved
+        + (f" FACEIT LVL {fc['level']}." if fc else ""),
+        ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
 @bot.tree.command(name="fp_unlink", description="(админ) Сбросить привязку Steam игрока")
