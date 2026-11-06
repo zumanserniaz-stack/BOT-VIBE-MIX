@@ -6,6 +6,10 @@ VIBE MIX FreePick 5x5: очередь -> готовность -> капитан�
 При Steam-верификации бот определяет FACEIT-уровень игрока и выдаёт роль «FACEIT LVL n».
 Результат матча: табло (K / D / K/D каждого игрока) на фоне картинки карты + ELO (+30 / -20) + кнопка «Скачать демо».
 
+v50: - GOTV включается автоматически: перед загрузкой матча бот ставит tv_enable 1 и перезагружает карту (changelevel),
+       иначе CS2 не применяет tv_enable и демо не записывается.
+     - Статистика игроков: если в map_result её нет, берётся из последнего round_end, затем из player_death.
+     - Диагностика: счётчик событий MatchZy в /fp_diag и RAW-логи первых round_end / player_death.
 v49: - В центре табло: аватар и ник MVP (игрок с наибольшим числом убийств), надпись «MVP» вместо «ИТОГ».
      - K/D: статистика по player_death сбрасывается на going_live только один раз (раньше повторный going_live её стирал).
      - Демо: включается GOTV (tv_enable), запрос на /demo пишется в лог, match id берётся и из имени файла,
@@ -21,7 +25,7 @@ v47: на табло результата у каждого игрока вид�
 v46: команды /match stop, /match stat, /profile, /mute, /unmute, /clan (create, accept, info, invite,
      kick, leave, list, menu), /clearrole. Статистика матчей, кланы и ELO входят в бэкап.
 """
-print("▶ bot.py v49 загружается...", flush=True)
+print("▶ bot.py v50 загружается...", flush=True)
 import asyncio
 from collections import deque
 import io
@@ -353,6 +357,7 @@ class State:
 
 S = State()
 last_round: dict[int, dict] = {}   # match_id -> последнее событие round_end (там статистика игроков)
+event_counts: dict = {}            # название события MatchZy -> сколько раз пришло (для /fp_diag)
 event_log = deque(maxlen=12)       # последние события MatchZy (для /fp_diag)
 events_seen: set[int] = set()      # match_id, от которых сервер уже присылал события (значит, remote log настроен)
 snapshots: dict[int, dict] = {}  # match_id -> {steamid64: (игрок, команда)}: чтобы результат пришёл даже после сброса
@@ -807,8 +812,10 @@ def _rcon_run(c, cmd: str):
     return _fix_text(resp) if enc == "latin-1" else resp
 
 
-def load_on_server(match_id: int):
+def load_on_server(match_id: int, map_name: str = ""):
     """Блокирующая функция: отправляет команды на CS2-сервер по RCON.
+    Сначала включает GOTV и перезагружает карту (CS2 применяет tv_enable только при смене карты),
+    потом задаёт настройки и грузит матч.
     Значения со ссылками обязательно в кавычках: иначе консоль CS2 считает «//» комментарием и режет URL до «https:»."""
     cmds = [
         f'matchzy_remote_log_url "{WEB_BASE_URL}/events"',
@@ -828,10 +835,33 @@ def load_on_server(match_id: int):
     ]
     cmds += [f"{k} {v}" for k, v in ff_cvars().items()]  # огонь по своим от гранат + штраф за убийство тиммейта
     cmds.append(f'matchzy_loadmatch_url "{WEB_BASE_URL}/match/{match_id}.json"')
+
+    # 1) сбросить прошлый матч (иначе MatchZy не загрузит новый) и включить GOTV
     with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
-        _rcon_run(c, "get5_endmatch")  # сбросить прошлый матч, иначе MatchZy не загрузит новый
+        _rcon_run(c, "get5_endmatch")
         time.sleep(1)
-        last = ""
+        _rcon_run(c, "tv_enable 1")
+        _rcon_run(c, "tv_delay 0")
+
+    # 2) перезагрузка карты, чтобы GOTV реально включился
+    if map_name and map_name != "?":
+        try:
+            with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
+                _rcon_run(c, f"changelevel {map_name}")
+        except Exception:
+            pass  # сервер может оборвать соединение при смене карты
+        time.sleep(10)
+        for _ in range(10):  # ждём, пока RCON снова ответит
+            try:
+                with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=5) as c:
+                    _rcon_run(c, "status")
+                break
+            except Exception:
+                time.sleep(3)
+
+    # 3) настройки и загрузка матча
+    last = ""
+    with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
         for cmd in cmds:
             last = _rcon_run(c, cmd) or ""
     return last  # ответ сервера на matchzy_loadmatch_url (последняя команда)
@@ -1695,7 +1725,7 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
         S.match_id = match_id
         S.connected = set()
         S.auto_started = False
-        load_resp = await asyncio.to_thread(load_on_server, match_id)
+        load_resp = await asyncio.to_thread(load_on_server, match_id, map_name)
         log.info("Ответ сервера на loadmatch: %r", (load_resp or "")[:300])
 
         # честная проверка: если сервер матч не принял, не говорим «Матч готов»
@@ -2033,6 +2063,17 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
         log.warning("Канал результатов не найден (задай RESULTS_CHANNEL_ID)")
         posted_results.discard(mid)
         return
+    # у map_result может не быть статистики игроков: берём её из последнего round_end
+    if not _server_has_stats(data):
+        lr = last_round.get(mid) or {}
+        if _server_has_stats(lr):
+            data = dict(data)
+            for _n in ("team1", "team2"):
+                _t = dict(data.get(_n) or {})
+                _t["players"] = (lr.get(_n) or {}).get("players") or []
+                if _t.get("score") is None:
+                    _t["score"] = (lr.get(_n) or {}).get("score")
+                data[_n] = _t
     data = build_from_tally(mid, players, data)  # если у сервера нет статистики игроков, берём свою (по player_death)
     t1, t2 = data.get("team1") or {}, data.get("team2") or {}
     s1, s2 = t1.get("score"), t2.get("score")
@@ -2610,6 +2651,9 @@ async def h_events(req: web.Request):
         return web.Response(status=400)
     log.info("MatchZy event: %s (matchid=%s)", data.get("event"), data.get("matchid"))
     ev = data.get("event")
+    event_counts[ev] = event_counts.get(ev, 0) + 1  # счётчик для /fp_diag
+    if ev in ("player_death", "round_end") and event_counts[ev] == 1:
+        log.info("RAW %s: %s", ev, json.dumps(data, ensure_ascii=False)[:700])  # формат события, чтобы подогнать разбор
     try:
         events_seen.add(int(data.get("matchid")))
     except (TypeError, ValueError):
@@ -3227,6 +3271,7 @@ async def fp_diag_cmd(i: discord.Interaction):
         parts.append(f"Статистика по player_death: событий {death_events.get(S.match_id, 0)}, "
                      f"убийств {sum(v['k'] for v in tl.values())}, смертей {sum(v['d'] for v in tl.values())}, "
                      f"TK {sum(v.get('tk', 0) for v in tl.values())}")
+    parts.append("Счётчик событий: " + (", ".join(f"{k}={v}" for k, v in event_counts.items()) or "—"))
     parts.append("**События MatchZy (последние)**\n```" + ("\n".join(list(event_log)[-8:]) or "ничего не приходило") + "```")
     for cv in ("matchzy_remote_log_url", "matchzy_demo_upload_url", "tv_enable", "mp_friendlyfire",
                "ff_damage_reduction_bullets", "cash_player_killed_teammate"):
