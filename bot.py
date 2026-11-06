@@ -6,6 +6,12 @@ VIBE MIX FreePick 5x5: очередь -> готовность -> капитан�
 При Steam-верификации бот определяет FACEIT-уровень игрока и выдаёт роль «FACEIT LVL n».
 Результат матча: табло (K / D / K/D каждого игрока) на фоне картинки карты + ELO (+30 / -20) + кнопка «Скачать демо».
 
+v51: - Токен событий/демо принимается из заголовка Authorization (с Bearer и без) ИЛИ из ?t= в адресе:
+       раньше, если сервер не передавал заголовок, все события отклонялись и результат был пустой (0:0, прочерки).
+     - matchzy_remote_log_url и matchzy_demo_upload_url теперь с ?t=токен (запасной путь без заголовков).
+     - Ручной сброс матча: бот сначала шлёт get5_endmatch (сервер выгружает демо и последние события), потом пишет результат.
+     - Если событий нет вообще, счёт берётся у сервера через RCON (get5_status).
+     - /fp_diag показывает счётчики HTTP-запросов от сервера (принято / отклонено).
 v50: - GOTV включается автоматически: перед загрузкой матча бот ставит tv_enable 1 и перезагружает карту (changelevel),
        иначе CS2 не применяет tv_enable и демо не записывается.
      - Статистика игроков: если в map_result её нет, берётся из последнего round_end, затем из player_death.
@@ -25,7 +31,7 @@ v47: на табло результата у каждого игрока вид�
 v46: команды /match stop, /match stat, /profile, /mute, /unmute, /clan (create, accept, info, invite,
      kick, leave, list, menu), /clearrole. Статистика матчей, кланы и ELO входят в бэкап.
 """
-print("▶ bot.py v50 загружается...", flush=True)
+print("▶ bot.py v51 загружается...", flush=True)
 import asyncio
 from collections import deque
 import io
@@ -57,7 +63,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("freepick")
 
 # ----------------------------- НАСТРОЙКИ -----------------------------
-# CS2-сервер. RCON_PASSWORD ОБЯЗАТЕЛЬНО задай в Render -> Environment (в коде пароль не хранится)
+# CS2-сервер. RCON_PASSWORD ОБЯЗАТЕЛЬНО задай в Render -> Environment (лучше убрать пароль из значения по умолчанию)
 SERVER_IP = os.getenv("SERVER_IP", "45.86.81.37").strip()
 SERVER_PORT = int(os.getenv("SERVER_PORT", "55031"))
 RCON_PASSWORD = os.getenv("RCON_PASSWORD", "ArniAlash22062008Nurlan")
@@ -365,6 +371,20 @@ captains: dict[int, dict] = {}     # match_id -> {1: капитан команд
 live_stats: dict[int, dict] = {}   # match_id -> {steamid64: {"k","d","a","hs","tk"}}: убийства/смерти, посчитанные по player_death
 live_reset: set[int] = set()       # match_id, для которых статистика уже обнулена на going_live (обнуляем только один раз)
 death_events: dict[int, int] = {}  # match_id -> сколько событий player_death пришло (для /fp_diag)
+
+# счётчики HTTP-запросов от CS2-сервера (для /fp_diag): принято / отклонено из-за токена
+http_hits = {"events": 0, "events_bad": 0, "demo": 0, "demo_bad": 0}
+
+
+def token_ok(req: web.Request) -> bool:
+    """Токен принимается из заголовка Authorization (с «Bearer » или без) ИЛИ из параметра ?t= в адресе."""
+    h = (req.headers.get("Authorization") or "").strip()
+    if h.lower().startswith("bearer "):
+        h = h[7:].strip()
+    tok = EVENT_TOKEN.encode()
+    return (secrets.compare_digest(h.encode(), tok)
+            or secrets.compare_digest(req.query.get("t", "").encode(), tok))
+
 
 GRENADE_WORDS = ("hegrenade", "grenade", "molotov", "incgrenade", "incendiary", "inferno")
 
@@ -816,9 +836,10 @@ def load_on_server(match_id: int, map_name: str = ""):
     """Блокирующая функция: отправляет команды на CS2-сервер по RCON.
     Сначала включает GOTV и перезагружает карту (CS2 применяет tv_enable только при смене карты),
     потом задаёт настройки и грузит матч.
-    Значения со ссылками обязательно в кавычках: иначе консоль CS2 считает «//» комментарием и режет URL до «https:»."""
+    Значения со ссылками обязательно в кавычках: иначе консоль CS2 считает «//» комментарием и режет URL до «https:».
+    Токен дублируется в адресе (?t=): если сервер не передаст заголовок Authorization, бот всё равно примет запрос."""
     cmds = [
-        f'matchzy_remote_log_url "{WEB_BASE_URL}/events"',
+        f'matchzy_remote_log_url "{WEB_BASE_URL}/events?t={EVENT_TOKEN}"',
         'matchzy_remote_log_header_key "Authorization"',
         f'matchzy_remote_log_header_value "{EVENT_TOKEN}"',
         'matchzy_chat_prefix [{PURPLE}VIBE MIX{Default}]',
@@ -826,10 +847,11 @@ def load_on_server(match_id: int, map_name: str = ""):
         'tv_enable 1',
         'tv_delay 0',
         # запись демо: в имени файла обязательно {MATCH_ID}, по нему кнопка «Скачать демку» находит файл
+        'matchzy_demo_recording_enabled true',
         'matchzy_demo_path "MatchZy/"',
         'matchzy_demo_name_format "{TIME}_{MATCH_ID}_{MAP}"',
         # загрузка демо матча на веб-сервер бота (приходит после окончания карты)
-        f'matchzy_demo_upload_url "{WEB_BASE_URL}/demo"',
+        f'matchzy_demo_upload_url "{WEB_BASE_URL}/demo?t={EVENT_TOKEN}"',
         'matchzy_demo_upload_header_key "Authorization"',
         f'matchzy_demo_upload_header_value "{EVENT_TOKEN}"',
     ]
@@ -871,12 +893,13 @@ def set_event_cvars():
     """Блокирующая функция: заново ставит адрес для событий и загрузки демо уже ПОСЛЕ загрузки матча
     (MatchZy мог сбросить эти настройки при loadmatch). Возвращает то, что сервер отвечает на запрос remote_log_url."""
     cmds = [
-        f'matchzy_remote_log_url "{WEB_BASE_URL}/events"',
+        f'matchzy_remote_log_url "{WEB_BASE_URL}/events?t={EVENT_TOKEN}"',
         'matchzy_remote_log_header_key "Authorization"',
         f'matchzy_remote_log_header_value "{EVENT_TOKEN}"',
-        f'matchzy_demo_upload_url "{WEB_BASE_URL}/demo"',
+        f'matchzy_demo_upload_url "{WEB_BASE_URL}/demo?t={EVENT_TOKEN}"',
         'matchzy_demo_upload_header_key "Authorization"',
         f'matchzy_demo_upload_header_value "{EVENT_TOKEN}"',
+        'matchzy_demo_recording_enabled true',
         'matchzy_demo_path "MatchZy/"',
         'matchzy_demo_name_format "{TIME}_{MATCH_ID}_{MAP}"',
     ]
@@ -893,6 +916,18 @@ def rcon_gamestate():
         resp = _rcon_run(c, "get5_status") or ""
     m = re.search(r'"gamestate"\s*:\s*"(\w+)"', resp)
     return m.group(1) if m else None
+
+
+def rcon_scores():
+    """Блокирующая функция: счёт текущей карты из get5_status (если события MatchZy не доходят до бота)."""
+    with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
+        raw = _rcon_run(c, "get5_status") or ""
+    try:
+        j = json.loads(raw[raw.index("{"): raw.rindex("}") + 1])
+        return ((j.get("team1") or {}).get("current_map_score"),
+                (j.get("team2") or {}).get("current_map_score"))
+    except Exception:
+        return None
 
 
 def rcon_kick(user_id, steamid: str):
@@ -1516,7 +1551,13 @@ async def clear_chat():
 async def reset_to_queue():
     # если сервер не прислал результат (ручной сброс, таймер), пишем итог, но только если матч реально стартовал
     if S.match_id and S.phase == "playing" and S.match_id not in posted_results and S.ever_live:
-        await post_fallback_result(S.match_id, dict(S.match_players))
+        try:  # завершаем матч на сервере: он выгрузит демо и пришлёт последние события
+            await asyncio.to_thread(rcon_raw, "get5_endmatch")
+        except Exception:
+            log.exception("get5_endmatch не удался")
+        await asyncio.sleep(3)  # даём серверу прислать последние события
+        if S.match_id not in posted_results:  # map_result мог прийти за эти секунды
+            await post_fallback_result(S.match_id, dict(S.match_players))
     await clear_voice_access()
     await clear_chat()
     await close_match_chat()
@@ -2218,14 +2259,21 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
 
 async def post_fallback_result(mid: int, players: dict):
     """map_result не пришёл: берём статистику из последнего round_end (а убийства/смерти при необходимости из
-    player_death). Победителем считается тот, кто ведёт по счёту: ELO начисляется (+30 / -20). При ничьей ELO не меняется."""
-    data = last_round.get(mid) or {}
+    player_death). Если событий нет совсем, спрашиваем счёт у сервера по RCON (get5_status).
+    Победителем считается тот, кто ведёт по счёту: ELO начисляется (+30 / -20). При ничьей ELO не меняется."""
+    data = dict(last_round.get(mid) or {})
     note = "manual"
+    if not data:  # события не дошли: пробуем узнать счёт у самого сервера
+        try:
+            sc = await asyncio.to_thread(rcon_scores)
+        except Exception:
+            sc = None
+        if sc and sc[0] is not None and sc[1] is not None:
+            data = {"team1": {"score": sc[0]}, "team2": {"score": sc[1]}}
     if data:
         s1 = (data.get("team1") or {}).get("score") or 0
         s2 = (data.get("team2") or {}).get("score") or 0
         if s1 != s2:  # побеждает тот, кто ведёт по счёту (ничья: ELO не меняется)
-            data = dict(data)
             data["winner"] = {"team": "team1" if s1 > s2 else "team2"}
             note = ""
     await post_result(data, players, mid, note=note)
@@ -2591,10 +2639,11 @@ async def h_demo(req: web.Request):
     log.info("Запрос на /demo: MatchZy-FileName=%s, MatchId=%s, Content-Length=%s",
              req.headers.get("MatchZy-FileName"), req.headers.get("MatchZy-MatchId"),
              req.headers.get("Content-Length"))
-    auth = (req.headers.get("Authorization") or "").replace("Bearer ", "").strip()
-    if auth != EVENT_TOKEN:
-        log.warning("Загрузка демо отклонена: неверный заголовок Authorization")
+    if not token_ok(req):
+        http_hits["demo_bad"] += 1
+        log.warning("Загрузка демо отклонена: неверный токен")
         return web.Response(status=401)
+    http_hits["demo"] += 1
     fname = re.sub(r"[^\w.\-]", "_", os.path.basename(
         req.headers.get("MatchZy-FileName") or f"match_{int(time.time())}.dem"))
     os.makedirs(DEMO_DIR, exist_ok=True)
@@ -2642,9 +2691,12 @@ async def h_demo_get(req: web.Request):
 
 
 async def h_events(req: web.Request):
-    if req.headers.get("Authorization") != EVENT_TOKEN:
-        log.warning("Событие MatchZy отклонено: неверный заголовок Authorization")
+    if not token_ok(req):
+        http_hits["events_bad"] += 1
+        log.warning("Событие MatchZy отклонено: неверный токен (заголовок: %r)",
+                    (req.headers.get("Authorization") or "")[:8])
         return web.Response(status=401)
+    http_hits["events"] += 1
     try:
         data = await req.json()
     except Exception:
@@ -3271,6 +3323,8 @@ async def fp_diag_cmd(i: discord.Interaction):
         parts.append(f"Статистика по player_death: событий {death_events.get(S.match_id, 0)}, "
                      f"убийств {sum(v['k'] for v in tl.values())}, смертей {sum(v['d'] for v in tl.values())}, "
                      f"TK {sum(v.get('tk', 0) for v in tl.values())}")
+    parts.append(f"HTTP от сервера: events ок={http_hits['events']}, отклонено={http_hits['events_bad']}; "
+                 f"demo ок={http_hits['demo']}, отклонено={http_hits['demo_bad']}")
     parts.append("Счётчик событий: " + (", ".join(f"{k}={v}" for k, v in event_counts.items()) or "—"))
     parts.append("**События MatchZy (последние)**\n```" + ("\n".join(list(event_log)[-8:]) or "ничего не приходило") + "```")
     for cv in ("matchzy_remote_log_url", "matchzy_demo_upload_url", "tv_enable", "mp_friendlyfire",
@@ -3610,12 +3664,12 @@ async def match_stop(i: discord.Interaction, publish: bool = False):
         if t and not t.done():
             t.cancel()
     else:
+        if not publish and S.match_id:
+            posted_results.add(S.match_id)  # без итога и без изменения ELO
         try:  # останавливаем матч на самом CS2-сервере
             await asyncio.to_thread(rcon_raw, "get5_endmatch")
         except Exception:
             log.exception("Не удалось остановить матч на сервере")
-        if not publish and S.match_id:
-            posted_results.add(S.match_id)  # без итога и без изменения ELO
     await reset_to_queue()
     await i.followup.send("🛑 Драфт отменён, очередь сброшена." if was == "draft"
                           else "🛑 Матч остановлен, очередь сброшена.", ephemeral=True)
