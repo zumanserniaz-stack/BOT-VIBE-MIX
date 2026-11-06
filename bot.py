@@ -91,7 +91,7 @@ WARMUP_SECONDS = int(os.getenv("WARMUP_SECONDS", "240"))     # разминка 
 
 # Огонь по своим (friendly fire) только от гранат и молотова; пули своих не ранят.
 # За убийство тиммейта игра сама снимает штраф TK_PENALTY долларов с убийцы.
-GRENADE_FF = os.getenv("GRENADE_FF", "1") == "1"            # 0 = не трогать настройки friendly fire на сервере
+GRENADE_FF = os.getenv("GRENADE_FF", "0") == "1"            # 0 = не трогать настройки friendly fire на сервере
 TK_PENALTY = int(os.getenv("TK_PENALTY", "300"))            # штраф в $ за убийство тиммейта
 FF_GRENADE = os.getenv("FF_GRENADE", "0.85")                # доля урона гранаты по своим (0..1)
 FF_OTHER = os.getenv("FF_OTHER", "0.4")                     # доля урона молотова/прочего по своим (0..1)
