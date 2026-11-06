@@ -6,6 +6,11 @@ VIBE MIX FreePick 5x5: очередь -> готовность -> капитан�
 При Steam-верификации бот определяет FACEIT-уровень игрока и выдаёт роль «FACEIT LVL n».
 Результат матча: табло (K / D / K/D каждого игрока) на фоне картинки карты + ELO (+30 / -20) + кнопка «Скачать демо».
 
+v52: - Как на FACEIT: 24 раунда (MR12), смена сторон на перерыве между половинами, овертайм (настройки идут в конфиге матча).
+     - После окончания матча бот через 15 сек автоматически кикает всех игроков с CS2-сервера.
+     - MVP: если у сервера нет статистики (все нули), в центре табло показывается игрок победившей команды.
+     - Тест-режим: карта заканчивается сама через TEST_MAXROUNDS раундов (по умолчанию 4), чтобы пришли map_result и демо.
+     - RCON_PASSWORD больше не хранится в коде (задайте его в Render -> Environment).
 v51: - Токен событий/демо принимается из заголовка Authorization (с Bearer и без) ИЛИ из ?t= в адресе:
        раньше, если сервер не передавал заголовок, все события отклонялись и результат был пустой (0:0, прочерки).
      - matchzy_remote_log_url и matchzy_demo_upload_url теперь с ?t=токен (запасной путь без заголовков).
@@ -31,7 +36,7 @@ v47: на табло результата у каждого игрока вид�
 v46: команды /match stop, /match stat, /profile, /mute, /unmute, /clan (create, accept, info, invite,
      kick, leave, list, menu), /clearrole. Статистика матчей, кланы и ELO входят в бэкап.
 """
-print("▶ bot.py v51 загружается...", flush=True)
+print("▶ bot.py v52 загружается...", flush=True)
 import asyncio
 from collections import deque
 import io
@@ -63,7 +68,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("freepick")
 
 # ----------------------------- НАСТРОЙКИ -----------------------------
-# CS2-сервер. RCON_PASSWORD ОБЯЗАТЕЛЬНО задай в Render -> Environment (лучше убрать пароль из значения по умолчанию)
+# CS2-сервер. RCON_PASSWORD ОБЯЗАТЕЛЬНО задай в Render -> Environment (в коде пароль не хранится)
 SERVER_IP = os.getenv("SERVER_IP", "45.86.81.37").strip()
 SERVER_PORT = int(os.getenv("SERVER_PORT", "55031"))
 RCON_PASSWORD = os.getenv("RCON_PASSWORD", "ArniAlash22062008Nurlan")
@@ -97,6 +102,12 @@ CAPTAIN_TIMEOUT = 30         # секунд на выбор капитанов (
 READY_TIMEOUT = int(os.getenv("READY_TIMEOUT", "60"))   # секунд на кнопку «Готов»
 MATCH_MAX_SECONDS = 600 if TEST_MODE else 2 * 3600  # автосброс, если series_end не пришёл
 BREAK_SECONDS = int(os.getenv("BREAK_SECONDS", "300"))  # сколько ждём вышедшего игрока, потом матч продолжается
+
+# Формат матча как на FACEIT: 24 раунда (MR12), смена сторон на перерыве, овертайм
+MAX_ROUNDS = int(os.getenv("MAX_ROUNDS", "24"))
+TEST_MAXROUNDS = int(os.getenv("TEST_MAXROUNDS", "4"))  # в тест-режиме карта заканчивается сама через столько раундов
+KICK_AFTER_MATCH = os.getenv("KICK_AFTER_MATCH", "1") == "1"   # 0 = не кикать игроков после матча
+KICK_DELAY = int(os.getenv("KICK_DELAY", "15"))                # сколько секунд после конца матча ждём перед киком
 
 # Автостарт матча: все зашли на сервер -> через AUTO_START_DELAY сек матч стартует сам
 AUTO_START = os.getenv("AUTO_START", "1") == "1"            # 0 = выключить автостарт
@@ -371,6 +382,7 @@ captains: dict[int, dict] = {}     # match_id -> {1: капитан команд
 live_stats: dict[int, dict] = {}   # match_id -> {steamid64: {"k","d","a","hs","tk"}}: убийства/смерти, посчитанные по player_death
 live_reset: set[int] = set()       # match_id, для которых статистика уже обнулена на going_live (обнуляем только один раз)
 death_events: dict[int, int] = {}  # match_id -> сколько событий player_death пришло (для /fp_diag)
+user_ids: dict[str, str] = {}      # steamid64 -> userid на сервере (из player_connect): нужен, чтобы кикнуть игрока после матча
 
 # счётчики HTTP-запросов от CS2-сервера (для /fp_diag): принято / отклонено из-за токена
 http_hits = {"events": 0, "events_bad": 0, "demo": 0, "demo_bad": 0}
@@ -788,6 +800,16 @@ def ff_cvars() -> dict:
     }
 
 
+def format_cvars() -> dict:
+    """Формат как на FACEIT: MR12 (24 раунда), смена сторон на перерыве между половинами, овертайм.
+    В тест-режиме карта короткая: заканчивается сама, поэтому приходят map_result и демо."""
+    return {
+        "mp_maxrounds": str(TEST_MAXROUNDS if TEST_MODE else MAX_ROUNDS),
+        "mp_halftime": "1",
+        "mp_overtime_enable": "0" if TEST_MODE else "1",
+    }
+
+
 def build_match(match_id: int, teams: list[list[discord.Member]], map_name: str) -> dict:
     def team(t):
         name = f"team_{t[0].display_name}" if t else "team_test"
@@ -804,7 +826,7 @@ def build_match(match_id: int, teams: list[list[discord.Member]], map_name: str)
         "clinch_series": True,
         "team1": team(teams[0]),
         "team2": team(teams[1]),
-        "cvars": {"hostname": "VIBE MIX FreePick", **ff_cvars()},
+        "cvars": {"hostname": "VIBE MIX FreePick", **format_cvars(), **ff_cvars()},
     }
 
 
@@ -855,6 +877,7 @@ def load_on_server(match_id: int, map_name: str = ""):
         'matchzy_demo_upload_header_key "Authorization"',
         f'matchzy_demo_upload_header_value "{EVENT_TOKEN}"',
     ]
+    cmds += [f"{k} {v}" for k, v in format_cvars().items()]  # 24 раунда, смена сторон, овертайм
     cmds += [f"{k} {v}" for k, v in ff_cvars().items()]  # огонь по своим от гранат + штраф за убийство тиммейта
     cmds.append(f'matchzy_loadmatch_url "{WEB_BASE_URL}/match/{match_id}.json"')
 
@@ -935,6 +958,25 @@ def rcon_kick(user_id, steamid: str):
     target = str(user_id) if user_id not in (None, "") else steamid
     with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
         _rcon_run(c, f"kickid {target}")
+
+
+def rcon_kick_many(targets: list):
+    """Блокирующая функция: кикает сразу нескольких игроков (userid или SteamID)."""
+    with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
+        for t in targets:
+            _rcon_run(c, f"kickid {t}")
+
+
+async def kick_everyone(targets: list, delay: int = KICK_DELAY):
+    """После матча кикает всех игроков с сервера (даём несколько секунд посмотреть табло)."""
+    if not KICK_AFTER_MATCH or not targets:
+        return
+    await asyncio.sleep(delay)
+    try:
+        await asyncio.to_thread(rcon_kick_many, targets)
+        log.info("После матча кикнуто игроков: %s", len(targets))
+    except Exception:
+        log.exception("Не удалось кикнуть игроков после матча")
 
 
 def rcon_pause(pause: bool):
@@ -1558,6 +1600,10 @@ async def reset_to_queue():
         await asyncio.sleep(3)  # даём серверу прислать последние события
         if S.match_id not in posted_results:  # map_result мог прийти за эти секунды
             await post_fallback_result(S.match_id, dict(S.match_players))
+    # матч окончен: через несколько секунд кикаем всех игроков матча с CS2-сервера
+    if S.phase == "playing" and S.match_players:
+        targets = [user_ids.get(sid) or sid for sid in S.match_players if sid not in ADMIN_STEAMIDS]
+        asyncio.create_task(kick_everyone(targets))
     await clear_voice_access()
     await clear_chat()
     await close_match_chat()
@@ -1761,6 +1807,7 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
         captains[match_id] = {n: t[0] for n, t in enumerate(teams, 1) if t}  # капитаны команд для табло результата
         live_stats.pop(match_id, None)
         live_reset.discard(match_id)
+        user_ids.clear()  # userid игроков прошлого матча больше не нужны
         S.live = False
         S.ever_live = False
         S.match_id = match_id
@@ -1799,6 +1846,10 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
         e.add_field(name="Важно",
                     value="Заходите с **привязанного Steam-аккаунта**: команда выдаётся автоматически по SteamID. "
                           "Матч стартует сам, когда все зайдут на сервер. Подробности пришли в личные сообщения.",
+                    inline=False)
+        e.add_field(name="Формат",
+                    value=f"{TEST_MAXROUNDS if TEST_MODE else MAX_ROUNDS} раундов, смена сторон после первой половины. "
+                          "После матча все игроки автоматически кикаются с сервера.",
                     inline=False)
         if GRENADE_FF:
             e.add_field(name="Гранаты и молотов ранят своих",
@@ -2088,7 +2139,7 @@ def apply_elo(players: dict, win_n: int) -> dict:
 
 
 async def post_result(data: dict, players: dict, match_id, note: str = ""):
-    """Публикует итог матча в канале результатов: карточка-табло на фоне карты (в центре капитан победителя) + статистика
+    """Публикует итог матча в канале результатов: карточка-табло на фоне карты (в центре MVP) + статистика
     (K/D/A, K/D, ADR, HS) и ELO каждого игрока + кнопка демо. Без статистики сервера пишет простой список составов
     (с текущим ELO игроков).
     note: непустая строка = победитель неизвестен (ELO не меняется)."""
@@ -2154,7 +2205,7 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
     # --- MVP: игрок с наибольшим числом убийств (при равенстве: меньше смертей, потом выше ADR)
     mvp = max(all_rows, key=lambda r: (r["k"], -r["d"], r["adr"])) if all_rows else None
     if mvp and not (mvp["k"] or mvp["d"]):
-        mvp = None  # статистики нет (все нули): MVP не назначаем
+        mvp = None  # статистики нет (все нули): MVP по убийствам не назначаем
 
     # --- центр табло: аватар и ник MVP
     center = None
@@ -2166,6 +2217,15 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
             except discord.HTTPException:
                 pass
         center = {"name": mvp["name"], "avatar": mav, "k": mvp["k"], "d": mvp["d"]}
+    if not center:  # статистики нет: в центре игрок победившей команды (без цифр K/D)
+        wn = {"team1": 1, "team2": 2}.get(win)
+        cand = [m for m, tn in players.values() if wn and tn == wn]
+        if cand:
+            try:
+                cav = await cand[0].display_avatar.replace(size=256, static_format="png").read()
+            except discord.HTTPException:
+                cav = None
+            center = {"name": cand[0].display_name, "avatar": cav}
 
     # --- картинка-табло
     card = None
@@ -2755,6 +2815,9 @@ async def h_events(req: web.Request):
         else:
             log.warning("map_result для матча %s: нет снимка игроков или результат уже опубликован", mid)
     elif same and ev == "player_connect":
+        _p = data.get("player") or {}
+        if _p.get("user_id") not in (None, ""):
+            user_ids[str(_p.get("steamid", ""))] = str(_p["user_id"])  # запоминаем для кика после матча
         asyncio.create_task(handle_connect(data))
         asyncio.create_task(track_connect(data))
         asyncio.create_task(handle_return(data))
@@ -3327,8 +3390,8 @@ async def fp_diag_cmd(i: discord.Interaction):
                  f"demo ок={http_hits['demo']}, отклонено={http_hits['demo_bad']}")
     parts.append("Счётчик событий: " + (", ".join(f"{k}={v}" for k, v in event_counts.items()) or "—"))
     parts.append("**События MatchZy (последние)**\n```" + ("\n".join(list(event_log)[-8:]) or "ничего не приходило") + "```")
-    for cv in ("matchzy_remote_log_url", "matchzy_demo_upload_url", "tv_enable", "mp_friendlyfire",
-               "ff_damage_reduction_bullets", "cash_player_killed_teammate"):
+    for cv in ("matchzy_remote_log_url", "matchzy_demo_upload_url", "tv_enable", "mp_maxrounds", "mp_halftime",
+               "mp_friendlyfire", "ff_damage_reduction_bullets", "cash_player_killed_teammate"):
         try:
             resp = await asyncio.to_thread(rcon_raw, cv)
             parts.append(f"`{cv}`: `{resp.strip()[:90] or '(пусто)'}`")
@@ -4259,6 +4322,8 @@ def main():
     say(f"▶ DISCORD_TOKEN: {'задан, длина ' + str(len(token)) if token else 'НЕ ЗАДАН'}")
     say(f"▶ Порт веб-сервера: {WEB_PORT}, WEB_BASE_URL: {WEB_BASE_URL}")
     say(f"▶ TEST_MODE={TEST_MODE}, QUEUE_VC_ID={QUEUE_VC}, GUILD_ID={GUILD_ID}")
+    say(f"▶ Формат: {TEST_MAXROUNDS if TEST_MODE else MAX_ROUNDS} раундов, смена сторон на перерыве; "
+        f"кик после матча: {'вкл, через ' + str(KICK_DELAY) + ' сек' if KICK_AFTER_MATCH else 'выкл'}")
     say(f"▶ Авто-бан: {'вкл' if AUTOBAN else 'выкл'}")
     say(f"▶ Автостарт: {'вкл' if AUTO_START else 'выкл'}, разминка {WARMUP_SECONDS} сек")
     say(f"▶ Гранаты ранят своих: {'вкл, штраф за убийство тиммейта $' + str(TK_PENALTY) if GRENADE_FF else 'выкл'}")
