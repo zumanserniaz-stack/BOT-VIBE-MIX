@@ -4,8 +4,13 @@ VIBE MIX FreePick 5x5: очередь -> готовность -> капитан�
 Авто-старт матча: как только все игроки зашли на сервер, матч стартует сам; иначе после разминки (4 мин).
 Если во время драфта все игроки вышли из войса очереди, драфт отменяется и очередь сбрасывается.
 При Steam-верификации бот определяет FACEIT-уровень игрока и выдаёт роль «FACEIT LVL n».
-Результат матча: табло (K / D / K/D каждого игрока) на фоне картинки карты + MVP + ELO (+30 / -20) + кнопка «Скачать демо».
+Результат матча: табло (K / D / K/D каждого игрока) на фоне картинки карты + ELO (+30 / -20) + кнопка «Скачать демо».
 
+v49: - В центре табло: аватар и ник КАПИТАНА победившей команды, надпись «MVP» вместо «ИТОГ».
+     - K/D: статистика по player_death сбрасывается на going_live только один раз (раньше повторный going_live её стирал).
+     - Демо: включается GOTV (tv_enable), запрос на /demo пишется в лог, match id берётся и из имени файла,
+       поддержан заголовок Authorization с префиксом Bearer.
+     - RCON_PASSWORD больше не хранится в коде: задайте его в Render -> Environment.
 v48: - K/D на табло считается надёжно: убийства и смерти берутся из событий player_death (даже если сервер не прислал
        итоговую статистику); подсчёт начинается с going_live, всё до него (нож, разминка) отбрасывается.
      - Убийство тиммейта гранатой/молотовом: пули своих не ранят, гранаты и молотов ранят (friendly fire только от гранат);
@@ -15,9 +20,8 @@ v48: - K/D на табло считается надёжно: убийства �
 v47: на табло результата у каждого игрока видно убийства (K), смерти (D) и K/D.
 v46: команды /match stop, /match stat, /profile, /mute, /unmute, /clan (create, accept, info, invite,
      kick, leave, list, menu), /clearrole. Статистика матчей, кланы и ELO входят в бэкап.
-     RCON_PASSWORD не хранится в коде: задайте его в Render -> Environment.
 """
-print("▶ bot.py v48 загружается...", flush=True)
+print("▶ bot.py v49 загружается...", flush=True)
 import asyncio
 from collections import deque
 import io
@@ -52,7 +56,7 @@ log = logging.getLogger("freepick")
 # CS2-сервер. RCON_PASSWORD ОБЯЗАТЕЛЬНО задай в Render -> Environment (в коде пароль не хранится)
 SERVER_IP = os.getenv("SERVER_IP", "45.86.81.37").strip()
 SERVER_PORT = int(os.getenv("SERVER_PORT", "55031"))
-RCON_PASSWORD = os.getenv("RCON_PASSWORD", "ArniAlash22062008Nurlan")
+RCON_PASSWORD = os.getenv("RCON_PASSWORD", "")
 SERVER_PASSWORD = os.getenv("SERVER_PASSWORD", "")
 
 # Веб-сервер бота (его должен видеть CS2-сервер)
@@ -352,7 +356,9 @@ last_round: dict[int, dict] = {}   # match_id -> последнее событи
 event_log = deque(maxlen=12)       # последние события MatchZy (для /fp_diag)
 events_seen: set[int] = set()      # match_id, от которых сервер уже присылал события (значит, remote log настроен)
 snapshots: dict[int, dict] = {}  # match_id -> {steamid64: (игрок, команда)}: чтобы результат пришёл даже после сброса
+captains: dict[int, dict] = {}     # match_id -> {1: капитан команды 1, 2: капитан команды 2}
 live_stats: dict[int, dict] = {}   # match_id -> {steamid64: {"k","d","a","hs","tk"}}: убийства/смерти, посчитанные по player_death
+live_reset: set[int] = set()       # match_id, для которых статистика уже обнулена на going_live (обнуляем только один раз)
 death_events: dict[int, int] = {}  # match_id -> сколько событий player_death пришло (для /fp_diag)
 
 GRENADE_WORDS = ("hegrenade", "grenade", "molotov", "incgrenade", "incendiary", "inferno")
@@ -809,6 +815,9 @@ def load_on_server(match_id: int):
         'matchzy_remote_log_header_key "Authorization"',
         f'matchzy_remote_log_header_value "{EVENT_TOKEN}"',
         'matchzy_chat_prefix [{PURPLE}VIBE MIX{Default}]',
+        # GOTV должен быть включён, иначе демо не записывается
+        'tv_enable 1',
+        'tv_delay 0',
         # запись демо: в имени файла обязательно {MATCH_ID}, по нему кнопка «Скачать демку» находит файл
         'matchzy_demo_path "MatchZy/"',
         'matchzy_demo_name_format "{TIME}_{MATCH_ID}_{MAP}"',
@@ -1678,7 +1687,9 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
         S.match_players = {get_steam(m.id): (m, n) for n, t in enumerate(teams, 1) for m in t}
         S.captain_ids = {t[0].id for t in teams if t}
         snapshots[match_id] = dict(S.match_players)
+        captains[match_id] = {n: t[0] for n, t in enumerate(teams, 1) if t}  # капитаны команд для табло результата
         live_stats.pop(match_id, None)
+        live_reset.discard(match_id)
         S.live = False
         S.ever_live = False
         S.match_id = match_id
@@ -1837,9 +1848,10 @@ async def prefetch_map_images():
         await ensure_map_image(m)
 
 
-def render_result_card(map_name: str, s1, s2, team_rows: dict, mvp: dict,
-                       mvp_avatar: bytes | None, names: tuple) -> bytes:
+def render_result_card(map_name: str, s1, s2, team_rows: dict, has_stats: bool,
+                       center: dict | None, names: tuple) -> bytes:
     """Рисует картинку-табло матча на фоне картинки карты. У каждого игрока три колонки: K (убийства), D (смерти), K/D.
+    В центре: аватар и ник капитана победившей команды, надпись «MVP».
     Блокирующая: вызывать через to_thread."""
     from PIL import Image, ImageDraw, ImageFilter, ImageEnhance
 
@@ -1901,7 +1913,7 @@ def render_result_card(map_name: str, s1, s2, team_rows: dict, mvp: dict,
             cy = y + 32
             d.ellipse((x0 + 22, cy - 8, x0 + 38, cy + 8), fill=col)
             d.text((x0 + 52, cy), fit(r["name"], f_name, 200), font=f_name, fill=white, anchor="lm")
-            if mvp is None:  # статистики нет: прочерки
+            if not has_stats:  # статистики нет: прочерки
                 for dx in COLS:
                     d.text((x0 + PW - dx, cy), "–", font=f_stat, fill=gray, anchor="rm")
             else:
@@ -1912,31 +1924,30 @@ def render_result_card(map_name: str, s1, s2, team_rows: dict, mvp: dict,
             d.line((x0 + 18, y + 66, x0 + PW - 18, y + 66), fill=(70, 80, 106), width=1)
             y += 70
 
-    # --- центр: аватар MVP, счёт, карта
+    # --- центр: аватар капитана победившей команды, «MVP», его ник, счёт, карта
     cx = W // 2
     R = 78
     ring = Image.new("RGBA", (2 * R + 12, 2 * R + 12), (0, 0, 0, 0))
     rd = ImageDraw.Draw(ring)
     rd.ellipse((0, 0, 2 * R + 11, 2 * R + 11), fill=GOLD + (255,))
     av = None
-    if mvp_avatar:
+    if center and center.get("avatar"):
         try:
-            av = Image.open(io.BytesIO(mvp_avatar)).convert("RGBA").resize((2 * R, 2 * R))
+            av = Image.open(io.BytesIO(center["avatar"])).convert("RGBA").resize((2 * R, 2 * R))
         except Exception:
             av = None
     if av is None:
         av = Image.new("RGBA", (2 * R, 2 * R), (40, 48, 72, 255))
-        ImageDraw.Draw(av).text((R, R), ((mvp["name"][:1] if mvp else "") or "?").upper(), font=get_font(70), fill=white, anchor="mm")
+        ImageDraw.Draw(av).text((R, R), ((center["name"][:1] if center else "") or "?").upper(),
+                                font=get_font(70), fill=white, anchor="mm")
     mask = Image.new("L", (2 * R, 2 * R), 0)
     ImageDraw.Draw(mask).ellipse((0, 0, 2 * R - 1, 2 * R - 1), fill=255)
     ring.paste(av, (6, 6), mask)
     img.alpha_composite(ring, (cx - R - 6, 62))
     d = ImageDraw.Draw(img)
-    d.text((cx, 258), "MVP" if mvp else "ИТОГ", font=get_font(50), fill=GOLD, anchor="mm")
-    d.text((cx, 304), fit(mvp["name"] if mvp else "Матч завершён", get_font(24), 250), font=get_font(24), fill=white, anchor="mm")
-    if mvp:  # K-D-K/D самого MVP под ником
-        mkd = mvp["k"] / mvp["d"] if mvp["d"] else float(mvp["k"])
-        d.text((cx, 336), f"{mvp['k']} / {mvp['d']}  ·  K/D {mkd:.2f}", font=get_font(20, "regular"), fill=gray, anchor="mm")
+    d.text((cx, 258), "MVP" if center else "ИТОГ", font=get_font(50), fill=GOLD, anchor="mm")
+    d.text((cx, 304), fit(center["name"] if center else "Матч завершён", get_font(24), 250),
+           font=get_font(24), fill=white, anchor="mm")
     f_score = get_font(72)
     d.text((cx - 78, 395), str(s1) if s1 is not None else "–", font=f_score, fill=BLUE, anchor="mm")
     d.text((cx, 395), "–", font=get_font(40), fill=gray, anchor="mm")
@@ -2002,8 +2013,9 @@ def apply_elo(players: dict, win_n: int) -> dict:
 
 
 async def post_result(data: dict, players: dict, match_id, note: str = ""):
-    """Публикует итог матча в канал результатов: карточка-табло на фоне карты + MVP + статистика (K/D/A, K/D, ADR, HS) и ELO
-    каждого игрока + демо. Без статистики сервера пишет простой список составов (с текущим ELO игроков).
+    """Публикует итог матча в канале результатов: карточка-табло на фоне карты (в центре капитан победителя) + статистика
+    (K/D/A, K/D, ADR, HS) и ELO каждого игрока + кнопка демо. Без статистики сервера пишет простой список составов
+    (с текущим ELO игроков).
     note: непустая строка = победитель неизвестен (ELO не меняется)."""
     try:
         mid = int(match_id)
@@ -2053,31 +2065,32 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
     all_rows = team_rows[1] + team_rows[2]
     save_match(mid, raw_map, s1, s2, win, team_rows, players)  # статистика для /profile и /match stat
 
-    # --- картинка-табло
-    card, mvp = None, None
-    if all_rows:
-        mvp = max(all_rows, key=lambda r: (r["k"], r["adr"]))
-        avatar = None
-        if mvp["member"]:
+    # --- лучший по убийствам (в тексте сообщения, не на картинке)
+    mvp = max(all_rows, key=lambda r: (r["k"], r["adr"])) if all_rows else None
+
+    # --- центр табло: капитан победившей команды (аватар + ник)
+    center = None
+    if win in ("team1", "team2"):
+        cap = (captains.get(mid) or {}).get(1 if win == "team1" else 2)
+        if cap:
+            cav = None
             try:
-                avatar = await mvp["member"].display_avatar.replace(size=256, static_format="png").read()
+                cav = await cap.display_avatar.replace(size=256, static_format="png").read()
             except discord.HTTPException:
                 pass
+            center = {"name": cap.display_name, "avatar": cav}
+
+    # --- картинка-табло
+    card = None
+    card_rows = team_rows if all_rows else {
+        n: [{"name": m.display_name, "member": m, "k": 0, "d": 0, "a": 0, "adr": 0, "hs": 0}
+            for m, tn in players.values() if tn == n] for n in (1, 2)}
+    if card_rows[1] or card_rows[2]:
         try:
-            card = await asyncio.to_thread(render_result_card, raw_map, s1, s2,
-                                           team_rows, mvp, avatar, ("TEAM A", "TEAM B"))
+            card = await asyncio.to_thread(render_result_card, raw_map, s1, s2, card_rows,
+                                           bool(all_rows), center, ("TEAM A", "TEAM B"))
         except Exception:
             log.exception("Не удалось нарисовать карточку (установлен ли Pillow?)")
-
-    if not all_rows:  # статистики нет (матч завершён вручную): всё равно рисуем табло, но только с составами
-        fb = {n: [{"name": m.display_name, "member": m, "k": 0, "d": 0, "a": 0, "adr": 0, "hs": 0}
-                  for m, tn in players.values() if tn == n] for n in (1, 2)}
-        if fb[1] or fb[2]:
-            try:
-                card = await asyncio.to_thread(render_result_card, raw_map, s1, s2, fb, None, None,
-                                               ("TEAM A", "TEAM B"))
-            except Exception:
-                log.exception("Не удалось нарисовать карточку (установлен ли Pillow?)")
 
     if card:
         names = [(cfg.get(f"team{n}") or {}).get("name", f"Team {n}") for n in (1, 2)]
@@ -2090,10 +2103,12 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
             lines.append(f"**Матч завершён** (Счёт: {s1} - {s2})")
         if not lines:
             lines.append("**Матч завершён**")
-        if mvp:
-            mkd = mvp["k"] / mvp["d"] if mvp["d"] else float(mvp["k"])
+        if center:
             lines.append("")
-            lines.append(f"🏅 **MVP — {mvp['name']}** · {mvp['k']}/{mvp['d']}/{mvp['a']} · "
+            lines.append(f"🏅 **MVP — {center['name']}** (капитан победившей команды)")
+        if mvp and (mvp["k"] or mvp["d"]):
+            mkd = mvp["k"] / mvp["d"] if mvp["d"] else float(mvp["k"])
+            lines.append(f"🔥 Больше всех убийств: {mvp['name']} · {mvp['k']}/{mvp['d']}/{mvp['a']} · "
                          f"K/D {mkd:.2f}" + (f" · {mvp['adr']} ADR" if mvp["adr"] else "") + f" · {mvp['hs']}% HS")
         e = discord.Embed(title=f"Match #{mid} — РЕЗУЛЬТАТЫ", description="\n".join(lines), color=0xF1C40F)
         e.set_image(url="attachment://result.png")
@@ -2529,7 +2544,11 @@ async def h_connect(req: web.Request):
 
 async def h_demo(req: web.Request):
     """Принимает файл демо от MatchZy (POST, тело = .dem), сохраняет и добавляет кнопку в сообщение с результатом."""
-    if req.headers.get("Authorization") != EVENT_TOKEN:
+    log.info("Запрос на /demo: MatchZy-FileName=%s, MatchId=%s, Content-Length=%s",
+             req.headers.get("MatchZy-FileName"), req.headers.get("MatchZy-MatchId"),
+             req.headers.get("Content-Length"))
+    auth = (req.headers.get("Authorization") or "").replace("Bearer ", "").strip()
+    if auth != EVENT_TOKEN:
         log.warning("Загрузка демо отклонена: неверный заголовок Authorization")
         return web.Response(status=401)
     fname = re.sub(r"[^\w.\-]", "_", os.path.basename(
@@ -2545,10 +2564,13 @@ async def h_demo(req: web.Request):
         return web.Response(status=500)
     url = f"{WEB_BASE_URL}/demos/{fname}"
     log.info("Демо сохранено: %s", fname)
+    mid = None
     try:
         mid = int(req.headers.get("MatchZy-MatchId", ""))
     except ValueError:
-        mid = None
+        found = re.search(r"(\d{10})", fname)  # из имени файла {TIME}_{MATCH_ID}_{MAP}
+        if found:
+            mid = int(found.group(1))
     if mid:
         demo_urls[mid] = url
         msg = result_msgs.get(mid)
@@ -2599,8 +2621,9 @@ async def h_events(req: web.Request):
             gmid = int(data.get("matchid"))
         except (TypeError, ValueError):
             gmid = None
-        if gmid in snapshots:
-            live_stats[gmid] = {}    # всё, что накопилось до старта (нож, разминка), отбрасываем
+        if gmid in snapshots and gmid not in live_reset:
+            live_reset.add(gmid)
+            live_stats[gmid] = {}    # нож/разминка отбрасываются, но только один раз (повторный going_live не стирает киллы)
         if same:
             S.live = True            # матч пошёл (после ножей): теперь выход игрока = перерыв
             S.ever_live = True       # матч реально стартовал: если его сбросят вручную, результат опубликуем
@@ -3167,7 +3190,7 @@ async def fp_diag_cmd(i: discord.Interaction):
                      f"убийств {sum(v['k'] for v in tl.values())}, смертей {sum(v['d'] for v in tl.values())}, "
                      f"TK {sum(v.get('tk', 0) for v in tl.values())}")
     parts.append("**События MatchZy (последние)**\n```" + ("\n".join(list(event_log)[-8:]) or "ничего не приходило") + "```")
-    for cv in ("matchzy_remote_log_url", "matchzy_demo_upload_url", "mp_friendlyfire",
+    for cv in ("matchzy_remote_log_url", "matchzy_demo_upload_url", "tv_enable", "mp_friendlyfire",
                "ff_damage_reduction_bullets", "cash_player_killed_teammate"):
         try:
             resp = await asyncio.to_thread(rcon_raw, cv)
@@ -3389,7 +3412,7 @@ async def on_message(message: discord.Message):
 
 
 # =====================================================================
-#  НОВЫЕ КОМАНДЫ v46: /match, /profile, /mute, /unmute, /clearrole, /clan
+#  КОМАНДЫ: /match, /profile, /mute, /unmute, /clearrole, /clan
 # =====================================================================
 CLAN_MAX = int(os.getenv("CLAN_MAX_MEMBERS", "10"))   # максимум игроков в клане
 CLAN_INVITE_TTL = 3 * 86400                            # приглашение действует 3 дня
