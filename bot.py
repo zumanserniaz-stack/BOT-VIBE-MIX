@@ -6,7 +6,7 @@ VIBE MIX FreePick 5x5: очередь -> готовность -> капитан�
 При Steam-верификации бот определяет FACEIT-уровень игрока и выдаёт роль «FACEIT LVL n».
 Результат матча: табло (K / D / K/D каждого игрока) на фоне картинки карты + ELO (+30 / -20) + кнопка «Скачать демо».
 
-v49: - В центре табло: аватар и ник КАПИТАНА победившей команды, надпись «MVP» вместо «ИТОГ».
+v49: - В центре табло: аватар и ник MVP (игрок с наибольшим числом убийств), надпись «MVP» вместо «ИТОГ».
      - K/D: статистика по player_death сбрасывается на going_live только один раз (раньше повторный going_live её стирал).
      - Демо: включается GOTV (tv_enable), запрос на /demo пишется в лог, match id берётся и из имени файла,
        поддержан заголовок Authorization с префиксом Bearer.
@@ -56,7 +56,7 @@ log = logging.getLogger("freepick")
 # CS2-сервер. RCON_PASSWORD ОБЯЗАТЕЛЬНО задай в Render -> Environment (в коде пароль не хранится)
 SERVER_IP = os.getenv("SERVER_IP", "45.86.81.37").strip()
 SERVER_PORT = int(os.getenv("SERVER_PORT", "55031"))
-RCON_PASSWORD = os.getenv("RCON_PASSWORD", "ArniAlash22062008Nurlan")
+RCON_PASSWORD = os.getenv("RCON_PASSWORD", "")
 SERVER_PASSWORD = os.getenv("SERVER_PASSWORD", "")
 
 # Веб-сервер бота (его должен видеть CS2-сервер)
@@ -1851,7 +1851,7 @@ async def prefetch_map_images():
 def render_result_card(map_name: str, s1, s2, team_rows: dict, has_stats: bool,
                        center: dict | None, names: tuple) -> bytes:
     """Рисует картинку-табло матча на фоне картинки карты. У каждого игрока три колонки: K (убийства), D (смерти), K/D.
-    В центре: аватар и ник капитана победившей команды, надпись «MVP».
+    В центре: аватар и ник MVP (больше всех убийств), надпись «MVP».
     Блокирующая: вызывать через to_thread."""
     from PIL import Image, ImageDraw, ImageFilter, ImageEnhance
 
@@ -1948,6 +1948,10 @@ def render_result_card(map_name: str, s1, s2, team_rows: dict, has_stats: bool,
     d.text((cx, 258), "MVP" if center else "ИТОГ", font=get_font(50), fill=GOLD, anchor="mm")
     d.text((cx, 304), fit(center["name"] if center else "Матч завершён", get_font(24), 250),
            font=get_font(24), fill=white, anchor="mm")
+    if center and "k" in center:  # убийства / смерти / K/D самого MVP под ником
+        ckd = center["k"] / center["d"] if center["d"] else float(center["k"])
+        d.text((cx, 336), f"{center['k']} / {center['d']}  ·  K/D {ckd:.2f}",
+               font=get_font(20, "regular"), fill=gray, anchor="mm")
     f_score = get_font(72)
     d.text((cx - 78, 395), str(s1) if s1 is not None else "–", font=f_score, fill=BLUE, anchor="mm")
     d.text((cx, 395), "–", font=get_font(40), fill=gray, anchor="mm")
@@ -2065,20 +2069,21 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
     all_rows = team_rows[1] + team_rows[2]
     save_match(mid, raw_map, s1, s2, win, team_rows, players)  # статистика для /profile и /match stat
 
-    # --- лучший по убийствам (в тексте сообщения, не на картинке)
-    mvp = max(all_rows, key=lambda r: (r["k"], r["adr"])) if all_rows else None
+    # --- MVP: игрок с наибольшим числом убийств (при равенстве: меньше смертей, потом выше ADR)
+    mvp = max(all_rows, key=lambda r: (r["k"], -r["d"], r["adr"])) if all_rows else None
+    if mvp and not (mvp["k"] or mvp["d"]):
+        mvp = None  # статистики нет (все нули): MVP не назначаем
 
-    # --- центр табло: капитан победившей команды (аватар + ник)
+    # --- центр табло: аватар и ник MVP
     center = None
-    if win in ("team1", "team2"):
-        cap = (captains.get(mid) or {}).get(1 if win == "team1" else 2)
-        if cap:
-            cav = None
+    if mvp:
+        mav = None
+        if mvp["member"]:
             try:
-                cav = await cap.display_avatar.replace(size=256, static_format="png").read()
+                mav = await mvp["member"].display_avatar.replace(size=256, static_format="png").read()
             except discord.HTTPException:
                 pass
-            center = {"name": cap.display_name, "avatar": cav}
+        center = {"name": mvp["name"], "avatar": mav, "k": mvp["k"], "d": mvp["d"]}
 
     # --- картинка-табло
     card = None
@@ -2103,12 +2108,10 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
             lines.append(f"**Матч завершён** (Счёт: {s1} - {s2})")
         if not lines:
             lines.append("**Матч завершён**")
-        if center:
-            lines.append("")
-            lines.append(f"🏅 **MVP — {center['name']}** (капитан победившей команды)")
-        if mvp and (mvp["k"] or mvp["d"]):
+        if mvp:
             mkd = mvp["k"] / mvp["d"] if mvp["d"] else float(mvp["k"])
-            lines.append(f"🔥 Больше всех убийств: {mvp['name']} · {mvp['k']}/{mvp['d']}/{mvp['a']} · "
+            lines.append("")
+            lines.append(f"🏅 **MVP — {mvp['name']}** · {mvp['k']}/{mvp['d']}/{mvp['a']} · "
                          f"K/D {mkd:.2f}" + (f" · {mvp['adr']} ADR" if mvp["adr"] else "") + f" · {mvp['hs']}% HS")
         e = discord.Embed(title=f"Match #{mid} — РЕЗУЛЬТАТЫ", description="\n".join(lines), color=0xF1C40F)
         e.set_image(url="attachment://result.png")
