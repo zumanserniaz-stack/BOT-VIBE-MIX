@@ -4,8 +4,10 @@ VIBE MIX FreePick 5x5: очередь -> готовность -> капитан�
 Авто-старт матча: как только все игроки зашли на сервер, матч стартует сам; иначе после разминки (4 мин).
 Если во время драфта все игроки вышли из войса очереди, драфт отменяется и очередь сбрасывается.
 При Steam-верификации бот определяет FACEIT-уровень игрока и выдаёт роль «FACEIT LVL n».
-Результат матча: табло (K / D / K/D каждого игрока) на фоне картинки карты + ELO (+30 / -20) + кнопка «Скачать демо».
+Результат матча: табло (K / D / K/D каждого игрока) на фоне картинки карты + ELO (+30 / -20).
 
+v53: - В канал результатов уходит только картинка-табло: без кнопки «Скачать демку» и без текста под картинкой
+       (ELO по-прежнему начисляется). Вернуть: DEMO_BUTTON=1 (кнопка демо), RESULT_TEXT=1 (текст со статистикой).
 v52: - Как на FACEIT: 24 раунда (MR12), смена сторон на перерыве между половинами, овертайм (настройки идут в конфиге матча).
      - После окончания матча бот через 15 сек автоматически кикает всех игроков с CS2-сервера.
      - MVP: если у сервера нет статистики (все нули), в центре табло показывается игрок победившей команды.
@@ -36,7 +38,7 @@ v47: на табло результата у каждого игрока вид�
 v46: команды /match stop, /match stat, /profile, /mute, /unmute, /clan (create, accept, info, invite,
      kick, leave, list, menu), /clearrole. Статистика матчей, кланы и ELO входят в бэкап.
 """
-print("▶ bot.py v52 загружается...", flush=True)
+print("▶ bot.py v53 загружается...", flush=True)
 import asyncio
 from collections import deque
 import io
@@ -123,6 +125,10 @@ FF_OTHER = os.getenv("FF_OTHER", "0.4")                     # доля урон�
 
 # Канал для результатов матчей (0 = бот сам найдёт канал, в названии которого есть "результаты")
 RESULTS_CHANNEL = int(os.getenv("RESULTS_CHANNEL_ID", "1565444339084038314"))
+
+# В результате матча: 1 = показывать кнопку «Скачать демку» / текст со статистикой под картинкой (по умолчанию выключено)
+DEMO_BUTTON = os.getenv("DEMO_BUTTON", "1") == "1"
+RESULT_TEXT = os.getenv("RESULT_TEXT", "0") == "1"
 
 # Бэкап привязок: приватный канал для админов, куда бот кладёт файл с привязками (0 = выключено).
 # Нужен, потому что на Render файл базы стирается при каждом обновлении.
@@ -2139,8 +2145,9 @@ def apply_elo(players: dict, win_n: int) -> dict:
 
 
 async def post_result(data: dict, players: dict, match_id, note: str = ""):
-    """Публикует итог матча в канале результатов: карточка-табло на фоне карты (в центре MVP) + статистика
-    (K/D/A, K/D, ADR, HS) и ELO каждого игрока + кнопка демо. Без статистики сервера пишет простой список составов
+    """Публикует итог матча в канале результатов: карточка-табло на фоне карты (в центре MVP).
+    По умолчанию уходит только картинка; текст со статистикой (K/D/A, ELO) и кнопка демо включаются
+    переменными RESULT_TEXT=1 и DEMO_BUTTON=1. Без статистики сервера пишет простой список составов
     (с текущим ELO игроков).
     note: непустая строка = победитель неизвестен (ELO не меняется)."""
     try:
@@ -2278,7 +2285,10 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
             e.add_field(name=f"Team {n}" + (f" — {tsc}" if tsc is not None else ""),
                         value="\n".join(lines_t)[:1024] or "—", inline=False)
         e.set_footer(text=f"Карта: {raw_map} · Сыграно раундов: {total_rounds}")
-        kwargs = {"embed": e, "file": discord.File(io.BytesIO(card), filename="result.png")}
+        if RESULT_TEXT:
+            kwargs = {"embed": e, "file": discord.File(io.BytesIO(card), filename="result.png")}
+        else:  # только картинка-табло
+            kwargs = {"file": discord.File(io.BytesIO(card), filename="result.png")}
     else:
         # запасной вариант без картинки (нет статистики или Pillow не установлен)
         def elo_tag(did: int) -> str:
@@ -2307,7 +2317,8 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
             e.add_field(name=title, value="\n".join(r[1] for r in rows) or "—", inline=False)
         kwargs = {"embed": e}
     try:
-        kwargs["view"] = demo_view(mid)  # кнопка демо сразу, файл подтянется, когда сервер его загрузит
+        if DEMO_BUTTON:
+            kwargs["view"] = demo_view(mid)  # кнопка демо сразу, файл подтянется, когда сервер его загрузит
         msg = await ch.send(**kwargs)
         result_msgs[mid] = msg
         live_stats.pop(mid, None)  # убийства/смерти уже в результате
@@ -2695,7 +2706,7 @@ async def h_connect(req: web.Request):
 
 
 async def h_demo(req: web.Request):
-    """Принимает файл демо от MatchZy (POST, тело = .dem), сохраняет и добавляет кнопку в сообщение с результатом."""
+    """Принимает файл демо от MatchZy (POST, тело = .dem), сохраняет и (если включено DEMO_BUTTON) добавляет кнопку в сообщение с результатом."""
     log.info("Запрос на /demo: MatchZy-FileName=%s, MatchId=%s, Content-Length=%s",
              req.headers.get("MatchZy-FileName"), req.headers.get("MatchZy-MatchId"),
              req.headers.get("Content-Length"))
@@ -2727,7 +2738,7 @@ async def h_demo(req: web.Request):
     if mid:
         demo_urls[mid] = url
         msg = result_msgs.get(mid)
-        if msg:  # результат уже опубликован: добавляем кнопку к нему
+        if msg and DEMO_BUTTON:  # результат уже опубликован: добавляем кнопку к нему
             try:
                 await msg.edit(view=demo_view(mid))
             except discord.HTTPException:
@@ -4328,6 +4339,7 @@ def main():
     say(f"▶ Автостарт: {'вкл' if AUTO_START else 'выкл'}, разминка {WARMUP_SECONDS} сек")
     say(f"▶ Гранаты ранят своих: {'вкл, штраф за убийство тиммейта $' + str(TK_PENALTY) if GRENADE_FF else 'выкл'}")
     say(f"▶ FACEIT: {'ключ задан' if FACEIT_API_KEY else 'FACEIT_API_KEY не задан (FACEIT-роли выключены)'}")
+    say(f"▶ Результат матча: {'с текстом' if RESULT_TEXT else 'только картинка'}, кнопка демо: {'вкл' if DEMO_BUTTON else 'выкл'}")
     say(f"▶ Демо сохраняются в: {DEMO_DIR}, картинки карт: {MAP_DIR}")
     if not token:
         say("❌ Не задана переменная DISCORD_TOKEN (Render -> Environment)")
