@@ -6,6 +6,9 @@ VIBE MIX FreePick 5x5: очередь -> готовность -> капитан�
 При Steam-верификации бот определяет FACEIT-уровень игрока и выдаёт роль «FACEIT LVL n».
 Результат матча: табло (K / D / K/D каждого игрока) на фоне картинки карты + ELO (+30 / -20).
 
+v54: - Как на FACEIT: игрок вышел с сервера -> авто-пауза, по центру экрана у всех «Игрок X вышел из игры / Техническая пауза 1:30»
+       с обратным отсчётом; на время паузы включается all talk (sv_alltalk), после паузы настройки возвращаются.
+       Длина паузы: BREAK_SECONDS (по умолчанию 90 = 1:30). Выключить all talk: PAUSE_ALLTALK=0.
 v53: - В канал результатов уходит только картинка-табло: без кнопки «Скачать демку» и без текста под картинкой
        (ELO по-прежнему начисляется). Вернуть: DEMO_BUTTON=1 (кнопка демо), RESULT_TEXT=1 (текст со статистикой).
 v52: - Как на FACEIT: 24 раунда (MR12), смена сторон на перерыве между половинами, овертайм (настройки идут в конфиге матча).
@@ -38,8 +41,9 @@ v47: на табло результата у каждого игрока вид�
 v46: команды /match stop, /match stat, /profile, /mute, /unmute, /clan (create, accept, info, invite,
      kick, leave, list, menu), /clearrole. Статистика матчей, кланы и ELO входят в бэкап.
 """
-print("▶ bot.py v53 загружается...", flush=True)
+print("▶ bot.py v54 загружается...", flush=True)
 import asyncio
+import threading
 from collections import deque
 import io
 import json
@@ -103,7 +107,8 @@ PICK_TIMEOUT = 30            # секунд на пик/бан, потом вы�
 CAPTAIN_TIMEOUT = 30         # секунд на выбор капитанов (кто не вызвался, назначается случайно)
 READY_TIMEOUT = int(os.getenv("READY_TIMEOUT", "60"))   # секунд на кнопку «Готов»
 MATCH_MAX_SECONDS = 600 if TEST_MODE else 2 * 3600  # автосброс, если series_end не пришёл
-BREAK_SECONDS = int(os.getenv("BREAK_SECONDS", "300"))  # сколько ждём вышедшего игрока, потом матч продолжается
+BREAK_SECONDS = int(os.getenv("BREAK_SECONDS", "90"))  # техпауза как на FACEIT: 1:30, потом матч продолжается
+PAUSE_ALLTALK = os.getenv("PAUSE_ALLTALK", "1") == "1"   # 1 = на время паузы включать all talk (общий голосовой/текстовый чат)
 
 # Формат матча как на FACEIT: 24 раунда (MR12), смена сторон на перерыве, овертайм
 MAX_ROUNDS = int(os.getenv("MAX_ROUNDS", "24"))
@@ -366,6 +371,8 @@ class State:
         self.ever_live = False                         # матч хотя бы раз дошёл до going_live (иначе пустой результат не пишем)
         self.paused = False                            # матч на паузе из-за вышедшего игрока
         self.absent: set[int] = set()                  # игроки, которые вышли с сервера
+        self.absent_names: dict[int, str] = {}         # discord id -> ник вышедшего (для надписи на экране)
+        self.pause_stop: threading.Event | None = None # останавливает надпись с отсчётом, когда пауза снята
         self.break_channel: discord.TextChannel | None = None
         self.break_task: asyncio.Task | None = None
         self.break_lock = asyncio.Lock()
@@ -995,6 +1002,55 @@ def rcon_pause(pause: bool):
             _rcon_run(c, fallback)
 
 
+def _fmt_mmss(sec: int) -> str:
+    sec = max(0, int(sec))
+    return f"{sec // 60}:{sec % 60:02d}"
+
+
+_overlay_mode = None  # какой способ показа надписи по центру экрана работает на сервере: "hsay" | "script"
+
+
+def _send_overlay(c, text: str):
+    """Надпись по центру экрана у всех игроков. Пробуем css_hsay (CS2-SimpleAdmin), затем VScript."""
+    global _overlay_mode
+    text = text.replace('"', "'")
+    for mode in ([_overlay_mode] if _overlay_mode else ["hsay", "script"]):
+        if mode == "hsay":
+            resp = _rcon_run(c, f"css_hsay {text}") or ""
+        else:
+            resp = _rcon_run(c, f'script ScriptPrintMessageCenterAll("{text}")') or ""
+        if "unknown command" not in resp.lower():
+            _overlay_mode = mode
+            return
+    _overlay_mode = None  # ни один способ не сработал: останется только сообщение в чат
+
+
+def rcon_pause_overlay(get_names, seconds: int, stop: threading.Event):
+    """Блокирующая функция (запускать в потоке): пока идёт техпауза, раз в секунду обновляет надпись
+    «Игрок X вышел из игры / Техническая пауза M:SS» и держит включённым all talk. По окончании возвращает all talk."""
+    old_alltalk = "0"
+    with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
+        try:
+            if PAUSE_ALLTALK:
+                m = re.search(r'=\s*"?(\d)"?', _rcon_run(c, "sv_alltalk") or "")
+                old_alltalk = m.group(1) if m else "0"
+                _rcon_run(c, "sv_alltalk 1")
+            _rcon_run(c, f"say [ПАУЗА] Игрок {get_names()} вышел из игры. "
+                         f"Техническая пауза {_fmt_mmss(seconds)}" + (". All talk включён" if PAUSE_ALLTALK else ""))
+            left = seconds
+            while left >= 0 and not stop.is_set():
+                _send_overlay(c, f"Игрок {get_names()} вышел из игры | Техническая пауза {_fmt_mmss(left)}")
+                if stop.wait(1):
+                    break
+                left -= 1
+        finally:
+            if PAUSE_ALLTALK:
+                try:
+                    _rcon_run(c, f"sv_alltalk {old_alltalk}")
+                except Exception:
+                    pass
+
+
 def rcon_force_start() -> str:
     """Блокирующая функция: принудительный старт матча MatchZy (как админская команда .start)."""
     with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
@@ -1230,6 +1286,7 @@ async def handle_disconnect(steamid: str):
         return
     member, team_n = info
     S.absent.add(member.id)
+    S.absent_names[member.id] = member.display_name
     first = not S.paused
     if first:
         S.paused = True  # ставим флаг сразу, чтобы второй выход не запускал паузу повторно
@@ -1238,6 +1295,9 @@ async def handle_disconnect(steamid: str):
         except Exception:
             log.exception("Не удалось поставить матч на паузу")
         S.break_task = asyncio.create_task(break_timer())
+        S.pause_stop = threading.Event()  # надпись с отсчётом на экране + all talk, как на FACEIT
+        asyncio.create_task(asyncio.to_thread(
+            rcon_pause_overlay, lambda: ", ".join(S.absent_names.values()) or "?", BREAK_SECONDS, S.pause_stop))
 
     guild = get_guild()
     async with S.break_lock:
@@ -1264,7 +1324,7 @@ async def handle_disconnect(steamid: str):
         await target.send(
             f"⏸ **Матч #{S.match_id} на паузе.** Вышел с сервера: {names} (Team {team_n}).\n"
             f"Игрок, вернитесь на сервер: {WEB_BASE_URL}/connect\n"
-            f"Если игрок не вернётся за {BREAK_SECONDS // 60} мин, матч продолжится автоматически. "
+            f"Если игрок не вернётся за {_fmt_mmss(BREAK_SECONDS)}, матч продолжится автоматически. "
             "Капитаны и администрация могут продолжить раньше кнопкой ниже.",
             view=BreakView())
     try:
@@ -1281,6 +1341,7 @@ async def handle_return(data: dict):
     if not info or not S.paused:
         return
     S.absent.discard(info[0].id)
+    S.absent_names.pop(info[0].id, None)
     if not S.absent:
         await resume_match("Все игроки вернулись на сервер")
 
@@ -1527,6 +1588,10 @@ async def resume_match(reason: str):
     leavers = [m for m, _ in S.match_players.values() if m.id in S.absent]  # кто так и не вернулся
     S.paused = False
     S.absent.clear()
+    S.absent_names.clear()
+    if S.pause_stop:
+        S.pause_stop.set()  # убрать надпись и вернуть all talk
+        S.pause_stop = None
     if S.break_task and S.break_task is not asyncio.current_task():
         S.break_task.cancel()
     S.break_task = None
@@ -1618,6 +1683,10 @@ async def reset_to_queue():
     S.ever_live = False
     S.paused = False
     S.absent.clear()
+    S.absent_names.clear()
+    if S.pause_stop:
+        S.pause_stop.set()
+        S.pause_stop = None
     S.match_players = {}
     S.captain_ids = set()
     S.connected = set()
