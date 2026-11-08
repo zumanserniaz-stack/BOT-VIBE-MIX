@@ -6,7 +6,8 @@ VIBE MIX FreePick 5x5: очередь -> готовность -> капитан�
 При Steam-верификации бот определяет FACEIT-уровень игрока и выдаёт роль «FACEIT LVL n».
 Результат матча: табло (K / D / K/D каждого игрока) на фоне картинки карты + ELO (+30 / -20).
 
-v54: - Как на FACEIT: игрок вышел с сервера -> авто-пауза, по центру экрана у всех «Игрок X вышел из игры / Техническая пауза 1:30»
+v54: - На смене сторон (перерыв между половинами) включается all talk на HALFTIME_TALK_SECONDS (15 сек), потом выключается.
+     - Как на FACEIT: игрок вышел с сервера -> авто-пауза, по центру экрана у всех «Игрок X вышел из игры / Техническая пауза 1:30»
        с обратным отсчётом; на время паузы включается all talk (sv_alltalk), после паузы настройки возвращаются.
        Длина паузы: BREAK_SECONDS (по умолчанию 90 = 1:30). Выключить all talk: PAUSE_ALLTALK=0.
 v53: - В канал результатов уходит только картинка-табло: без кнопки «Скачать демку» и без текста под картинкой
@@ -108,6 +109,8 @@ CAPTAIN_TIMEOUT = 30         # секунд на выбор капитанов (
 READY_TIMEOUT = int(os.getenv("READY_TIMEOUT", "60"))   # секунд на кнопку «Готов»
 MATCH_MAX_SECONDS = 600 if TEST_MODE else 2 * 3600  # автосброс, если series_end не пришёл
 BREAK_SECONDS = int(os.getenv("BREAK_SECONDS", "90"))  # техпауза как на FACEIT: 1:30, потом матч продолжается
+HALFTIME_ALLTALK = os.getenv("HALFTIME_ALLTALK", "1") == "1"   # 1 = при смене сторон (CT <-> T) включать all talk
+HALFTIME_TALK_SECONDS = int(os.getenv("HALFTIME_TALK_SECONDS", "15"))  # сколько секунд all talk работает на смене сторон
 PAUSE_ALLTALK = os.getenv("PAUSE_ALLTALK", "1") == "1"   # 1 = на время паузы включать all talk (общий голосовой/текстовый чат)
 
 # Формат матча как на FACEIT: 24 раунда (MR12), смена сторон на перерыве, овертайм
@@ -1049,6 +1052,39 @@ def rcon_pause_overlay(get_names, seconds: int, stop: threading.Event):
                     _rcon_run(c, f"sv_alltalk {old_alltalk}")
                 except Exception:
                     pass
+
+
+def rcon_set_alltalk(value: str):
+    """Блокирующая функция: включает/выключает all talk на сервере."""
+    with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
+        _rcon_run(c, f"sv_alltalk {value}")
+
+
+_halftime_busy = False
+
+
+async def halftime_talk():
+    """Смена сторон: все игроки (обе команды) могут говорить друг с другом, после перерыва all talk выключается."""
+    global _halftime_busy
+    if _halftime_busy:
+        return
+    _halftime_busy = True
+    try:
+        await asyncio.to_thread(rcon_set_alltalk, "1")
+        try:
+            await asyncio.to_thread(rcon_raw, "say [СМЕНА СТОРОН] All talk включён на перерыв")
+        except Exception:
+            pass
+        await asyncio.sleep(HALFTIME_TALK_SECONDS)
+    except Exception:
+        log.exception("all talk на смене сторон не сработал")
+    finally:
+        _halftime_busy = False
+        if not S.paused:  # если идёт техпауза, all talk вернёт она сама
+            try:
+                await asyncio.to_thread(rcon_set_alltalk, "0")
+            except Exception:
+                log.exception("Не удалось выключить all talk")
 
 
 def rcon_force_start() -> str:
@@ -2880,6 +2916,10 @@ async def h_events(req: web.Request):
         try:
             if data.get("team1"):
                 last_round[int(data.get("matchid"))] = data  # статистика на случай, если map_result не придёт
+                if same and HALFTIME_ALLTALK:  # середина карты = смена сторон CT <-> T
+                    _played = int((data.get("team1") or {}).get("score") or 0) + int((data.get("team2") or {}).get("score") or 0)
+                    if _played == (TEST_MAXROUNDS if TEST_MODE else MAX_ROUNDS) // 2:
+                        asyncio.create_task(halftime_talk())
         except (TypeError, ValueError):
             pass
     elif ev == "map_result":
