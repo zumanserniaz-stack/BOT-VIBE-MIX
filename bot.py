@@ -6,6 +6,9 @@ VIBE MIX FreePick 5x5: очередь -> готовность -> капитан�
 При Steam-верификации бот определяет FACEIT-уровень игрока и выдаёт роль «FACEIT LVL n».
 Результат матча: табло (K / D / K/D каждого игрока) на фоне картинки карты + ELO (+30 / -20).
 
+v55: - В канал результатов уходит табло + короткий текст: только «Победитель (счёт)» и «MVP — ник».
+       Без K/D/A, ADR, HS и без списков игроков/ELO в тексте (ELO по-прежнему начисляется).
+       RESULT_TEXT теперь включён по умолчанию (RESULT_TEXT=0 вернёт только картинку).
 v54: - На смене сторон (перерыв между половинами) включается all talk на HALFTIME_TALK_SECONDS (15 сек), потом выключается.
      - Как на FACEIT: игрок вышел с сервера -> авто-пауза, по центру экрана у всех «Игрок X вышел из игры / Техническая пауза 1:30»
        с обратным отсчётом; на время паузы включается all talk (sv_alltalk), после паузы настройки возвращаются.
@@ -42,7 +45,7 @@ v47: на табло результата у каждого игрока вид�
 v46: команды /match stop, /match stat, /profile, /mute, /unmute, /clan (create, accept, info, invite,
      kick, leave, list, menu), /clearrole. Статистика матчей, кланы и ELO входят в бэкап.
 """
-print("▶ bot.py v54 загружается...", flush=True)
+print("▶ bot.py v55 загружается...", flush=True)
 import asyncio
 import threading
 from collections import deque
@@ -79,7 +82,7 @@ log = logging.getLogger("freepick")
 SERVER_IP = os.getenv("SERVER_IP", "45.86.81.37").strip()
 SERVER_PORT = int(os.getenv("SERVER_PORT", "55031"))
 RCON_PASSWORD = os.getenv("RCON_PASSWORD", "ArniAlash22062008Nurlan")
-SERVER_PASSWORD = os.getenv("SERVER_PASSWORD", "")
+SERVER_PASSWORD = os.getenv("SERVER_PASSWORD", "ArniAlash22062008Nurlan")
 
 # Веб-сервер бота (его должен видеть CS2-сервер)
 WEB_PORT = int(os.getenv("PORT") or os.getenv("WEB_PORT", "55031"))
@@ -134,9 +137,10 @@ FF_OTHER = os.getenv("FF_OTHER", "0.4")                     # доля урон�
 # Канал для результатов матчей (0 = бот сам найдёт канал, в названии которого есть "результаты")
 RESULTS_CHANNEL = int(os.getenv("RESULTS_CHANNEL_ID", "1565444339084038314"))
 
-# В результате матча: 1 = показывать кнопку «Скачать демку» / текст со статистикой под картинкой (по умолчанию выключено)
+# В результате матча: RESULT_TEXT=1 (по умолчанию) = под картинкой короткий текст «Победитель + MVP»; 0 = только картинка.
+# DEMO_BUTTON=1 = кнопка «Скачать демку».
 DEMO_BUTTON = os.getenv("DEMO_BUTTON", "1") == "1"
-RESULT_TEXT = os.getenv("RESULT_TEXT", "0") == "1"
+RESULT_TEXT = os.getenv("RESULT_TEXT", "1") == "1"
 
 # Бэкап привязок: приватный канал для админов, куда бот кладёт файл с привязками (0 = выключено).
 # Нужен, потому что на Render файл базы стирается при каждом обновлении.
@@ -2251,8 +2255,9 @@ def apply_elo(players: dict, win_n: int) -> dict:
 
 async def post_result(data: dict, players: dict, match_id, note: str = ""):
     """Публикует итог матча в канале результатов: карточка-табло на фоне карты (в центре MVP).
-    По умолчанию уходит только картинка; текст со статистикой (K/D/A, ELO) и кнопка демо включаются
-    переменными RESULT_TEXT=1 и DEMO_BUTTON=1. Без статистики сервера пишет простой список составов
+    По умолчанию (RESULT_TEXT=1) над картинкой короткий текст: только «Победитель (счёт)» и «MVP — ник».
+    Без K/D/A, ADR, HS и без списков игроков/ELO в тексте (ELO при этом начисляется).
+    Кнопка демо включается DEMO_BUTTON=1. Без статистики сервера пишет простой список составов
     (с текущим ELO игроков).
     note: непустая строка = победитель неизвестен (ELO не меняется)."""
     try:
@@ -2363,33 +2368,10 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
         if not lines:
             lines.append("**Матч завершён**")
         if mvp:
-            mkd = mvp["k"] / mvp["d"] if mvp["d"] else float(mvp["k"])
             lines.append("")
-            lines.append(f"🏅 **MVP — {mvp['name']}** · {mvp['k']}/{mvp['d']}/{mvp['a']} · "
-                         f"K/D {mkd:.2f}" + (f" · {mvp['adr']} ADR" if mvp["adr"] else "") + f" · {mvp['hs']}% HS")
+            lines.append(f"🏅 **MVP — {mvp['name']}**")
         e = discord.Embed(title=f"Match #{mid} — РЕЗУЛЬТАТЫ", description="\n".join(lines), color=0xF1C40F)
         e.set_image(url="attachment://result.png")
-        # статистика и ELO каждого игрока по командам
-        for n in (1, 2):
-            lines_t = []
-            for r in team_rows[n]:
-                tag = ""
-                if r["member"] and r["member"].id in changes:
-                    old, new = changes[r["member"].id]
-                    tag = f" · **{new}** ({new - old:+d} ELO)"
-                who = r["member"].mention if r["member"] else r["name"]
-                kd = r["k"] / r["d"] if r["d"] else float(r["k"])
-                lines_t.append(f"{who} `{r['k']}/{r['d']}/{r['a']}` · K/D {kd:.2f}"
-                               + (f" · ADR {r['adr']}" if r["adr"] else "") + f" · HS {r['hs']}%"
-                               + (f" · TK {r['tk']}" if r.get("tk") else "") + tag)
-            if not lines_t:  # статистики нет: показываем состав и ELO
-                lines_t = [m.mention + (f" · **{changes[m.id][1]}** ({changes[m.id][1] - changes[m.id][0]:+d} ELO)"
-                                        if m.id in changes else "")
-                           for m, tn in players.values() if tn == n]
-            tsc = (t1, t2)[n - 1].get("score")
-            e.add_field(name=f"Team {n}" + (f" — {tsc}" if tsc is not None else ""),
-                        value="\n".join(lines_t)[:1024] or "—", inline=False)
-        e.set_footer(text=f"Карта: {raw_map} · Сыграно раундов: {total_rounds}")
         if RESULT_TEXT:
             kwargs = {"embed": e, "file": discord.File(io.BytesIO(card), filename="result.png")}
         else:  # только картинка-табло
@@ -4448,7 +4430,7 @@ def main():
     say(f"▶ Автостарт: {'вкл' if AUTO_START else 'выкл'}, разминка {WARMUP_SECONDS} сек")
     say(f"▶ Гранаты ранят своих: {'вкл, штраф за убийство тиммейта $' + str(TK_PENALTY) if GRENADE_FF else 'выкл'}")
     say(f"▶ FACEIT: {'ключ задан' if FACEIT_API_KEY else 'FACEIT_API_KEY не задан (FACEIT-роли выключены)'}")
-    say(f"▶ Результат матча: {'с текстом' if RESULT_TEXT else 'только картинка'}, кнопка демо: {'вкл' if DEMO_BUTTON else 'выкл'}")
+    say(f"▶ Результат матча: {'картинка + текст (победитель и MVP)' if RESULT_TEXT else 'только картинка'}, кнопка демо: {'вкл' if DEMO_BUTTON else 'выкл'}")
     say(f"▶ Демо сохраняются в: {DEMO_DIR}, картинки карт: {MAP_DIR}")
     if not token:
         say("❌ Не задана переменная DISCORD_TOKEN (Render -> Environment)")
