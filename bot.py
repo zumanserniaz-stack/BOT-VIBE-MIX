@@ -6,46 +6,43 @@ VIBE MIX FreePick 5x5: очередь -> готовность -> капитан�
 При Steam-верификации бот определяет FACEIT-уровень игрока и выдаёт роль «FACEIT LVL n».
 Результат матча: табло (K / D / K/D каждого игрока) на фоне картинки карты + ELO (+30 / -20).
 
+v56: - В результате матча: MVP «ник — K/D/A | ADR | HS%», ELO каждого игрока (стало и изменение, +30 / -20),
+       ссылка «Скачать демку» в тексте (кнопка под сообщением тоже остаётся).
+     - Плашка сайта (vibeproject.kz) в правом верхнем углу картинки-табло и ссылка на сайт в заголовке результата.
+       Адрес сайта: SITE_URL в Render -> Environment (пусто = без плашки).
+     - RCON_PASSWORD в коде больше нет: задайте его в Render -> Environment.
 v55: - В канал результатов уходит табло + короткий текст: только «Победитель (счёт)» и «MVP — ник».
-       Без K/D/A, ADR, HS и без списков игроков/ELO в тексте (ELO по-прежнему начисляется).
-       RESULT_TEXT теперь включён по умолчанию (RESULT_TEXT=0 вернёт только картинку).
+       RESULT_TEXT включён по умолчанию (RESULT_TEXT=0 вернёт только картинку).
 v54: - На смене сторон (перерыв между половинами) включается all talk на HALFTIME_TALK_SECONDS (15 сек), потом выключается.
      - Как на FACEIT: игрок вышел с сервера -> авто-пауза, по центру экрана у всех «Игрок X вышел из игры / Техническая пауза 1:30»
        с обратным отсчётом; на время паузы включается all talk (sv_alltalk), после паузы настройки возвращаются.
        Длина паузы: BREAK_SECONDS (по умолчанию 90 = 1:30). Выключить all talk: PAUSE_ALLTALK=0.
-v53: - В канал результатов уходит только картинка-табло: без кнопки «Скачать демку» и без текста под картинкой
-       (ELO по-прежнему начисляется). Вернуть: DEMO_BUTTON=1 (кнопка демо), RESULT_TEXT=1 (текст со статистикой).
+v53: - В канал результатов уходит только картинка-табло: без кнопки «Скачать демку» и без текста под картинкой.
+       Вернуть: DEMO_BUTTON=1 (кнопка демо), RESULT_TEXT=1 (текст со статистикой).
 v52: - Как на FACEIT: 24 раунда (MR12), смена сторон на перерыве между половинами, овертайм (настройки идут в конфиге матча).
      - После окончания матча бот через 15 сек автоматически кикает всех игроков с CS2-сервера.
      - MVP: если у сервера нет статистики (все нули), в центре табло показывается игрок победившей команды.
      - Тест-режим: карта заканчивается сама через TEST_MAXROUNDS раундов (по умолчанию 4), чтобы пришли map_result и демо.
-     - RCON_PASSWORD больше не хранится в коде (задайте его в Render -> Environment).
-v51: - Токен событий/демо принимается из заголовка Authorization (с Bearer и без) ИЛИ из ?t= в адресе:
-       раньше, если сервер не передавал заголовок, все события отклонялись и результат был пустой (0:0, прочерки).
+v51: - Токен событий/демо принимается из заголовка Authorization (с Bearer и без) ИЛИ из ?t= в адресе.
      - matchzy_remote_log_url и matchzy_demo_upload_url теперь с ?t=токен (запасной путь без заголовков).
      - Ручной сброс матча: бот сначала шлёт get5_endmatch (сервер выгружает демо и последние события), потом пишет результат.
      - Если событий нет вообще, счёт берётся у сервера через RCON (get5_status).
      - /fp_diag показывает счётчики HTTP-запросов от сервера (принято / отклонено).
-v50: - GOTV включается автоматически: перед загрузкой матча бот ставит tv_enable 1 и перезагружает карту (changelevel),
-       иначе CS2 не применяет tv_enable и демо не записывается.
+v50: - GOTV включается автоматически: перед загрузкой матча бот ставит tv_enable 1 и перезагружает карту (changelevel).
      - Статистика игроков: если в map_result её нет, берётся из последнего round_end, затем из player_death.
      - Диагностика: счётчик событий MatchZy в /fp_diag и RAW-логи первых round_end / player_death.
 v49: - В центре табло: аватар и ник MVP (игрок с наибольшим числом убийств), надпись «MVP» вместо «ИТОГ».
-     - K/D: статистика по player_death сбрасывается на going_live только один раз (раньше повторный going_live её стирал).
-     - Демо: включается GOTV (tv_enable), запрос на /demo пишется в лог, match id берётся и из имени файла,
-       поддержан заголовок Authorization с префиксом Bearer.
-     - RCON_PASSWORD больше не хранится в коде: задайте его в Render -> Environment.
-v48: - K/D на табло считается надёжно: убийства и смерти берутся из событий player_death (даже если сервер не прислал
-       итоговую статистику); подсчёт начинается с going_live, всё до него (нож, разминка) отбрасывается.
-     - Убийство тиммейта гранатой/молотовом: пули своих не ранят, гранаты и молотов ранят (friendly fire только от гранат);
-       за убийство тиммейта игра снимает штраф ($300, параметр TK_PENALTY), в чат сервера уходит сообщение [TK].
+     - K/D: статистика по player_death сбрасывается на going_live только один раз.
+     - Демо: включается GOTV (tv_enable), запрос на /demo пишется в лог, match id берётся и из имени файла.
+v48: - K/D на табло считается надёжно: убийства и смерти берутся из событий player_death.
+     - Убийство тиммейта гранатой/молотовом: штраф TK_PENALTY, в чат сервера уходит сообщение [TK].
      - На фоне табло результата картинка карты (скачивается автоматически, можно положить свою в папку maps/).
-     - Сообщения в игровой чат сервера на русском теперь отправляются корректно (UTF-8).
+     - Сообщения в игровой чат сервера на русском отправляются корректно (UTF-8).
 v47: на табло результата у каждого игрока видно убийства (K), смерти (D) и K/D.
 v46: команды /match stop, /match stat, /profile, /mute, /unmute, /clan (create, accept, info, invite,
      kick, leave, list, menu), /clearrole. Статистика матчей, кланы и ELO входят в бэкап.
 """
-print("▶ bot.py v55 загружается...", flush=True)
+print("▶ bot.py v56 загружается...", flush=True)
 import asyncio
 import threading
 from collections import deque
@@ -137,10 +134,13 @@ FF_OTHER = os.getenv("FF_OTHER", "0.4")                     # доля урон�
 # Канал для результатов матчей (0 = бот сам найдёт канал, в названии которого есть "результаты")
 RESULTS_CHANNEL = int(os.getenv("RESULTS_CHANNEL_ID", "1565444339084038314"))
 
-# В результате матча: RESULT_TEXT=1 (по умолчанию) = под картинкой короткий текст «Победитель + MVP»; 0 = только картинка.
+# В результате матча: RESULT_TEXT=1 (по умолчанию) = под картинкой текст (счёт, MVP, ELO, демо); 0 = только картинка.
 # DEMO_BUTTON=1 = кнопка «Скачать демку».
 DEMO_BUTTON = os.getenv("DEMO_BUTTON", "1") == "1"
 RESULT_TEXT = os.getenv("RESULT_TEXT", "1") == "1"
+
+# Сайт: плашка в правом верхнем углу картинки результата и ссылка в заголовке (пусто = выключено)
+SITE_URL = os.getenv("SITE_URL", "https://vibeproject.kz/").strip()
 
 # Бэкап привязок: приватный канал для админов, куда бот кладёт файл с привязками (0 = выключено).
 # Нужен, потому что на Render файл базы стирается при каждом обновлении.
@@ -2088,7 +2088,7 @@ async def prefetch_map_images():
 def render_result_card(map_name: str, s1, s2, team_rows: dict, has_stats: bool,
                        center: dict | None, names: tuple) -> bytes:
     """Рисует картинку-табло матча на фоне картинки карты. У каждого игрока три колонки: K (убийства), D (смерти), K/D.
-    В центре: аватар и ник MVP (больше всех убийств), надпись «MVP».
+    В центре: аватар и ник MVP (больше всех убийств), надпись «MVP». В правом верхнем углу плашка сайта (SITE_URL).
     Блокирующая: вызывать через to_thread."""
     from PIL import Image, ImageDraw, ImageFilter, ImageEnhance
 
@@ -2161,7 +2161,7 @@ def render_result_card(map_name: str, s1, s2, team_rows: dict, has_stats: bool,
             d.line((x0 + 18, y + 66, x0 + PW - 18, y + 66), fill=(70, 80, 106), width=1)
             y += 70
 
-    # --- центр: аватар капитана победившей команды, «MVP», его ник, счёт, карта
+    # --- центр: аватар MVP (или игрока победившей команды), «MVP», его ник, счёт, карта
     cx = W // 2
     R = 78
     ring = Image.new("RGBA", (2 * R + 12, 2 * R + 12), (0, 0, 0, 0))
@@ -2194,6 +2194,16 @@ def render_result_card(map_name: str, s1, s2, team_rows: dict, has_stats: bool,
     d.text((cx, 395), "–", font=get_font(40), fill=gray, anchor="mm")
     d.text((cx + 78, 395), str(s2) if s2 is not None else "–", font=f_score, fill=ORANGE, anchor="mm")
     d.text((cx, 470), f"КАРТА: {map_name.replace('de_', '').upper()}", font=get_font(24), fill=gray, anchor="mm")
+
+    # --- плашка сайта в правом верхнем углу (как «voin-cs.kz ↗»)
+    if SITE_URL:
+        label = SITE_URL.replace("https://", "").replace("http://", "").strip("/") + " ↗"
+        f_site = get_font(17)
+        tw = d.textlength(label, font=f_site)
+        x1 = W - 30
+        x0 = x1 - tw - 28
+        d.rounded_rectangle((x0, 7, x1, 35), 8, fill=(30, 32, 38, 235), outline=(84, 88, 100, 255), width=1)
+        d.text(((x0 + x1) / 2, 21), label, font=f_site, fill=white, anchor="mm")
 
     out = io.BytesIO()
     img.convert("RGB").save(out, "PNG")
@@ -2254,11 +2264,10 @@ def apply_elo(players: dict, win_n: int) -> dict:
 
 
 async def post_result(data: dict, players: dict, match_id, note: str = ""):
-    """Публикует итог матча в канале результатов: карточка-табло на фоне карты (в центре MVP).
-    По умолчанию (RESULT_TEXT=1) над картинкой короткий текст: только «Победитель (счёт)» и «MVP — ник».
-    Без K/D/A, ADR, HS и без списков игроков/ELO в тексте (ELO при этом начисляется).
-    Кнопка демо включается DEMO_BUTTON=1. Без статистики сервера пишет простой список составов
-    (с текущим ELO игроков).
+    """Публикует итог матча в канале результатов: карточка-табло на фоне карты (в центре MVP, справа вверху плашка сайта).
+    По умолчанию (RESULT_TEXT=1) над картинкой текст в стиле сайта: «Счёт | Победитель», MVP «ник — K/D/A | ADR | HS%»,
+    ELO каждого игрока (стало и изменение) и ссылка «Скачать демку». Кнопка демо включается DEMO_BUTTON=1.
+    Без картинки пишет простой список составов (с текущим ELO игроков).
     note: непустая строка = победитель неизвестен (ELO не меняется)."""
     try:
         mid = int(match_id)
@@ -2362,15 +2371,27 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
         if win in ("team1", "team2"):
             wn = 1 if win == "team1" else 2
             ws, ls = (s1, s2) if wn == 1 else (s2, s1)
-            lines.append(f"**Победитель:** 🏆 {names[wn - 1]} (Счёт: {ws} - {ls})")
+            lines.append(f"**Счёт:** {ws} : {ls} | **Победитель:** 🏆 {names[wn - 1]}")
         elif s1 is not None and s2 is not None:
-            lines.append(f"**Матч завершён** (Счёт: {s1} - {s2})")
-        if not lines:
+            lines.append(f"**Матч завершён** (Счёт: {s1} : {s2})")
+        else:
             lines.append("**Матч завершён**")
+        e = discord.Embed(title=f"Матч #{mid} завершён", description="\n".join(lines), color=0xF1C40F,
+                          url=SITE_URL or None)
         if mvp:
-            lines.append("")
-            lines.append(f"🏅 **MVP — {mvp['name']}**")
-        e = discord.Embed(title=f"Match #{mid} — РЕЗУЛЬТАТЫ", description="\n".join(lines), color=0xF1C40F)
+            e.add_field(name="🏅 MVP",
+                        value=f"{mvp['name']} — {mvp['k']}/{mvp['d']}/{mvp['a']} | {mvp['adr']} ADR | {mvp['hs']}% HS",
+                        inline=False)
+        if changes:  # ELO каждого игрока: стало (изменение)
+            for n in (1, 2):
+                part = []
+                for m, tn in players.values():
+                    if tn == n and m.id in changes:
+                        old, new = changes[m.id]
+                        part.append(f"{m.display_name}: **{new}** ({new - old:+d})")
+                if part:
+                    e.add_field(name=f"ELO — {names[n - 1]}"[:256], value="\n".join(part)[:1024], inline=True)
+        e.add_field(name="Демо", value=f"[Скачать демку]({WEB_BASE_URL}/demo/{mid})", inline=False)
         e.set_image(url="attachment://result.png")
         if RESULT_TEXT:
             kwargs = {"embed": e, "file": discord.File(io.BytesIO(card), filename="result.png")}
@@ -2389,7 +2410,8 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
             lines.append(f"**Team 1  {s1} : {s2}  Team 2**")
         if win in ("team1", "team2"):
             lines.append("🏆 Победитель: **" + ("Team 1" if win == "team1" else "Team 2") + "**")
-        e = discord.Embed(title=f"Результат матча #{mid} — {pretty(raw_map)}", color=0x57F287)
+        e = discord.Embed(title=f"Результат матча #{mid} — {pretty(raw_map)}", color=0x57F287,
+                          url=SITE_URL or None)
         e.description = "\n".join(lines) or "Матч завершён."
         for n in (1, 2):
             rows = [(r["k"], f"{r['member'].mention if r['member'] else r['name']}: "
@@ -2402,6 +2424,7 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
             t = (t1, t2)[n - 1]
             title = f"Team {n}" + (f" ({t.get('score')})" if t.get("score") is not None else "")
             e.add_field(name=title, value="\n".join(r[1] for r in rows) or "—", inline=False)
+        e.add_field(name="Демо", value=f"[Скачать демку]({WEB_BASE_URL}/demo/{mid})", inline=False)
         kwargs = {"embed": e}
     try:
         if DEMO_BUTTON:
@@ -4430,7 +4453,8 @@ def main():
     say(f"▶ Автостарт: {'вкл' if AUTO_START else 'выкл'}, разминка {WARMUP_SECONDS} сек")
     say(f"▶ Гранаты ранят своих: {'вкл, штраф за убийство тиммейта $' + str(TK_PENALTY) if GRENADE_FF else 'выкл'}")
     say(f"▶ FACEIT: {'ключ задан' if FACEIT_API_KEY else 'FACEIT_API_KEY не задан (FACEIT-роли выключены)'}")
-    say(f"▶ Результат матча: {'картинка + текст (победитель и MVP)' if RESULT_TEXT else 'только картинка'}, кнопка демо: {'вкл' if DEMO_BUTTON else 'выкл'}")
+    say(f"▶ Результат матча: {'картинка + текст (счёт, MVP, ELO, демо)' if RESULT_TEXT else 'только картинка'}, "
+        f"кнопка демо: {'вкл' if DEMO_BUTTON else 'выкл'}, сайт: {SITE_URL or 'выкл'}")
     say(f"▶ Демо сохраняются в: {DEMO_DIR}, картинки карт: {MAP_DIR}")
     if not token:
         say("❌ Не задана переменная DISCORD_TOKEN (Render -> Environment)")
