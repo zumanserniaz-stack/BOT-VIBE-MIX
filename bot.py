@@ -6,6 +6,8 @@ VIBE MIX FreePick 5x5: очередь -> готовность -> капитан�
 При Steam-верификации бот определяет FACEIT-уровень игрока и выдаёт роль «FACEIT LVL n».
 Результат матча: табло (K / D / K/D каждого игрока) на фоне картинки карты + ELO (+30 / -20).
 
+v57: - Под результатом матча вместо кнопки «Скачать демку» теперь кнопка «vibeproject.kz» (ссылка на SITE_URL).
+       Ссылка «Скачать демку» в тексте результата остаётся.
 v56: - В результате матча: MVP «ник — K/D/A | ADR | HS%», ELO каждого игрока (стало и изменение, +30 / -20),
        ссылка «Скачать демку» в тексте (кнопка под сообщением тоже остаётся).
      - Плашка сайта (vibeproject.kz) в правом верхнем углу картинки-табло и ссылка на сайт в заголовке результата.
@@ -42,7 +44,7 @@ v47: на табло результата у каждого игрока вид�
 v46: команды /match stop, /match stat, /profile, /mute, /unmute, /clan (create, accept, info, invite,
      kick, leave, list, menu), /clearrole. Статистика матчей, кланы и ELO входят в бэкап.
 """
-print("▶ bot.py v56 загружается...", flush=True)
+print("▶ bot.py v57 загружается...", flush=True)
 import asyncio
 import threading
 from collections import deque
@@ -135,11 +137,11 @@ FF_OTHER = os.getenv("FF_OTHER", "0.4")                     # доля урон�
 RESULTS_CHANNEL = int(os.getenv("RESULTS_CHANNEL_ID", "1565444339084038314"))
 
 # В результате матча: RESULT_TEXT=1 (по умолчанию) = под картинкой текст (счёт, MVP, ELO, демо); 0 = только картинка.
-# DEMO_BUTTON=1 = кнопка «Скачать демку».
+# DEMO_BUTTON больше не используется: под результатом кнопка сайта (SITE_URL).
 DEMO_BUTTON = os.getenv("DEMO_BUTTON", "1") == "1"
 RESULT_TEXT = os.getenv("RESULT_TEXT", "1") == "1"
 
-# Сайт: плашка в правом верхнем углу картинки результата и ссылка в заголовке (пусто = выключено)
+# Сайт: плашка в правом верхнем углу картинки результата, ссылка в заголовке и кнопка под результатом (пусто = выключено)
 SITE_URL = os.getenv("SITE_URL", "https://vibeproject.kz/").strip()
 
 # Бэкап привязок: приватный канал для админов, куда бот кладёт файл с привязками (0 = выключено).
@@ -2229,13 +2231,13 @@ posted_results: set[int] = set()  # матчи, результат которы�
 
 # ---- демо матчей
 demo_urls: dict[int, str] = {}                 # match_id -> ссылка на демо
-result_msgs: dict[int, discord.Message] = {}   # match_id -> сообщение с результатом (чтобы добавить кнопку демо позже)
+result_msgs: dict[int, discord.Message] = {}   # match_id -> сообщение с результатом
 
 
-def demo_view(mid: int) -> discord.ui.View:
-    """Кнопка всегда есть в результате: ссылка ведёт на /demo/<id>, а там уже отдаётся файл (или «ещё грузится»)."""
+def site_view() -> discord.ui.View:
+    """Кнопка под результатом: ссылка на сайт."""
     v = discord.ui.View()
-    v.add_item(discord.ui.Button(label="Скачать демку", emoji="⬇️", url=f"{WEB_BASE_URL}/demo/{mid}"))
+    v.add_item(discord.ui.Button(label="vibeproject.kz", emoji="🌐", url=SITE_URL))
     return v
 
 
@@ -2266,7 +2268,7 @@ def apply_elo(players: dict, win_n: int) -> dict:
 async def post_result(data: dict, players: dict, match_id, note: str = ""):
     """Публикует итог матча в канале результатов: карточка-табло на фоне карты (в центре MVP, справа вверху плашка сайта).
     По умолчанию (RESULT_TEXT=1) над картинкой текст в стиле сайта: «Счёт | Победитель», MVP «ник — K/D/A | ADR | HS%»,
-    ELO каждого игрока (стало и изменение) и ссылка «Скачать демку». Кнопка демо включается DEMO_BUTTON=1.
+    ELO каждого игрока (стало и изменение) и ссылка «Скачать демку». Под сообщением кнопка «vibeproject.kz» (SITE_URL).
     Без картинки пишет простой список составов (с текущим ELO игроков).
     note: непустая строка = победитель неизвестен (ELO не меняется)."""
     try:
@@ -2427,8 +2429,8 @@ async def post_result(data: dict, players: dict, match_id, note: str = ""):
         e.add_field(name="Демо", value=f"[Скачать демку]({WEB_BASE_URL}/demo/{mid})", inline=False)
         kwargs = {"embed": e}
     try:
-        if DEMO_BUTTON:
-            kwargs["view"] = demo_view(mid)  # кнопка демо сразу, файл подтянется, когда сервер его загрузит
+        if SITE_URL:
+            kwargs["view"] = site_view()  # кнопка «vibeproject.kz» под результатом
         msg = await ch.send(**kwargs)
         result_msgs[mid] = msg
         live_stats.pop(mid, None)  # убийства/смерти уже в результате
@@ -2816,7 +2818,7 @@ async def h_connect(req: web.Request):
 
 
 async def h_demo(req: web.Request):
-    """Принимает файл демо от MatchZy (POST, тело = .dem), сохраняет и (если включено DEMO_BUTTON) добавляет кнопку в сообщение с результатом."""
+    """Принимает файл демо от MatchZy (POST, тело = .dem) и сохраняет его. Скачать демо можно по ссылке /demo/<id>."""
     log.info("Запрос на /demo: MatchZy-FileName=%s, MatchId=%s, Content-Length=%s",
              req.headers.get("MatchZy-FileName"), req.headers.get("MatchZy-MatchId"),
              req.headers.get("Content-Length"))
@@ -2847,12 +2849,6 @@ async def h_demo(req: web.Request):
             mid = int(found.group(1))
     if mid:
         demo_urls[mid] = url
-        msg = result_msgs.get(mid)
-        if msg and DEMO_BUTTON:  # результат уже опубликован: добавляем кнопку к нему
-            try:
-                await msg.edit(view=demo_view(mid))
-            except discord.HTTPException:
-                log.exception("Не удалось добавить кнопку демо к результату")
     return web.Response(text="ok")
 
 
@@ -4454,7 +4450,7 @@ def main():
     say(f"▶ Гранаты ранят своих: {'вкл, штраф за убийство тиммейта $' + str(TK_PENALTY) if GRENADE_FF else 'выкл'}")
     say(f"▶ FACEIT: {'ключ задан' if FACEIT_API_KEY else 'FACEIT_API_KEY не задан (FACEIT-роли выключены)'}")
     say(f"▶ Результат матча: {'картинка + текст (счёт, MVP, ELO, демо)' if RESULT_TEXT else 'только картинка'}, "
-        f"кнопка демо: {'вкл' if DEMO_BUTTON else 'выкл'}, сайт: {SITE_URL or 'выкл'}")
+        f"кнопка под результатом: {'vibeproject.kz' if SITE_URL else 'выкл'}, сайт: {SITE_URL or 'выкл'}")
     say(f"▶ Демо сохраняются в: {DEMO_DIR}, картинки карт: {MAP_DIR}")
     if not token:
         say("❌ Не задана переменная DISCORD_TOKEN (Render -> Environment)")
