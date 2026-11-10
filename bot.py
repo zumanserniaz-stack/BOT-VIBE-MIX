@@ -6,6 +6,12 @@ VIBE MIX FreePick 5x5: очередь -> готовность -> капитан�
 При Steam-верификации бот определяет FACEIT-уровень игрока и выдаёт роль «FACEIT LVL n».
 Результат матча: табло (K / D / K/D каждого игрока) на фоне картинки карты + ELO (+30 / -20).
 
+v58: - Демо и события: после загрузки матча бот пишет в лог ответ сервера на каждую команду matchzy_*;
+       если сервер не знает эти команды, в чат матча приходит предупреждение.
+     - /demo/<id> ищет файл на диске и объясняет причину, если демо нет.
+     - Бот раз в 4 минуты открывает свой адрес (Render не засыпает).
+     - /fp_diag: доступность бота снаружи, число демо на диске, настройки MatchZy через css_cvar (токен скрыт).
+     - RCON_PASSWORD в коде больше нет (задаётся только в Render -> Environment).
 v57: - Под результатом матча вместо кнопки «Скачать демку» теперь кнопка «vibeproject.kz» (ссылка на SITE_URL).
        Ссылка «Скачать демку» в тексте результата остаётся.
 v56: - В результате матча: MVP «ник — K/D/A | ADR | HS%», ELO каждого игрока (стало и изменение, +30 / -20),
@@ -44,7 +50,7 @@ v47: на табло результата у каждого игрока вид�
 v46: команды /match stop, /match stat, /profile, /mute, /unmute, /clan (create, accept, info, invite,
      kick, leave, list, menu), /clearrole. Статистика матчей, кланы и ELO входят в бэкап.
 """
-print("▶ bot.py v57 загружается...", flush=True)
+print("▶ bot.py v58 загружается...", flush=True)
 import asyncio
 import threading
 from collections import deque
@@ -103,7 +109,7 @@ FACEIT_API_KEY = os.getenv("FACEIT_API_KEY", "").strip()
 # 1 = стартовый ELO в FreePick берётся из FACEIT ELO (только для тех, у кого ещё нет рейтинга)
 FACEIT_START_ELO = os.getenv("FACEIT_START_ELO", "0") == "1"
 
-TEST_MODE = os.getenv("TEST_MODE", "0") == "1"  # 1 = тест: хватает одного игрока, без драфта
+TEST_MODE = os.getenv("TEST_MODE", "1") == "1"  # 1 = тест: хватает одного игрока, без драфта
 TEAM_SIZE = 1 if TEST_MODE else 5
 NEED = 1 if TEST_MODE else TEAM_SIZE * 2
 PICK_TIMEOUT = 30            # секунд на пик/бан, потом выбор случайный
@@ -931,12 +937,15 @@ def load_on_server(match_id: int, map_name: str = ""):
     with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
         for cmd in cmds:
             last = _rcon_run(c, cmd) or ""
+            if cmd.startswith("matchzy_") and "unknown" in last.lower():
+                log.warning("RCON: сервер не знает команду %s", cmd.split()[0])
     return last  # ответ сервера на matchzy_loadmatch_url (последняя команда)
 
 
 def set_event_cvars():
     """Блокирующая функция: заново ставит адрес для событий и загрузки демо уже ПОСЛЕ загрузки матча
-    (MatchZy мог сбросить эти настройки при loadmatch). Возвращает то, что сервер отвечает на запрос remote_log_url."""
+    (MatchZy мог сбросить эти настройки при loadmatch). Возвращает ответ сервера на запрос remote_log_url;
+    если какие-то matchzy_* команды сервер не знает, дописывает их в конец после «НЕИЗВЕСТНО:»."""
     cmds = [
         f'matchzy_remote_log_url "{WEB_BASE_URL}/events?t={EVENT_TOKEN}"',
         'matchzy_remote_log_header_key "Authorization"',
@@ -949,10 +958,17 @@ def set_event_cvars():
         'matchzy_demo_name_format "{TIME}_{MATCH_ID}_{MAP}"',
     ]
     cmds += [f"{k} {v}" for k, v in ff_cvars().items()]  # MatchZy мог вернуть свои значения при загрузке матча
+    unknown = []
     with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
         for cmd in cmds:
-            _rcon_run(c, cmd)
-        return _rcon_run(c, "matchzy_remote_log_url") or ""
+            resp = _rcon_run(c, cmd) or ""
+            log.info("RCON %s -> %r", cmd.split()[0], resp.strip()[:100])  # токен в лог не пишем
+            if "unknown" in resp.lower():
+                unknown.append(cmd.split()[0])
+        cur = _rcon_run(c, "css_cvar matchzy_remote_log_url") or _rcon_run(c, "matchzy_remote_log_url") or ""
+    if unknown:
+        cur += " | НЕИЗВЕСТНО: " + ", ".join(sorted(set(unknown)))
+    return cur
 
 
 def rcon_gamestate():
@@ -1127,6 +1143,15 @@ def rcon_raw(cmd: str) -> str:
     """Блокирующая функция: выполняет любую RCON-команду и возвращает ответ (для /fp_diag)."""
     with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
         return _rcon_run(c, cmd) or ""
+
+
+def rcon_cvar(name: str) -> str:
+    """Блокирующая функция: читает настройку плагина. Сначала css_cvar (CounterStrikeSharp), потом обычная команда."""
+    with Rcon(SERVER_IP, SERVER_PORT, passwd=RCON_PASSWORD, timeout=10) as c:
+        r = _rcon_run(c, f"css_cvar {name}") or ""
+        if not r.strip() or "unknown" in r.lower():
+            r = _rcon_run(c, name) or ""
+    return r
 
 
 def rcon_say(text: str):
@@ -1940,6 +1965,11 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
         try:  # события и демо: ставим заново после загрузки матча
             cur = await asyncio.to_thread(set_event_cvars)
             log.info("matchzy_remote_log_url после загрузки матча: %r", cur.strip()[:200])
+            if "НЕИЗВЕСТНО" in cur and chat:
+                await chat.send("⚠ CS2-сервер не знает команды MatchZy для событий/демо "
+                                f"(`{cur.split('НЕИЗВЕСТНО:')[1].strip()[:150]}`). "
+                                "Результат и демо автоматически не придут: обновите MatchZy на сервере.",
+                                delete_after=300)
         except Exception:
             log.exception("Не удалось повторно задать адрес событий MatchZy")
 
@@ -2853,18 +2883,17 @@ async def h_demo(req: web.Request):
 
 
 async def h_demo_get(req: web.Request):
-    """Скачивание демо по номеру матча: редирект на файл, если он уже загружен сервером."""
+    """Скачивание демо по номеру матча: ищем файл с этим номером в DEMO_DIR."""
     mid = req.match_info["mid"]
-    url = demo_urls.get(int(mid))
-    if not url and os.path.isdir(DEMO_DIR):
+    if os.path.isdir(DEMO_DIR):
         for f in sorted(os.listdir(DEMO_DIR), reverse=True):
             if mid in f and ".dem" in f:
-                url = f"{WEB_BASE_URL}/demos/{f}"
-                break
-    if url:
-        raise web.HTTPFound(url)
-    return page("Демо ещё не готово",
-                "Сервер загружает демо после окончания матча. Попробуйте через минуту.", False)
+                raise web.HTTPFound(f"{WEB_BASE_URL}/demos/{f}")
+    if http_hits["demo"] == 0:
+        why = "С момента запуска бота сервер не присылал ни одного демо."
+    else:
+        why = "Демо этого матча не найдено (могло стереться при перезапуске бота, если не подключён Render Disk)."
+    return page("Демо ещё не готово", why + " Если матч только что закончился, попробуйте через минуту.", False)
 
 
 async def h_events(req: web.Request):
@@ -3219,6 +3248,19 @@ async def h_auth_callback(req: web.Request):
 
 
 # ----------------------------- БОТ -----------------------------------
+async def keepalive_loop():
+    """Раз в 4 минуты открывает собственный публичный адрес, чтобы Render не усыплял бота."""
+    await asyncio.sleep(60)
+    while True:
+        try:
+            async with aiohttp.ClientSession() as ses:
+                async with ses.get(WEB_BASE_URL + "/", timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    await r.read()
+        except Exception:
+            log.warning("keepalive: не удалось открыть %s", WEB_BASE_URL)
+        await asyncio.sleep(240)
+
+
 class FreePickBot(commands.Bot):
     async def setup_hook(self):
         self.add_view(QueueView())
@@ -3246,6 +3288,7 @@ class FreePickBot(commands.Bot):
         await runner.setup()
         await web.TCPSite(runner, "0.0.0.0", WEB_PORT).start()
         log.info("Веб-сервер слушает порт %s", WEB_PORT)
+        asyncio.create_task(keepalive_loop())  # Render не должен засыпать
 
         # Синхронизация слэш-команд
         if GUILD_ID:
@@ -3511,8 +3554,27 @@ async def fp_diag_cmd(i: discord.Interaction):
                  f"demo ок={http_hits['demo']}, отклонено={http_hits['demo_bad']}")
     parts.append("Счётчик событий: " + (", ".join(f"{k}={v}" for k, v in event_counts.items()) or "—"))
     parts.append("**События MatchZy (последние)**\n```" + ("\n".join(list(event_log)[-8:]) or "ничего не приходило") + "```")
-    for cv in ("matchzy_remote_log_url", "matchzy_demo_upload_url", "tv_enable", "mp_maxrounds", "mp_halftime",
-               "mp_friendlyfire", "ff_damage_reduction_bullets", "cash_player_killed_teammate"):
+    # доступен ли бот снаружи (так его видит CS2-сервер)
+    try:
+        async with aiohttp.ClientSession() as ses:
+            async with ses.get(WEB_BASE_URL + "/", timeout=aiohttp.ClientTimeout(total=10)) as r:
+                parts.append(f"Бот по {WEB_BASE_URL}: HTTP {r.status}")
+    except Exception as exc:
+        parts.append(f"Бот по {WEB_BASE_URL} НЕ открывается: `{type(exc).__name__}`")
+    try:
+        demos = [f for f in os.listdir(DEMO_DIR) if ".dem" in f] if os.path.isdir(DEMO_DIR) else []
+        parts.append(f"Демо в `{DEMO_DIR}`: {len(demos)}" + (f", последнее `{sorted(demos)[-1][:60]}`" if demos else ""))
+    except Exception:
+        pass
+    for cv in ("matchzy_remote_log_url", "matchzy_demo_upload_url", "matchzy_demo_recording_enabled"):
+        try:
+            resp = await asyncio.to_thread(rcon_cvar, cv)
+            resp = re.sub(r"t=[\w\-]+", "t=***", resp)  # токен в чат не показываем
+            parts.append(f"`{cv}`: `{resp.strip()[:90] or '(пусто)'}`")
+        except Exception as exc:
+            parts.append(f"`{cv}`: ошибка `{type(exc).__name__}`")
+    for cv in ("tv_enable", "mp_maxrounds", "mp_halftime", "mp_friendlyfire",
+               "ff_damage_reduction_bullets", "cash_player_killed_teammate"):
         try:
             resp = await asyncio.to_thread(rcon_raw, cv)
             parts.append(f"`{cv}`: `{resp.strip()[:90] or '(пусто)'}`")
