@@ -892,7 +892,7 @@ def load_on_server(match_id: int, map_name: str = ""):
         f'matchzy_remote_log_url "{WEB_BASE_URL}/events?t={EVENT_TOKEN}"',
         'matchzy_remote_log_header_key "Authorization"',
         f'matchzy_remote_log_header_value "{EVENT_TOKEN}"',
-        'matchzy_chat_prefix [{PURPLE}VIBE MIX{Default}]',
+        'matchzy_chat_prefix {PURPLE}VIBE MIX{Default}',
         # GOTV должен быть включён, иначе демо не записывается
         'tv_enable 1',
         'tv_delay 0',
