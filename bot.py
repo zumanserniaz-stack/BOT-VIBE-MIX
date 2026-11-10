@@ -105,7 +105,7 @@ VERIFIED_ROLE = int(os.getenv("VERIFIED_ROLE_ID", "1565117832251965653"))
 
 # FACEIT: ключ с https://developers.faceit.com (Server side API key). Пусто = FACEIT-роли выключены.
 # Ключ задаётся ТОЛЬКО в Render -> Environment (FACEIT_API_KEY), в коде его не храним.
-FACEIT_API_KEY = os.getenv("FACEIT_API_KEY", "").strip()
+FACEIT_API_KEY = os.getenv("FACEIT_API_KEY", "dc718e03-bd86-4430-b54d-f7919c3aaf50").strip()
 # 1 = стартовый ELO в FreePick берётся из FACEIT ELO (только для тех, у кого ещё нет рейтинга)
 FACEIT_START_ELO = os.getenv("FACEIT_START_ELO", "1") == "1"
 
