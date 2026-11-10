@@ -4493,6 +4493,1148 @@ async def clan_menu(i: discord.Interaction):
 bot.tree.add_command(clan_group)
 
 
+# =====================================================================
+#  КОМАНДЫ: /match, /profile, /mute, /unmute, /clearrole, /clan
+# =====================================================================
+CLAN_MAX = int(os.getenv("CLAN_MAX_MEMBERS", "10"))   # максимум игроков в клане
+CLAN_INVITE_TTL = 3 * 86400                            # приглашение действует 3 дня
+
+# ---- таблицы (создаются при запуске) ----
+db.execute("CREATE TABLE IF NOT EXISTS clans ("
+           "id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, name_key TEXT NOT NULL UNIQUE, "
+           "tag TEXT NOT NULL, tag_key TEXT NOT NULL UNIQUE, owner_id INTEGER NOT NULL, created INTEGER NOT NULL)")
+for _col in ("elo INTEGER NOT NULL DEFAULT 1000", "wins INTEGER NOT NULL DEFAULT 0",
+             "losses INTEGER NOT NULL DEFAULT 0"):   # ELO клана и счёт клановых войн
+    try:
+        db.execute(f"ALTER TABLE clans ADD COLUMN {_col}")
+    except sqlite3.OperationalError:
+        pass
+db.execute("CREATE TABLE IF NOT EXISTS clan_members ("
+           "discord_id INTEGER PRIMARY KEY, clan_id INTEGER NOT NULL, role TEXT NOT NULL DEFAULT 'member', "
+           "joined INTEGER NOT NULL)")
+db.execute("CREATE TABLE IF NOT EXISTS clan_invites ("
+           "clan_id INTEGER NOT NULL, discord_id INTEGER NOT NULL, inviter_id INTEGER NOT NULL, "
+           "created INTEGER NOT NULL, PRIMARY KEY (clan_id, discord_id))")
+db.execute("CREATE TABLE IF NOT EXISTS clan_assets ("      # роль и войс каждого клана
+           "clan_id INTEGER PRIMARY KEY, role_id INTEGER, vc_id INTEGER, tag TEXT)")
+db.execute("CREATE TABLE IF NOT EXISTS clan_war_cd ("      # кулдаун вызовов: кто -> кому -> когда
+           "a INTEGER, b INTEGER, ts INTEGER, PRIMARY KEY (a, b))")
+db.execute("CREATE TABLE IF NOT EXISTS matches ("
+           "match_id INTEGER PRIMARY KEY, map TEXT, score1 INTEGER, score2 INTEGER, winner TEXT, created INTEGER)")
+db.execute("CREATE TABLE IF NOT EXISTS match_stats ("
+           "match_id INTEGER NOT NULL, discord_id INTEGER NOT NULL, team INTEGER, kills INTEGER, deaths INTEGER, "
+           "assists INTEGER, adr INTEGER, hs INTEGER, won INTEGER, has_stats INTEGER NOT NULL DEFAULT 1, "
+           "PRIMARY KEY (match_id, discord_id))")
+db.commit()
+
+
+# ---- сохранение статистики матча + бэкап новых таблиц ----
+def save_match(mid, map_name, s1, s2, win, team_rows, players):
+    """Вызывается из post_result: пишет итог матча и статистику каждого игрока."""
+    try:
+        db.execute("INSERT OR REPLACE INTO matches (match_id, map, score1, score2, winner, created) "
+                   "VALUES (?,?,?,?,?,?)", (mid, map_name, s1 or 0, s2 or 0, win or "", int(time.time())))
+        saved = set()
+        for n in (1, 2):
+            won = 1 if win == f"team{n}" else 0
+            for r in team_rows.get(n, []):
+                m = r.get("member")
+                if not m:
+                    continue
+                db.execute("INSERT OR REPLACE INTO match_stats VALUES (?,?,?,?,?,?,?,?,?,1)",
+                           (mid, m.id, n, r["k"], r["d"], r["a"], r["adr"], r["hs"], won))
+                saved.add(m.id)
+        for m, n in players.values():  # игроки без статистики сервера: только факт участия
+            if m.id not in saved:
+                won = 1 if win == f"team{n}" else 0
+                db.execute("INSERT OR REPLACE INTO match_stats VALUES (?,?,?,0,0,0,0,0,?,0)", (mid, m.id, n, won))
+        db.commit()
+        schedule_backup()
+    except Exception:
+        log.exception("Не удалось сохранить статистику матча %s", mid)
+
+
+def dump_extra() -> dict:
+    return {
+        "clans": db.execute("SELECT id,name,name_key,tag,tag_key,owner_id,created FROM clans").fetchall(),
+        "clan_elo": db.execute("SELECT id,elo,wins,losses FROM clans").fetchall(),
+        "clan_members": db.execute("SELECT discord_id,clan_id,role,joined FROM clan_members").fetchall(),
+        "matches": db.execute("SELECT match_id,map,score1,score2,winner,created FROM matches").fetchall(),
+        "match_stats": db.execute("SELECT match_id,discord_id,team,kills,deaths,assists,adr,hs,won,has_stats "
+                                  "FROM match_stats").fetchall(),
+    }
+
+
+def restore_extra(data: dict):
+    for r in data.get("clans", []):
+        db.execute("INSERT OR IGNORE INTO clans (id,name,name_key,tag,tag_key,owner_id,created) "
+                   "VALUES (?,?,?,?,?,?,?)", tuple(r))
+    for cid, e_, w_, l_ in data.get("clan_elo", []):
+        db.execute("UPDATE clans SET elo=?, wins=?, losses=? WHERE id=?", (int(e_), int(w_), int(l_), int(cid)))
+    for r in data.get("clan_members", []):
+        db.execute("INSERT OR IGNORE INTO clan_members (discord_id,clan_id,role,joined) VALUES (?,?,?,?)", tuple(r))
+    for r in data.get("matches", []):
+        db.execute("INSERT OR IGNORE INTO matches (match_id,map,score1,score2,winner,created) "
+                   "VALUES (?,?,?,?,?,?)", tuple(r))
+    for r in data.get("match_stats", []):
+        db.execute("INSERT OR IGNORE INTO match_stats (match_id,discord_id,team,kills,deaths,assists,adr,hs,won,"
+                   "has_stats) VALUES (?,?,?,?,?,?,?,?,?,?)", tuple(r))
+
+
+def is_admin_user(i: discord.Interaction) -> bool:
+    return isinstance(i.user, discord.Member) and i.user.guild_permissions.administrator
+
+
+# ---- единый обработчик ошибок слэш-команд (чтобы не было «приложение не отвечает») ----
+@bot.tree.error
+async def on_app_command_error(i: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        msg = "⛔ Недостаточно прав для этой команды."
+    else:
+        log.error("Ошибка команды /%s", getattr(i.command, "qualified_name", "?"), exc_info=error)
+        msg = "❌ Ошибка при выполнении команды."
+    try:
+        if i.response.is_done():
+            await i.followup.send(msg, ephemeral=True)
+        else:
+            await i.response.send_message(msg, ephemeral=True)
+    except discord.HTTPException:
+        pass
+
+
+# =====================================================================
+#  /match stop, /match stat
+# =====================================================================
+match_group = app_commands.Group(name="match", description="Матчи FreePick", guild_only=True)
+
+
+@match_group.command(name="stop", description="(админ) Остановить текущий матч или драфт")
+@app_commands.describe(publish="Опубликовать итог матча и начислить ELO (по умолчанию нет)")
+async def match_stop(i: discord.Interaction, publish: bool = False):
+    if not is_admin_user(i):
+        return await i.response.send_message("⛔ Эта команда только для администраторов.", ephemeral=True)
+    if S.phase == "queue":
+        return await i.response.send_message("Сейчас нет активного матча или драфта.", ephemeral=True)
+    await i.response.defer(ephemeral=True)
+    was = S.phase
+    if was == "draft":
+        t = S.draft_task
+        if t and not t.done():
+            t.cancel()
+    else:
+        if not publish and S.match_id:
+            posted_results.add(S.match_id)  # без итога и без изменения ELO
+        try:  # останавливаем матч на самом CS2-сервере
+            await asyncio.to_thread(rcon_raw, "get5_endmatch")
+        except Exception:
+            log.exception("Не удалось остановить матч на сервере")
+    await reset_to_queue()
+    await i.followup.send("🛑 Драфт отменён, очередь сброшена." if was == "draft"
+                          else "🛑 Матч остановлен, очередь сброшена.", ephemeral=True)
+
+
+@match_group.command(name="stat", description="Статистика матча или последние матчи игрока")
+@app_commands.describe(match_id="Номер матча (из канала результатов). Пусто = последние матчи игрока",
+                       member="Игрок (по умолчанию вы)")
+async def match_stat(i: discord.Interaction, match_id: int = None, member: discord.Member = None):
+    if match_id:
+        m = db.execute("SELECT map, score1, score2, winner, created FROM matches WHERE match_id=?",
+                       (match_id,)).fetchone()
+        if not m:
+            return await i.response.send_message(
+                "Матч не найден. Статистика сохраняется только для матчей, сыгранных после обновления бота.",
+                ephemeral=True)
+        rows = db.execute("SELECT discord_id, team, kills, deaths, assists, adr, hs, won, has_stats "
+                          "FROM match_stats WHERE match_id=? ORDER BY team, kills DESC", (match_id,)).fetchall()
+        mp, s1, s2, win, created = m
+        e = discord.Embed(title=f"Матч #{match_id} — {pretty(mp or '?')}", color=0xF1C40F)
+        head = f"**Team 1  {s1} : {s2}  Team 2**"
+        if win in ("team1", "team2"):
+            head += f"\n🏆 Победитель: **{'Team 1' if win == 'team1' else 'Team 2'}**"
+        e.description = head
+        for n in (1, 2):
+            lines = []
+            for did, team, k, d, a, adr, hs, won, has in rows:
+                if team != n:
+                    continue
+                kd = k / d if d else float(k)
+                st = (f" `{k}/{d}/{a}` · K/D {kd:.2f}" + (f" · ADR {adr}" if adr else "") + f" · HS {hs}%") if has else ""
+                lines.append(f"<@{did}>{st}")
+            e.add_field(name=f"Team {n}", value="\n".join(lines)[:1024] or "—", inline=False)
+        e.set_footer(text=f"Сыграно: {time.strftime('%d.%m.%Y %H:%M', time.localtime(created or 0))}")
+        return await i.response.send_message(embed=e)
+
+    member = member or i.user
+    rows = db.execute(
+        "SELECT s.match_id, x.map, x.score1, x.score2, x.winner, s.team, s.kills, s.deaths, s.assists, s.has_stats "
+        "FROM match_stats s LEFT JOIN matches x ON x.match_id=s.match_id "
+        "WHERE s.discord_id=? ORDER BY s.match_id DESC LIMIT 5", (member.id,)).fetchall()
+    if not rows:
+        return await i.response.send_message(f"У {member.mention} пока нет сохранённых матчей.", ephemeral=True,
+                                             allowed_mentions=discord.AllowedMentions.none())
+    lines = []
+    for mid, mp, s1, s2, win, team, k, d, a, has in rows:
+        res = "➖" if win not in ("team1", "team2") else ("✅" if win == f"team{team}" else "❌")
+        kda = f" · `{k}/{d}/{a}`" if has else ""
+        lines.append(f"`#{mid}` {res} {pretty(mp or '?')} {s1}:{s2}{kda}")
+    e = discord.Embed(title=f"Последние матчи — {member.display_name}", description="\n".join(lines), color=0xF1C40F)
+    e.set_footer(text="Подробности матча: /match stat match_id:<номер>")
+    await i.response.send_message(embed=e)
+
+
+bot.tree.add_command(match_group)
+
+
+# =====================================================================
+#  /profile
+# =====================================================================
+@bot.tree.command(name="profile", description="Профиль игрока FreePick")
+@app_commands.guild_only()
+@app_commands.describe(member="Игрок (по умолчанию вы)")
+async def profile_cmd(i: discord.Interaction, member: discord.Member = None):
+    member = member or i.user
+    elo, w, l = get_stats(member.id)
+    rank = db.execute("SELECT COUNT(*) FROM elo WHERE elo > ?", (elo,)).fetchone()[0] + 1
+    n, k, d, a, adr, hs = db.execute(
+        "SELECT COUNT(*), COALESCE(SUM(kills),0), COALESCE(SUM(deaths),0), COALESCE(SUM(assists),0), "
+        "COALESCE(AVG(adr),0), COALESCE(AVG(hs),0) FROM match_stats WHERE discord_id=? AND has_stats=1",
+        (member.id,)).fetchone()
+    total = w + l
+    wr = round(w * 100 / total) if total else 0
+    e = discord.Embed(title=f"Профиль — {member.display_name}", color=0x2B2D31)
+    e.set_thumbnail(url=member.display_avatar.url)
+    e.add_field(name="ELO", value=f"**{elo}**\nМесто в топе: #{rank}", inline=True)
+    e.add_field(name="Матчи", value=f"{w}W / {l}L\nВинрейт {wr}%", inline=True)
+    if n:
+        kd = k / d if d else float(k)
+        e.add_field(name="Статистика", value=f"K/D {kd:.2f}" + (f" · ADR {adr:.0f}" if adr else "") + f" · HS {hs:.0f}%\n"
+                                              f"Убийств {k} · Смертей {d} · Помощей {a}", inline=False)
+    else:
+        e.add_field(name="Статистика", value="Пока нет данных по убийствам", inline=False)
+    c = get_clan(member.id)
+    if c:
+        e.add_field(name="Клан", value=f"[{c[2]}] {c[1]}" + (" 👑" if c[3] == member.id else ""), inline=True)
+    sid = get_steam(member.id)
+    e.add_field(name="Steam", value=f"[Профиль](https://steamcommunity.com/profiles/{sid})" if sid
+                else "не привязан", inline=True)
+    fc = next((r.name for r in member.roles if r.name.startswith("FACEIT LVL ")), None)
+    if fc:
+        e.add_field(name="FACEIT", value=fc.replace("FACEIT ", ""), inline=True)
+    flags = []
+    if is_banned(member.id):
+        flags.append("⛔ бан FreePick")
+    if member.is_timed_out():
+        flags.append("🔇 мут")
+    if flags:
+        e.add_field(name="Статус", value=", ".join(flags), inline=False)
+    await i.response.send_message(embed=e)
+
+
+# =====================================================================
+#  /mute, /unmute  (тайм-аут Discord)
+# =====================================================================
+@bot.tree.command(name="mute", description="(модератор) Выдать мут (тайм-аут) участнику")
+@app_commands.guild_only()
+@app_commands.default_permissions(moderate_members=True)
+@app_commands.describe(member="Кого замутить", duration="Срок: 10m, 2h, 3d (максимум 28 дней)", reason="Причина")
+async def mute_cmd(i: discord.Interaction, member: discord.Member, duration: str = "10m", reason: str = "—"):
+    perms = i.user.guild_permissions
+    if not (perms.moderate_members or perms.administrator):
+        return await i.response.send_message("⛔ Нужно право «Управлять участниками» (Moderate Members).", ephemeral=True)
+    if member.bot or member.id == i.user.id:
+        return await i.response.send_message("Нельзя замутить бота или самого себя.", ephemeral=True)
+    if member.guild_permissions.administrator:
+        return await i.response.send_message("Администраторов мутить нельзя.", ephemeral=True)
+    if i.user.id != i.guild.owner_id and member.top_role >= i.user.top_role:
+        return await i.response.send_message("Роль этого участника выше или равна вашей.", ephemeral=True)
+    sec = parse_duration(duration)
+    if sec is None:
+        return await i.response.send_message("Неверный срок. Примеры: `10m`, `2h`, `3d`, `1w`.", ephemeral=True)
+    sec = min(sec or 28 * 86400, 28 * 86400)  # Discord: максимум 28 дней
+    try:
+        await member.timeout(timedelta(seconds=sec), reason=f"{i.user}: {reason}"[:500])
+    except discord.Forbidden:
+        return await i.response.send_message("❌ У бота нет прав: нужна роль бота выше участника и право "
+                                             "Moderate Members.", ephemeral=True)
+    except discord.HTTPException:
+        return await i.response.send_message("❌ Не удалось выдать мут.", ephemeral=True)
+    await i.response.send_message(f"🔇 {member.mention} замучен на {fmt_dur(sec)}: {reason}", ephemeral=True,
+                                  allowed_mentions=discord.AllowedMentions.none())
+    until = int(time.time()) + sec
+    e = discord.Embed(title="🔇 Мут выдан", color=0xFEE75C, timestamp=discord.utils.utcnow())
+    e.add_field(name="Игрок", value=f"<@{member.id}>\n`{member.id}`")
+    e.add_field(name="Снимется", value=f"<t:{until}:R>")
+    e.add_field(name="Причина", value=reason[:1000])
+    e.set_thumbnail(url=member.display_avatar.url)
+    e.set_footer(text=f"Модератор: {i.user.display_name} • {i.user.id}")
+    await send_ban_log(e)
+
+
+@bot.tree.command(name="unmute", description="(модератор) Снять мут с участника")
+@app_commands.guild_only()
+@app_commands.default_permissions(moderate_members=True)
+async def unmute_cmd(i: discord.Interaction, member: discord.Member):
+    perms = i.user.guild_permissions
+    if not (perms.moderate_members or perms.administrator):
+        return await i.response.send_message("⛔ Нужно право «Управлять участниками» (Moderate Members).", ephemeral=True)
+    if not member.is_timed_out():
+        return await i.response.send_message("У этого участника нет мута.", ephemeral=True)
+    try:
+        await member.timeout(None, reason=f"Мут снят: {i.user}")
+    except discord.HTTPException:
+        return await i.response.send_message("❌ Не удалось снять мут (проверьте права бота).", ephemeral=True)
+    await i.response.send_message(f"🔊 Мут с {member.mention} снят.", ephemeral=True,
+                                  allowed_mentions=discord.AllowedMentions.none())
+
+
+# =====================================================================
+#  /clearrole
+# =====================================================================
+def _role_problem(i: discord.Interaction, role: discord.Role):
+    g = i.guild
+    if role.is_default():
+        return "Роль @everyone трогать нельзя."
+    if role.managed:
+        return "Это служебная роль (бот/интеграция), её нельзя снять вручную."
+    if role >= g.me.top_role:
+        return "Роль выше или равна роли бота: поднимите роль бота выше в настройках сервера."
+    if i.user.id != g.owner_id and role >= i.user.top_role:
+        return "Эта роль выше или равна вашей высшей роли."
+    return None
+
+
+class ClearRoleConfirm(discord.ui.View):
+    def __init__(self, user_id: int, role: discord.Role):
+        super().__init__(timeout=60)
+        self.user_id, self.role = user_id, role
+
+    @discord.ui.button(label="Да, снять у всех", style=discord.ButtonStyle.danger)
+    async def yes(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.user_id:
+            return await i.response.send_message("Это не ваша кнопка.", ephemeral=True)
+        members = list(self.role.members)
+        await i.response.edit_message(content=f"⏳ Снимаю роль **{self.role.name}** у {len(members)} участников...",
+                                      view=None)
+        done = fail = 0
+        for m in members:
+            try:
+                await m.remove_roles(self.role, reason=f"/clearrole от {i.user}")
+                done += 1
+            except discord.HTTPException:
+                fail += 1
+            await asyncio.sleep(0.4)  # не упираемся в лимиты Discord
+        await i.edit_original_response(
+            content=f"✅ Роль **{self.role.name}** снята у {done} участников" + (f", ошибок: {fail}" if fail else "") + ".")
+
+    @discord.ui.button(label="Отмена", style=discord.ButtonStyle.secondary)
+    async def no(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.user_id:
+            return await i.response.send_message("Это не ваша кнопка.", ephemeral=True)
+        await i.response.edit_message(content="Отменено.", view=None)
+
+
+@bot.tree.command(name="clearrole", description="(админ) Снять роль у участника или у всех, у кого она есть")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_roles=True)
+@app_commands.describe(role="Какую роль снять", member="С кого снять (пусто = у всех, у кого есть эта роль)")
+async def clearrole_cmd(i: discord.Interaction, role: discord.Role, member: discord.Member = None):
+    perms = i.user.guild_permissions
+    if not (perms.manage_roles or perms.administrator):
+        return await i.response.send_message("⛔ Нужно право «Управлять ролями» (Manage Roles).", ephemeral=True)
+    problem = _role_problem(i, role)
+    if problem:
+        return await i.response.send_message(f"❌ {problem}", ephemeral=True)
+    if member:
+        if role not in member.roles:
+            return await i.response.send_message(f"У {member.mention} нет роли **{role.name}**.", ephemeral=True,
+                                                 allowed_mentions=discord.AllowedMentions.none())
+        try:
+            await member.remove_roles(role, reason=f"/clearrole от {i.user}")
+        except discord.HTTPException:
+            return await i.response.send_message("❌ Не удалось снять роль (проверьте права бота).", ephemeral=True)
+        return await i.response.send_message(f"✅ Роль **{role.name}** снята у {member.mention}.", ephemeral=True,
+                                             allowed_mentions=discord.AllowedMentions.none())
+    count = len(role.members)
+    if not count:
+        return await i.response.send_message(f"Роль **{role.name}** сейчас ни у кого нет.", ephemeral=True)
+    await i.response.send_message(
+        f"⚠ Снять роль **{role.name}** у **{count}** участников? Действие нельзя отменить.",
+        view=ClearRoleConfirm(i.user.id, role), ephemeral=True)
+
+
+# =====================================================================
+#  КЛАНЫ: /clan ...  (у клана своя роль и закрытый войс, тег в нике, приглашения в ЛС, войны 5x5, ELO клана)
+# =====================================================================
+NAME_RE = re.compile(r"^[\w\- ]{3,24}$")
+TAG_RE = re.compile(r"^[A-Za-z0-9А-Яа-яЁё]{2,5}$")
+CLAN_ELO_WIN = int(os.getenv("CLAN_ELO_WIN", "25"))      # ELO клана за победу в клановой войне
+CLAN_ELO_LOSS = int(os.getenv("CLAN_ELO_LOSS", "25"))    # ELO клана за поражение
+WAR_COOLDOWN = 2 * 3600                                  # кулдаун вызова одному и тому же клану
+CLAN_CATEGORY = "КЛАНЫ"                                  # категория, где лежат войсы кланов
+CLAN_COLORS = [0x5865F2, 0xED4245, 0x57F287, 0xFEE75C, 0xEB459E, 0xFAA61A, 0x1ABC9C, 0x9B59B6]
+clan_wars: dict[int, tuple] = {}   # match_id -> (id клана team1, id клана team2)
+
+
+def get_clan(did: int):
+    """(id, name, tag, owner_id, created) клана игрока или None."""
+    return db.execute("SELECT c.id, c.name, c.tag, c.owner_id, c.created FROM clan_members m "
+                      "JOIN clans c ON c.id=m.clan_id WHERE m.discord_id=?", (did,)).fetchone()
+
+
+def clan_by_name(name: str):
+    key = (name or "").strip().casefold()
+    return db.execute("SELECT id, name, tag, owner_id, created FROM clans WHERE name_key=? OR tag_key=?",
+                      (key, key)).fetchone()
+
+
+def clan_count(cid: int) -> int:
+    return db.execute("SELECT COUNT(*) FROM clan_members WHERE clan_id=?", (cid,)).fetchone()[0]
+
+
+def _clan_row(cid: int):
+    return db.execute("SELECT id, name, tag, owner_id, created FROM clans WHERE id=?", (cid,)).fetchone()
+
+
+def clan_embed(c) -> discord.Embed:
+    cid, name, tag, owner_id, created = c
+    celo, cw, cl = db.execute("SELECT elo, wins, losses FROM clans WHERE id=?", (cid,)).fetchone()
+    mem = db.execute(
+        "SELECT m.discord_id, m.role, COALESCE(e.elo, ?) FROM clan_members m "
+        "LEFT JOIN elo e ON e.discord_id=m.discord_id WHERE m.clan_id=? "
+        "ORDER BY (m.role='owner') DESC, e.elo DESC", (ELO_START, cid)).fetchall()
+    e = discord.Embed(title=f"[{tag}] {name}", color=0x2B2D31)
+    e.add_field(name="ELO клана", value=f"**{celo}**", inline=True)
+    e.add_field(name="Клановые войны", value=f"{cw}W / {cl}L", inline=True)
+    e.add_field(name="Участники", value=f"{len(mem)}/{CLAN_MAX}", inline=True)
+    e.add_field(name="Лидер", value=f"<@{owner_id}>", inline=True)
+    e.add_field(name="Создан", value=f"<t:{created}:D>", inline=True)
+    a = db.execute("SELECT vc_id FROM clan_assets WHERE clan_id=?", (cid,)).fetchone()
+    if a:
+        e.add_field(name="Войс клана", value=f"<#{a[0]}>", inline=True)
+    lines = [f"{'👑' if role == 'owner' else '•'} <@{did}> · ELO {pe}" for did, role, pe in mem]
+    e.add_field(name="Состав", value="\n".join(lines)[:1024] or "—", inline=False)
+    return e
+
+
+def clan_create_do(user, name: str, tag: str):
+    name, tag = " ".join((name or "").split()), (tag or "").strip()
+    if get_clan(user.id):
+        return False, "Вы уже состоите в клане. Сначала выйдите: `/clan leave`."
+    if not NAME_RE.fullmatch(name):
+        return False, "Название клана: 3–24 символа (буквы, цифры, пробел, дефис, подчёркивание)."
+    if not TAG_RE.fullmatch(tag):
+        return False, "Тег клана: 2–5 символов (только буквы и цифры)."
+    try:
+        cur = db.execute("INSERT INTO clans (name, name_key, tag, tag_key, owner_id, created) VALUES (?,?,?,?,?,?)",
+                         (name, name.casefold(), tag, tag.casefold(), user.id, int(time.time())))
+    except sqlite3.IntegrityError:
+        return False, "Клан с таким названием или тегом уже существует."
+    db.execute("INSERT INTO clan_members (discord_id, clan_id, role, joined) VALUES (?,?,?,?)",
+               (user.id, cur.lastrowid, "owner", int(time.time())))
+    db.commit()
+    schedule_backup()
+    return True, f"✅ Клан **[{tag}] {name}** создан. Вы — лидер. Роль и войс клана появятся через пару секунд. Приглашайте игроков: `/clan invite`."
+
+
+class ClanInviteView(discord.ui.View):
+    """Приглашение в клан приходит в ЛС с кнопками."""
+
+    def __init__(self, clan_id: int, user_id: int):
+        super().__init__(timeout=CLAN_INVITE_TTL)
+        self.clan_id, self.user_id = clan_id, user_id
+
+    @discord.ui.button(label="Принять", emoji="✅", style=discord.ButtonStyle.success)
+    async def yes(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.user_id:
+            return await i.response.send_message("Это приглашение не для вас.", ephemeral=True)
+        row = db.execute("SELECT name FROM clans WHERE id=?", (self.clan_id,)).fetchone()
+        if not row:
+            return await i.response.edit_message(content="Этот клан уже не существует.", view=None)
+        ok, msg = clan_accept_do(i.user, row[0])
+        await i.response.edit_message(content=msg, view=None)
+
+    @discord.ui.button(label="Отклонить", emoji="✖️", style=discord.ButtonStyle.danger)
+    async def no(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.user_id:
+            return await i.response.send_message("Это приглашение не для вас.", ephemeral=True)
+        db.execute("DELETE FROM clan_invites WHERE clan_id=? AND discord_id=?", (self.clan_id, self.user_id))
+        db.commit()
+        await i.response.edit_message(content="Приглашение отклонено.", view=None)
+
+
+async def clan_invite_flow(inviter, target):
+    c = get_clan(inviter.id)
+    if not c:
+        return False, "Вы не состоите в клане."
+    if c[3] != inviter.id:
+        return False, "Приглашать может только лидер клана."
+    if target.bot or target.id == inviter.id:
+        return False, "Нельзя пригласить бота или самого себя."
+    if get_clan(target.id):
+        return False, f"{target.mention} уже состоит в клане."
+    if clan_count(c[0]) >= CLAN_MAX:
+        return False, f"В клане максимум {CLAN_MAX} участников."
+    db.execute("INSERT OR REPLACE INTO clan_invites (clan_id, discord_id, inviter_id, created) VALUES (?,?,?,?)",
+               (c[0], target.id, inviter.id, int(time.time())))
+    db.commit()
+    try:
+        await target.send(f"📨 **{inviter.display_name}** приглашает вас в клан **[{c[2]}] {c[1]}**.\n"
+                          "Приглашение действует 3 дня.", view=ClanInviteView(c[0], target.id))
+    except discord.HTTPException:
+        return True, (f"{target.mention}: ЛС закрыты. Приглашение сохранено, пусть напишет `/clan accept` "
+                      "на сервере.")
+    return True, f"📨 Приглашение отправлено {target.mention} в личные сообщения."
+
+
+def clan_accept_do(user, name: str = None):
+    if get_clan(user.id):
+        return False, "Вы уже состоите в клане."
+    rows = db.execute("SELECT c.id, c.name, c.tag FROM clan_invites v JOIN clans c ON c.id=v.clan_id "
+                      "WHERE v.discord_id=? AND v.created>?", (user.id, int(time.time()) - CLAN_INVITE_TTL)).fetchall()
+    if not rows:
+        return False, "У вас нет действующих приглашений."
+    if name:
+        key = name.strip().casefold()
+        rows = [r for r in rows if key in (r[1].casefold(), r[2].casefold())]
+        if not rows:
+            return False, "Приглашения от этого клана нет."
+    elif len(rows) > 1:
+        return False, "У вас несколько приглашений, укажите клан: " + ", ".join(f"**{r[1]}**" for r in rows)
+    cid, cname, ctag = rows[0]
+    if clan_count(cid) >= CLAN_MAX:
+        return False, "В клане уже нет свободных мест."
+    db.execute("INSERT INTO clan_members (discord_id, clan_id, role, joined) VALUES (?,?,?,?)",
+               (user.id, cid, "member", int(time.time())))
+    db.execute("DELETE FROM clan_invites WHERE discord_id=?", (user.id,))
+    db.commit()
+    schedule_backup()
+    return True, f"✅ Вы вступили в клан **[{ctag}] {cname}**."
+
+
+def clan_kick_do(owner, target_id: int):
+    c = get_clan(owner.id)
+    if not c:
+        return False, "Вы не состоите в клане."
+    if c[3] != owner.id:
+        return False, "Исключать может только лидер клана."
+    if target_id == owner.id:
+        return False, "Себя исключить нельзя. Чтобы выйти, используйте `/clan leave`."
+    tc = get_clan(target_id)
+    if not tc or tc[0] != c[0]:
+        return False, "Этот игрок не состоит в вашем клане."
+    db.execute("DELETE FROM clan_members WHERE discord_id=?", (target_id,))
+    db.commit()
+    schedule_backup()
+    return True, f"👢 <@{target_id}> исключён из клана."
+
+
+def clan_disband_do(owner):
+    c = get_clan(owner.id)
+    if not c or c[3] != owner.id:
+        return False, "Распустить клан может только его лидер."
+    db.execute("DELETE FROM clan_members WHERE clan_id=?", (c[0],))
+    db.execute("DELETE FROM clan_invites WHERE clan_id=?", (c[0],))
+    db.execute("DELETE FROM clans WHERE id=?", (c[0],))
+    db.commit()
+    schedule_backup()
+    return True, f"🗑 Клан **[{c[2]}] {c[1]}** распущен. Роль и войс клана удаляются."
+
+
+def clan_leave_do(user):
+    c = get_clan(user.id)
+    if not c:
+        return False, "Вы не состоите в клане."
+    if c[3] == user.id:
+        nxt = db.execute("SELECT discord_id FROM clan_members WHERE clan_id=? AND discord_id<>? "
+                         "ORDER BY joined LIMIT 1", (c[0], user.id)).fetchone()
+        if not nxt:  # лидер один в клане: клан распускается
+            return clan_disband_do(user)
+        db.execute("UPDATE clans SET owner_id=? WHERE id=?", (nxt[0], c[0]))
+        db.execute("UPDATE clan_members SET role='owner' WHERE discord_id=?", (nxt[0],))
+        db.execute("DELETE FROM clan_members WHERE discord_id=?", (user.id,))
+        db.commit()
+        schedule_backup()
+        return True, f"🚪 Вы покинули клан **[{c[2]}] {c[1]}**. Лидерство передано <@{nxt[0]}>."
+    db.execute("DELETE FROM clan_members WHERE discord_id=?", (user.id,))
+    db.commit()
+    schedule_backup()
+    return True, f"🚪 Вы покинули клан **[{c[2]}] {c[1]}**."
+
+
+# ---------- роль, закрытый войс и тег в нике (синхронизация с базой) ----------
+async def _tag_nick(member: discord.Member, tag: str, add: bool):
+    pre = f"[{tag}] "
+    nick = member.nick
+    try:
+        if add:
+            base = nick or member.display_name
+            if base.startswith(pre):
+                return
+            await member.edit(nick=(pre + base)[:32], reason="Клан: тег")
+        elif nick and nick.startswith(pre):
+            await member.edit(nick=nick[len(pre):] or None, reason="Клан: тег снят")
+    except discord.HTTPException:
+        pass  # владельцу сервера и тем, чья роль выше бота, ник менять нельзя
+
+
+_resync_lock = asyncio.Lock()
+
+
+async def clan_resync(guild: discord.Guild | None):
+    """Приводит роли, войсы и теги кланов в соответствие с базой. Безопасно вызывать сколько угодно раз."""
+    if not guild:
+        return
+    async with _resync_lock:
+        try:
+            clans = db.execute("SELECT id, name, tag, owner_id FROM clans").fetchall()
+            assets = {r[0]: r for r in db.execute("SELECT clan_id, role_id, vc_id, tag FROM clan_assets")}
+            alive = {c[0] for c in clans}
+
+            # 1) клан распущен: удаляем роль и войс, снимаем тег
+            for cid, role_id, vc_id, tag in list(assets.values()):
+                if cid in alive:
+                    continue
+                role = guild.get_role(role_id)
+                if role:
+                    for m in list(role.members):
+                        await _tag_nick(m, tag, False)
+                    try:
+                        await role.delete(reason="Клан распущен")
+                    except discord.HTTPException:
+                        pass
+                vc = guild.get_channel(vc_id)
+                if vc:
+                    try:
+                        await vc.delete(reason="Клан распущен")
+                    except discord.HTTPException:
+                        pass
+                db.execute("DELETE FROM clan_assets WHERE clan_id=?", (cid,))
+            db.commit()
+            if not clans:
+                return
+
+            cat = discord.utils.get(guild.categories, name=CLAN_CATEGORY)
+            if not cat:
+                cat = await guild.create_category(CLAN_CATEGORY, reason="Клановые войсы")
+
+            # 2) каждому клану: роль + закрытый войс
+            for cid, name, tag, owner_id in clans:
+                rname = f"[{tag}] {name}"[:100]
+                vname = f"🛡 [{tag}] {name}"[:100]
+                a = assets.get(cid)
+                role = guild.get_role(a[1]) if a else None
+                if not role:
+                    role = discord.utils.get(guild.roles, name=rname) or await guild.create_role(
+                        name=rname, colour=discord.Colour(CLAN_COLORS[cid % len(CLAN_COLORS)]),
+                        mentionable=False, reason="Роль клана")
+                elif role.name != rname:
+                    await role.edit(name=rname)
+                ow = {
+                    # все видят войс, но зайти не могут
+                    guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=False),
+                    role: discord.PermissionOverwrite(view_channel=True, connect=True, speak=True),
+                    guild.me: discord.PermissionOverwrite(view_channel=True, connect=True,
+                                                          move_members=True, manage_channels=True),
+                }
+                vc = guild.get_channel(a[2]) if a else None
+                if not vc:
+                    vc = discord.utils.get(guild.voice_channels, name=vname)
+                if not vc:
+                    vc = await guild.create_voice_channel(vname, category=cat, overwrites=ow,
+                                                          reason="Войс клана")
+                elif vc.name != vname:
+                    await vc.edit(name=vname, overwrites=ow)
+                db.execute("INSERT OR REPLACE INTO clan_assets VALUES (?,?,?,?)", (cid, role.id, vc.id, tag))
+                db.commit()
+
+                ids = {r[0] for r in db.execute("SELECT discord_id FROM clan_members WHERE clan_id=?", (cid,))}
+                for m in list(role.members):          # вышел или исключён
+                    if m.id not in ids:
+                        try:
+                            await m.remove_roles(role, reason="Покинул клан")
+                        except discord.HTTPException:
+                            pass
+                        await _tag_nick(m, tag, False)
+                for did in ids:                       # состоит в клане
+                    mem = guild.get_member(did)
+                    if not mem:
+                        continue
+                    if role not in mem.roles:
+                        try:
+                            await mem.add_roles(role, reason="Вступил в клан")
+                        except discord.HTTPException:
+                            log.warning("Не удалось выдать роль клана (роль бота выше, право Manage Roles)")
+                    await _tag_nick(mem, tag, True)
+        except Exception:
+            log.exception("clan_resync: ошибка (нужны права Manage Roles, Manage Channels, Manage Nicknames)")
+
+
+def request_resync():
+    try:
+        asyncio.get_running_loop().create_task(clan_resync(get_guild()))
+    except RuntimeError:
+        pass
+
+
+def _with_resync(fn):
+    def wrapper(*a, **k):
+        res = fn(*a, **k)
+        if res and res[0]:
+            request_resync()
+        return res
+    return wrapper
+
+
+# после любого успешного действия с кланом роли, войсы и теги обновляются сами
+clan_create_do = _with_resync(clan_create_do)
+clan_accept_do = _with_resync(clan_accept_do)
+clan_kick_do = _with_resync(clan_kick_do)
+clan_leave_do = _with_resync(clan_leave_do)
+clan_disband_do = _with_resync(clan_disband_do)
+
+
+clan_group = app_commands.Group(name="clan", description="Кланы FreePick", guild_only=True)
+
+
+@clan_group.command(name="create", description="Создать клан")
+@app_commands.describe(name="Название клана (3–24 символа)", tag="Тег клана (2–5 символов)")
+async def clan_create(i: discord.Interaction, name: app_commands.Range[str, 3, 24], tag: app_commands.Range[str, 2, 5]):
+    ok, msg = clan_create_do(i.user, name, tag)
+    await i.response.send_message(msg, ephemeral=not ok)
+
+
+@clan_group.command(name="invite", description="Пригласить игрока в клан (только лидер)")
+async def clan_invite(i: discord.Interaction, member: discord.Member):
+    await i.response.defer(ephemeral=True)
+    ok, msg = await clan_invite_flow(i.user, member)
+    await i.followup.send(msg, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+@clan_group.command(name="accept", description="Принять приглашение в клан")
+@app_commands.describe(clan="Клан, из которого пришло приглашение (если оно одно, можно не указывать)")
+async def clan_accept(i: discord.Interaction, clan: str = None):
+    ok, msg = clan_accept_do(i.user, clan)
+    await i.response.send_message(msg, ephemeral=not ok)
+
+
+@clan_accept.autocomplete("clan")
+async def clan_accept_ac(i: discord.Interaction, current: str):
+    rows = db.execute("SELECT c.name, c.tag FROM clan_invites v JOIN clans c ON c.id=v.clan_id "
+                      "WHERE v.discord_id=? AND v.created>?", (i.user.id, int(time.time()) - CLAN_INVITE_TTL)).fetchall()
+    cur = (current or "").casefold()
+    return [app_commands.Choice(name=f"[{t}] {n}"[:100], value=n) for n, t in rows
+            if cur in n.casefold() or cur in t.casefold()][:25]
+
+
+async def clan_name_ac(i: discord.Interaction, current: str):
+    like = f"%{(current or '').casefold()}%"
+    rows = db.execute("SELECT name, tag FROM clans WHERE name_key LIKE ? OR tag_key LIKE ? "
+                      "ORDER BY name_key LIMIT 25", (like, like)).fetchall()
+    return [app_commands.Choice(name=f"[{t}] {n}"[:100], value=n) for n, t in rows]
+
+
+@clan_group.command(name="info", description="Информация о клане")
+@app_commands.describe(name="Название или тег клана (пусто = ваш клан)")
+@app_commands.autocomplete(name=clan_name_ac)
+async def clan_info(i: discord.Interaction, name: str = None):
+    c = clan_by_name(name) if name else get_clan(i.user.id)
+    if not c:
+        return await i.response.send_message("Клан не найден." if name else "Вы не состоите в клане.",
+                                             ephemeral=True)
+    await i.response.send_message(embed=clan_embed(c))
+
+
+@clan_group.command(name="kick", description="Исключить игрока из клана (только лидер)")
+async def clan_kick(i: discord.Interaction, member: discord.User):
+    ok, msg = clan_kick_do(i.user, member.id)
+    await i.response.send_message(msg, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+@clan_group.command(name="leave", description="Покинуть клан")
+async def clan_leave(i: discord.Interaction):
+    ok, msg = clan_leave_do(i.user)
+    await i.response.send_message(msg, ephemeral=True)
+
+
+def clan_top_embed(title: str) -> discord.Embed | None:
+    """Рейтинг кланов по ELO клана (ELO меняется только в клановых войнах)."""
+    rows = db.execute(
+        "SELECT c.name, c.tag, COUNT(m.discord_id) AS n, c.elo, c.wins, c.losses "
+        "FROM clans c JOIN clan_members m ON m.clan_id=c.id "
+        "GROUP BY c.id ORDER BY c.elo DESC, c.wins DESC, n DESC LIMIT 15").fetchall()
+    if not rows:
+        return None
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    lines = [f"{medals.get(n, f'`{n}.`')} **[{t}] {nm}** · ELO **{elo}** · {w}W/{l}L · {cnt}/{CLAN_MAX} игроков"
+             for n, (nm, t, cnt, elo, w, l) in enumerate(rows, 1)]
+    return discord.Embed(title=title, description="\n".join(lines), color=0xFEE75C)
+
+
+@clan_group.command(name="list", description="Рейтинг кланов по ELO клана")
+async def clan_list(i: discord.Interaction):
+    emb = clan_top_embed("Топ кланов FreePick")
+    if not emb:
+        return await i.response.send_message("Кланов пока нет. Создайте первый: `/clan create`.", ephemeral=True)
+    await i.response.send_message(embed=emb)
+
+
+class ClanCreateModal(discord.ui.Modal, title="Создать клан"):
+    name = discord.ui.TextInput(label="Название (3–24 символа)", min_length=3, max_length=24)
+    tag = discord.ui.TextInput(label="Тег (2–5 символов)", min_length=2, max_length=5)
+
+    async def on_submit(self, i: discord.Interaction):
+        ok, msg = clan_create_do(i.user, str(self.name), str(self.tag))
+        await i.response.send_message(msg, ephemeral=True)
+
+
+class ClanDisbandConfirm(discord.ui.View):
+    def __init__(self, user_id: int):
+        super().__init__(timeout=60)
+        self.user_id = user_id
+
+    @discord.ui.button(label="Да, распустить", style=discord.ButtonStyle.danger)
+    async def yes(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.user_id:
+            return await i.response.send_message("Это не ваша кнопка.", ephemeral=True)
+        ok, msg = clan_disband_do(i.user)
+        await i.response.edit_message(content=msg, view=None)
+
+    @discord.ui.button(label="Отмена", style=discord.ButtonStyle.secondary)
+    async def no(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.user_id:
+            return await i.response.send_message("Это не ваша кнопка.", ephemeral=True)
+        await i.response.edit_message(content="Отменено.", view=None)
+
+
+class ClanMenu(discord.ui.View):
+    """Меню клана с кнопками. Для игрока без клана: создание клана и список приглашений."""
+
+    def __init__(self, user_id: int, clan):
+        super().__init__(timeout=180)
+        self.user_id = user_id
+        if clan:
+            self._add("Информация", discord.ButtonStyle.primary, self.on_info, "📋")
+            if clan[3] == user_id:
+                self._add("Пригласить", discord.ButtonStyle.success, self.on_invite, "📨")
+                self._add("Бросить вызов", discord.ButtonStyle.danger, self.on_war, "⚔️")
+            self._add("Покинуть клан", discord.ButtonStyle.secondary, self.on_leave, "🚪")
+            if clan[3] == user_id:
+                self._add("Распустить клан", discord.ButtonStyle.danger, self.on_disband, "🗑")
+        else:
+            self._add("Создать клан", discord.ButtonStyle.success, self.on_create, "➕")
+
+    def _add(self, label, style, cb, emoji):
+        b = discord.ui.Button(label=label, style=style, emoji=emoji)
+        b.callback = cb
+        self.add_item(b)
+
+    async def interaction_check(self, i: discord.Interaction) -> bool:
+        if i.user.id != self.user_id:
+            await i.response.send_message("Это меню другого игрока. Откройте своё: `/clan menu`.", ephemeral=True)
+            return False
+        return True
+
+    async def on_info(self, i: discord.Interaction):
+        c = get_clan(i.user.id)
+        if not c:
+            return await i.response.send_message("Вы уже не состоите в клане.", ephemeral=True)
+        await i.response.send_message(embed=clan_embed(c), ephemeral=True)
+
+    async def on_invite(self, i: discord.Interaction):
+        sel = discord.ui.UserSelect(placeholder="Кого пригласить?", min_values=1, max_values=1)
+
+        async def picked(ii: discord.Interaction):
+            await ii.response.defer(ephemeral=True)
+            ok, msg = await clan_invite_flow(ii.user, sel.values[0])
+            await ii.followup.send(msg, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+        sel.callback = picked
+        v = discord.ui.View(timeout=60)
+        v.add_item(sel)
+        await i.response.send_message("Выберите игрока:", view=v, ephemeral=True)
+
+    async def on_war(self, i: discord.Interaction):
+        c = get_clan(i.user.id)
+        if not c or c[3] != i.user.id:
+            return await i.response.send_message("Только лидер клана может бросать вызов.", ephemeral=True)
+        rows = db.execute(
+            "SELECT c.id, c.name, c.tag, c.elo FROM clans c JOIN clan_members m ON m.clan_id=c.id "
+            "WHERE c.id<>? GROUP BY c.id HAVING COUNT(m.discord_id)>=? ORDER BY c.elo DESC LIMIT 25",
+            (c[0], TEAM_SIZE)).fetchall()
+        if not rows:
+            return await i.response.send_message(f"Нет кланов, у которых {TEAM_SIZE}+ участников.", ephemeral=True)
+        sel = discord.ui.Select(placeholder="Какому клану бросить вызов?",
+                                options=[discord.SelectOption(label=f"[{t}] {n}"[:100], value=str(cid),
+                                                              description=f"ELO {e}") for cid, n, t, e in rows])
+
+        async def picked(ii: discord.Interaction):
+            await ii.response.defer(ephemeral=True)
+            ok, msg = await send_war_challenge(ii.user, int(sel.values[0]))
+            await ii.followup.send(msg, ephemeral=True)
+
+        sel.callback = picked
+        v = discord.ui.View(timeout=60)
+        v.add_item(sel)
+        await i.response.send_message("Выберите соперника:", view=v, ephemeral=True)
+
+    async def on_leave(self, i: discord.Interaction):
+        ok, msg = clan_leave_do(i.user)
+        await i.response.send_message(msg, ephemeral=True)
+
+    async def on_disband(self, i: discord.Interaction):
+        await i.response.send_message("⚠ Распустить клан? Это нельзя отменить.",
+                                      view=ClanDisbandConfirm(i.user.id), ephemeral=True)
+
+    async def on_create(self, i: discord.Interaction):
+        await i.response.send_modal(ClanCreateModal())
+
+
+@clan_group.command(name="menu", description="Меню клана")
+async def clan_menu(i: discord.Interaction):
+    c = get_clan(i.user.id)
+    if c:
+        emb = clan_embed(c)
+    else:
+        inv = db.execute("SELECT c.name, c.tag FROM clan_invites v JOIN clans c ON c.id=v.clan_id "
+                         "WHERE v.discord_id=? AND v.created>?",
+                         (i.user.id, int(time.time()) - CLAN_INVITE_TTL)).fetchall()
+        text = "Вы не состоите в клане. Создайте свой кнопкой ниже или примите приглашение."
+        if inv:
+            text += "\n\n**Ваши приглашения:**\n" + "\n".join(f"• **[{t}] {n}** — `/clan accept clan:{n}`" for n, t in inv)
+        emb = discord.Embed(title="Кланы FreePick", description=text, color=0x2B2D31)
+    await i.response.send_message(embed=emb, view=ClanMenu(i.user.id, c), ephemeral=True)
+
+
+bot.tree.add_command(clan_group)
+
+
+# =====================================================================
+#  КЛАНОВЫЕ ВОЙНЫ 5x5
+# =====================================================================
+async def clan_veto(channel, caps) -> str:
+    """Вето карт для клановой войны: банят лидеры кланов по очереди."""
+    no = next_match_no()
+    maps, banned_list, turn, vmsg, last = MAPS.copy(), [], 0, None, ""
+    while len(maps) > 1:
+        cap = caps[turn]
+        view = VetoView(cap, maps)
+        emb = veto_embed(no, maps, banned_list, cap, last=last)
+        if vmsg is None:
+            vmsg = await track_send(channel, embed=emb, view=view)
+        else:
+            await vmsg.edit(embed=emb, view=view)
+        await view.wait()
+        banned = view.banned or random.choice(maps)
+        maps.remove(banned)
+        banned_list.append((banned, cap))
+        last = f"{cap.display_name} забанил карту {pretty(banned)}"
+        turn ^= 1
+    await vmsg.edit(embed=veto_embed(no, maps, banned_list, final=maps[0], last=last), view=None)
+    return maps[0]
+
+
+async def start_clan_war(channel, c1, c2):
+    """Берёт игроков из клановых войсов и запускает матч. Возвращает текст ошибки или None."""
+    guild = get_guild()
+    if not guild or not channel:
+        return "Не найден канал для матча (админу нужно отправить /setup)."
+    teams = []
+    for c in (c1, c2):
+        a = db.execute("SELECT vc_id FROM clan_assets WHERE clan_id=?", (c[0],)).fetchone()
+        vc = guild.get_channel(a[0]) if a else None
+        if not vc:
+            return f"У клана [{c[2]}] нет войса (админ может выполнить /clan_sync)."
+        mems = []
+        for m in vc.members:
+            mc = get_clan(m.id)
+            if not m.bot and mc and mc[0] == c[0] and get_steam(m.id) and not is_banned(m.id):
+                mems.append(m)
+        if len(mems) < TEAM_SIZE:
+            return (f"Клан **[{c[2]}]** не собрал {TEAM_SIZE} игроков с привязанным Steam в своём войсе "
+                    f"(сейчас {len(mems)}). Соберитесь и повторите.")
+        mems.sort(key=lambda m: (m.id != c[3], -get_elo(m.id)))   # лидер первым: он капитан
+        teams.append(mems[:TEAM_SIZE])
+    async with S.lock:
+        if S.phase != "queue":
+            return "Сейчас идёт драфт или матч. Дождитесь окончания."
+        S.phase = "draft"
+        S.war = (c1[0], c2[0])
+        S.queue = []
+    players = teams[0] + teams[1]
+    await refresh_panel()
+    asyncio.create_task(run_match(channel, players, fixed_teams=teams))
+    return None
+
+
+class ClanWarView(discord.ui.View):
+    """Вызов приходит лидеру клана-соперника в ЛС."""
+
+    def __init__(self, c1_id: int, c2_id: int):
+        super().__init__(timeout=3600)
+        self.c1_id, self.c2_id = c1_id, c2_id
+
+    @discord.ui.button(label="Принять вызов", emoji="⚔️", style=discord.ButtonStyle.success)
+    async def yes(self, i: discord.Interaction, b: discord.ui.Button):
+        c1, c2 = _clan_row(self.c1_id), _clan_row(self.c2_id)
+        if not c1 or not c2:
+            return await i.response.edit_message(content="Один из кланов уже не существует.", view=None)
+        if i.user.id != c2[3]:
+            return await i.response.send_message("Принять вызов может только лидер клана.", ephemeral=True)
+        await i.response.defer()
+        channel = S.panel.channel if S.panel else None
+        err = await start_clan_war(channel, c1, c2)
+        if err:
+            return await i.followup.send(f"⚠ {err}", ephemeral=True)
+        await i.edit_original_response(content=f"⚔️ Вызов принят: **[{c1[2]}]** vs **[{c2[2]}]**. "
+                                               "Матч готовится, смотрите чат матча.", view=None)
+
+    @discord.ui.button(label="Отклонить", emoji="✖️", style=discord.ButtonStyle.danger)
+    async def no(self, i: discord.Interaction, b: discord.ui.Button):
+        c2 = _clan_row(self.c2_id)
+        if not c2 or i.user.id != c2[3]:
+            return await i.response.send_message("Отклонить может только лидер клана.", ephemeral=True)
+        await i.response.edit_message(content="Вызов отклонён.", view=None)
+
+
+async def send_war_challenge(owner: discord.Member, target_id: int):
+    c1, c2 = get_clan(owner.id), _clan_row(target_id)
+    if not c1 or c1[3] != owner.id:
+        return False, "Бросать вызов может только лидер клана."
+    if not c2 or c2[0] == c1[0]:
+        return False, "Клан не найден."
+    for c in (c1, c2):
+        if clan_count(c[0]) < TEAM_SIZE:
+            return False, f"В клане **[{c[2]}]** меньше {TEAM_SIZE} участников: войны недоступны."
+    cd = db.execute("SELECT ts FROM clan_war_cd WHERE a=? AND b=?", (c1[0], c2[0])).fetchone()
+    if cd and cd[0] > time.time() - WAR_COOLDOWN:
+        return False, f"Кулдаун: этому клану можно снова бросить вызов <t:{int(cd[0] + WAR_COOLDOWN)}:R>."
+    if S.phase != "queue":
+        return False, "Сейчас идёт драфт или матч. Попробуйте позже."
+    g = get_guild()
+    target_owner = g.get_member(c2[3]) if g else None
+    if not target_owner:
+        return False, "Лидер клана-соперника не найден на сервере."
+    my_elo = db.execute("SELECT elo FROM clans WHERE id=?", (c1[0],)).fetchone()[0]
+    try:
+        await target_owner.send(
+            f"⚔️ Клан **[{c1[2]}] {c1[1]}** (ELO {my_elo}) бросает вызов вашему клану "
+            f"**[{c2[2]}] {c2[1]}** в матче {TEAM_SIZE}x{TEAM_SIZE}.\n"
+            f"Соберите {TEAM_SIZE} игроков в войсе клана и нажмите «Принять вызов».",
+            view=ClanWarView(c1[0], c2[0]))
+    except discord.HTTPException:
+        return False, "У лидера соперника закрыты ЛС, вызов не отправлен."
+    db.execute("INSERT OR REPLACE INTO clan_war_cd VALUES (?,?,?)", (c1[0], c2[0], int(time.time())))
+    db.commit()
+    return True, (f"⚔️ Вызов отправлен клану **[{c2[2]}] {c2[1]}**. Соберите {TEAM_SIZE} игроков в войсе "
+                  "вашего клана: матч стартует, когда соперник примет вызов.")
+
+
+async def apply_clan_elo(mid: int, win_n: int, ch):
+    """ELO кланов после клановой войны: победитель +CLAN_ELO_WIN, проигравший -CLAN_ELO_LOSS."""
+    pair = clan_wars.pop(mid, None)
+    if not pair:
+        return
+    lines = []
+    for n, cid in enumerate(pair, 1):
+        row = db.execute("SELECT name, tag, elo FROM clans WHERE id=?", (cid,)).fetchone()
+        if not row:
+            continue
+        won = n == win_n
+        new = max(ELO_MIN, row[2] + (CLAN_ELO_WIN if won else -CLAN_ELO_LOSS))
+        db.execute("UPDATE clans SET elo=?, wins=wins+?, losses=losses+? WHERE id=?",
+                   (new, int(won), int(not won), cid))
+        lines.append(f"{'🏆' if won else '💀'} **[{row[1]}] {row[0]}**: {new} ({new - row[2]:+d})")
+    db.commit()
+    schedule_backup()
+    if lines and ch:
+        try:
+            await ch.send(embed=discord.Embed(title="⚔️ ELO кланов", description="\n".join(lines), color=0xF1C40F))
+        except discord.HTTPException:
+            pass
+
+
+# =====================================================================
+#  ПАНЕЛЬ «КЛАНОВЫЕ ВОЙНЫ»: /clan_setup, /clan_sync
+# =====================================================================
+CLAN_SITE = SITE_URL or "https://vibeproject.kz"
+
+
+def clan_panel_embed() -> discord.Embed:
+    e = discord.Embed(title="➤ Клановые войны", color=0xED4245)
+    e.description = (
+        "Создай клан, собери команду и бросай вызов другим кланам в матчах 5v5\n\n"
+        "➤ **Как начать**\n"
+        "⚪ Нажми «Создать клан» и введи название и тег\n"
+        "⚪ Пригласи минимум 4 участников через «Мой клан»\n"
+        "⚪ Бросай вызовы через меню управления кланом\n\n"
+        "» **Правила**\n"
+        "⚪ Минимум 5 участников для участия в войнах\n"
+        "⚪ Cooldown между вызовами одному клану — 2 ч.\n"
+        "⚪ Если клан не собрал 5 игроков в своём войсе, матч не стартует (NO-SHOW)\n"
+        "⚪ Тег клана автоматически добавляется к нику каждого участника"
+    )
+    e.add_field(name="VIBE PROJECT kz", value="\u200b", inline=False)
+    e.set_footer(text=CLAN_SITE.replace("https://", "").replace("http://", "").strip("/"))
+    return e
+
+
+class ClanPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(discord.ui.Button(label=CLAN_SITE.replace("https://", "").replace("http://", "").strip("/"),
+                                        emoji="🌐", url=CLAN_SITE))
+
+    @discord.ui.button(label="Создать клан", style=discord.ButtonStyle.primary, custom_id="fp:clan_create")
+    async def create(self, i: discord.Interaction, b: discord.ui.Button):
+        if get_clan(i.user.id):
+            return await i.response.send_message("Вы уже состоите в клане. Сначала выйдите: `/clan leave`.",
+                                                 ephemeral=True)
+        await i.response.send_modal(ClanCreateModal())
+
+    @discord.ui.button(label="Рейтинг кланов", style=discord.ButtonStyle.secondary, custom_id="fp:clan_top")
+    async def top(self, i: discord.Interaction, b: discord.ui.Button):
+        emb = clan_top_embed("Топ кланов VIBE PROJECT")
+        if not emb:
+            return await i.response.send_message("Кланов пока нет. Создайте первый кнопкой «Создать клан».",
+                                                 ephemeral=True)
+        await i.response.send_message(embed=emb, ephemeral=True)
+
+    @discord.ui.button(label="Мой клан", style=discord.ButtonStyle.secondary, custom_id="fp:clan_my")
+    async def my(self, i: discord.Interaction, b: discord.ui.Button):
+        c = get_clan(i.user.id)
+        if c:
+            emb = clan_embed(c)
+        else:
+            inv = db.execute("SELECT c.name, c.tag FROM clan_invites v JOIN clans c ON c.id=v.clan_id "
+                             "WHERE v.discord_id=? AND v.created>?",
+                             (i.user.id, int(time.time()) - CLAN_INVITE_TTL)).fetchall()
+            text = "Вы не состоите в клане. Создайте свой кнопкой «Создать клан» или примите приглашение."
+            if inv:
+                text += "\n\n**Ваши приглашения:**\n" + "\n".join(
+                    f"• **[{t}] {n}** — `/clan accept clan:{n}`" for n, t in inv)
+            emb = discord.Embed(title="Кланы VIBE PROJECT", description=text, color=0x2B2D31)
+        await i.response.send_message(embed=emb, view=ClanMenu(i.user.id, c), ephemeral=True)
+
+
+@bot.tree.command(name="clan_setup", description="(админ) Отправить панель «Клановые войны» в этот канал")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@admin
+async def clan_setup_cmd(i: discord.Interaction):
+    await i.channel.send(embed=clan_panel_embed(), view=ClanPanelView())
+    await i.response.send_message("Панель кланов отправлена.", ephemeral=True)
+
+
+@bot.tree.command(name="clan_sync", description="(админ) Пересоздать роли, войсы и теги кланов")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@admin
+async def clan_sync_cmd(i: discord.Interaction):
+    await i.response.defer(ephemeral=True)
+    await clan_resync(i.guild)
+    await i.followup.send("✅ Роли, войсы и теги кланов обновлены.", ephemeral=True)
+
+
 # ----------------------------- ЗАПУСК --------------------------------
 def say(msg: str):
     print(msg, flush=True)
@@ -4513,6 +5655,7 @@ def main():
     say(f"▶ FACEIT: {'ключ задан' if FACEIT_API_KEY else 'FACEIT_API_KEY не задан (FACEIT-роли выключены)'}")
     say(f"▶ Результат матча: {'картинка + текст (счёт, MVP, ELO, демо)' if RESULT_TEXT else 'только картинка'}, "
         f"кнопка под результатом: {'vibeproject.kz' if SITE_URL else 'выкл'}, сайт: {SITE_URL or 'выкл'}")
+    say(f"▶ Клановые войны: ELO клана +{CLAN_ELO_WIN} / -{CLAN_ELO_LOSS}, кулдаун вызова {WAR_COOLDOWN // 3600} ч")
     say(f"▶ Демо сохраняются в: {DEMO_DIR}, картинки карт: {MAP_DIR}")
     if not token:
         say("❌ Не задана переменная DISCORD_TOKEN (Render -> Environment)")
