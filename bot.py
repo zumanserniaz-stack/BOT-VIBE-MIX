@@ -4728,140 +4728,6 @@ async def profile_cmd(i: discord.Interaction, member: discord.Member = None):
     if flags:
         e.add_field(name="Статус", value=", ".join(flags), inline=False)
     await i.response.send_message(embed=e)
-
-
-# =====================================================================
-#  /mute, /unmute  (тайм-аут Discord)
-# =====================================================================
-@bot.tree.command(name="mute", description="(модератор) Выдать мут (тайм-аут) участнику")
-@app_commands.guild_only()
-@app_commands.default_permissions(moderate_members=True)
-@app_commands.describe(member="Кого замутить", duration="Срок: 10m, 2h, 3d (максимум 28 дней)", reason="Причина")
-async def mute_cmd(i: discord.Interaction, member: discord.Member, duration: str = "10m", reason: str = "—"):
-    perms = i.user.guild_permissions
-    if not (perms.moderate_members or perms.administrator):
-        return await i.response.send_message("⛔ Нужно право «Управлять участниками» (Moderate Members).", ephemeral=True)
-    if member.bot or member.id == i.user.id:
-        return await i.response.send_message("Нельзя замутить бота или самого себя.", ephemeral=True)
-    if member.guild_permissions.administrator:
-        return await i.response.send_message("Администраторов мутить нельзя.", ephemeral=True)
-    if i.user.id != i.guild.owner_id and member.top_role >= i.user.top_role:
-        return await i.response.send_message("Роль этого участника выше или равна вашей.", ephemeral=True)
-    sec = parse_duration(duration)
-    if sec is None:
-        return await i.response.send_message("Неверный срок. Примеры: `10m`, `2h`, `3d`, `1w`.", ephemeral=True)
-    sec = min(sec or 28 * 86400, 28 * 86400)  # Discord: максимум 28 дней
-    try:
-        await member.timeout(timedelta(seconds=sec), reason=f"{i.user}: {reason}"[:500])
-    except discord.Forbidden:
-        return await i.response.send_message("❌ У бота нет прав: нужна роль бота выше участника и право "
-                                             "Moderate Members.", ephemeral=True)
-    except discord.HTTPException:
-        return await i.response.send_message("❌ Не удалось выдать мут.", ephemeral=True)
-    await i.response.send_message(f"🔇 {member.mention} замучен на {fmt_dur(sec)}: {reason}", ephemeral=True,
-                                  allowed_mentions=discord.AllowedMentions.none())
-    until = int(time.time()) + sec
-    e = discord.Embed(title="🔇 Мут выдан", color=0xFEE75C, timestamp=discord.utils.utcnow())
-    e.add_field(name="Игрок", value=f"<@{member.id}>\n`{member.id}`")
-    e.add_field(name="Снимется", value=f"<t:{until}:R>")
-    e.add_field(name="Причина", value=reason[:1000])
-    e.set_thumbnail(url=member.display_avatar.url)
-    e.set_footer(text=f"Модератор: {i.user.display_name} • {i.user.id}")
-    await send_ban_log(e)
-
-
-@bot.tree.command(name="unmute", description="(модератор) Снять мут с участника")
-@app_commands.guild_only()
-@app_commands.default_permissions(moderate_members=True)
-async def unmute_cmd(i: discord.Interaction, member: discord.Member):
-    perms = i.user.guild_permissions
-    if not (perms.moderate_members or perms.administrator):
-        return await i.response.send_message("⛔ Нужно право «Управлять участниками» (Moderate Members).", ephemeral=True)
-    if not member.is_timed_out():
-        return await i.response.send_message("У этого участника нет мута.", ephemeral=True)
-    try:
-        await member.timeout(None, reason=f"Мут снят: {i.user}")
-    except discord.HTTPException:
-        return await i.response.send_message("❌ Не удалось снять мут (проверьте права бота).", ephemeral=True)
-    await i.response.send_message(f"🔊 Мут с {member.mention} снят.", ephemeral=True,
-                                  allowed_mentions=discord.AllowedMentions.none())
-
-
-# =====================================================================
-#  /clearrole
-# =====================================================================
-def _role_problem(i: discord.Interaction, role: discord.Role):
-    g = i.guild
-    if role.is_default():
-        return "Роль @everyone трогать нельзя."
-    if role.managed:
-        return "Это служебная роль (бот/интеграция), её нельзя снять вручную."
-    if role >= g.me.top_role:
-        return "Роль выше или равна роли бота: поднимите роль бота выше в настройках сервера."
-    if i.user.id != g.owner_id and role >= i.user.top_role:
-        return "Эта роль выше или равна вашей высшей роли."
-    return None
-
-
-class ClearRoleConfirm(discord.ui.View):
-    def __init__(self, user_id: int, role: discord.Role):
-        super().__init__(timeout=60)
-        self.user_id, self.role = user_id, role
-
-    @discord.ui.button(label="Да, снять у всех", style=discord.ButtonStyle.danger)
-    async def yes(self, i: discord.Interaction, b: discord.ui.Button):
-        if i.user.id != self.user_id:
-            return await i.response.send_message("Это не ваша кнопка.", ephemeral=True)
-        members = list(self.role.members)
-        await i.response.edit_message(content=f"⏳ Снимаю роль **{self.role.name}** у {len(members)} участников...",
-                                      view=None)
-        done = fail = 0
-        for m in members:
-            try:
-                await m.remove_roles(self.role, reason=f"/clearrole от {i.user}")
-                done += 1
-            except discord.HTTPException:
-                fail += 1
-            await asyncio.sleep(0.4)  # не упираемся в лимиты Discord
-        await i.edit_original_response(
-            content=f"✅ Роль **{self.role.name}** снята у {done} участников" + (f", ошибок: {fail}" if fail else "") + ".")
-
-    @discord.ui.button(label="Отмена", style=discord.ButtonStyle.secondary)
-    async def no(self, i: discord.Interaction, b: discord.ui.Button):
-        if i.user.id != self.user_id:
-            return await i.response.send_message("Это не ваша кнопка.", ephemeral=True)
-        await i.response.edit_message(content="Отменено.", view=None)
-
-
-@bot.tree.command(name="clearrole", description="(админ) Снять роль у участника или у всех, у кого она есть")
-@app_commands.guild_only()
-@app_commands.default_permissions(manage_roles=True)
-@app_commands.describe(role="Какую роль снять", member="С кого снять (пусто = у всех, у кого есть эта роль)")
-async def clearrole_cmd(i: discord.Interaction, role: discord.Role, member: discord.Member = None):
-    perms = i.user.guild_permissions
-    if not (perms.manage_roles or perms.administrator):
-        return await i.response.send_message("⛔ Нужно право «Управлять ролями» (Manage Roles).", ephemeral=True)
-    problem = _role_problem(i, role)
-    if problem:
-        return await i.response.send_message(f"❌ {problem}", ephemeral=True)
-    if member:
-        if role not in member.roles:
-            return await i.response.send_message(f"У {member.mention} нет роли **{role.name}**.", ephemeral=True,
-                                                 allowed_mentions=discord.AllowedMentions.none())
-        try:
-            await member.remove_roles(role, reason=f"/clearrole от {i.user}")
-        except discord.HTTPException:
-            return await i.response.send_message("❌ Не удалось снять роль (проверьте права бота).", ephemeral=True)
-        return await i.response.send_message(f"✅ Роль **{role.name}** снята у {member.mention}.", ephemeral=True,
-                                             allowed_mentions=discord.AllowedMentions.none())
-    count = len(role.members)
-    if not count:
-        return await i.response.send_message(f"Роль **{role.name}** сейчас ни у кого нет.", ephemeral=True)
-    await i.response.send_message(
-        f"⚠ Снять роль **{role.name}** у **{count}** участников? Действие нельзя отменить.",
-        view=ClearRoleConfirm(i.user.id, role), ephemeral=True)
-
-
 # =====================================================================
 #  КЛАНЫ: /clan ...  (у клана своя роль и закрытый войс, тег в нике, приглашения в ЛС, войны 5x5, ELO клана)
 # =====================================================================
@@ -4989,8 +4855,8 @@ async def clan_invite_flow(inviter, target):
 def clan_accept_do(user, name: str = None):
     if get_clan(user.id):
         return False, "Вы уже состоите в клане."
-    rows = db.execute("SELECT c.id, c.name, c.tag FROM clan_invites v JOIN clans c ON c.id=v.clan_id "
-                      "WHERE v.discord_id=? AND v.created>?", (user.id, int(time.time()) - CLAN_INVITE_TTL)).fetchall()
+    rows = db.execute("SELECT c.id, c.name, c.tag FROM clan_invites v JOIN clans c ON c.id=v._id "
+                      "WHERE v.discord_id=? AND v.created>?", (user.id, int(time.time()) - _INVITE_TTL)).fetchall()
     if not rows:
         return False, "У вас нет действующих приглашений."
     if name:
