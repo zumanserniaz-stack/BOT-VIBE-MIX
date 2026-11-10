@@ -107,7 +107,7 @@ VERIFIED_ROLE = int(os.getenv("VERIFIED_ROLE_ID", "1565117832251965653"))
 # Ключ задаётся ТОЛЬКО в Render -> Environment (FACEIT_API_KEY), в коде его не храним.
 FACEIT_API_KEY = os.getenv("FACEIT_API_KEY", "").strip()
 # 1 = стартовый ELO в FreePick берётся из FACEIT ELO (только для тех, у кого ещё нет рейтинга)
-FACEIT_START_ELO = os.getenv("FACEIT_START_ELO", "0") == "1"
+FACEIT_START_ELO = os.getenv("FACEIT_START_ELO", "1") == "1"
 
 TEST_MODE = os.getenv("TEST_MODE", "0") == "1"  # 1 = тест: хватает одного игрока, без драфта
 TEAM_SIZE = 1 if TEST_MODE else 5
@@ -4491,6 +4491,8 @@ async def clan_menu(i: discord.Interaction):
 
 
 bot.tree.add_command(clan_group)
+
+
 # ----------------------------- ЗАПУСК --------------------------------
 def say(msg: str):
     print(msg, flush=True)
@@ -4511,7 +4513,6 @@ def main():
     say(f"▶ FACEIT: {'ключ задан' if FACEIT_API_KEY else 'FACEIT_API_KEY не задан (FACEIT-роли выключены)'}")
     say(f"▶ Результат матча: {'картинка + текст (счёт, MVP, ELO, демо)' if RESULT_TEXT else 'только картинка'}, "
         f"кнопка под результатом: {'vibeproject.kz' if SITE_URL else 'выкл'}, сайт: {SITE_URL or 'выкл'}")
-    say(f"▶ Клановые войны: ELO клана +{CLAN_ELO_WIN} / -{CLAN_ELO_LOSS}, кулдаун вызова {WAR_COOLDOWN // 3600} ч")
     say(f"▶ Демо сохраняются в: {DEMO_DIR}, картинки карт: {MAP_DIR}")
     if not token:
         say("❌ Не задана переменная DISCORD_TOKEN (Render -> Environment)")
