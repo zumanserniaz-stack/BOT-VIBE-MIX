@@ -4492,7 +4492,73 @@ async def clan_menu(i: discord.Interaction):
 
 bot.tree.add_command(clan_group)
 
-
+CLAN_MAX = int(os.getenv("CLAN_MAX_MEMBERS", "10"))   # максимум игроков в клане
+CLAN_INVITE_TTL = 3 * 86400                            # приглашение действует 3 дня
+ 
+# ---- таблицы (создаются при запуске) ----
+db.execute("CREATE TABLE IF NOT EXISTS clans ("
+           "id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, name_key TEXT NOT NULL UNIQUE, "
+           "tag TEXT NOT NULL, tag_key TEXT NOT NULL UNIQUE, owner_id INTEGER NOT NULL, created INTEGER NOT NULL)")
+db.execute("CREATE TABLE IF NOT EXISTS clan_members ("
+           "discord_id INTEGER PRIMARY KEY, clan_id INTEGER NOT NULL, role TEXT NOT NULL DEFAULT 'member', "
+           "joined INTEGER NOT NULL)")
+db.execute("CREATE TABLE IF NOT EXISTS clan_invites ("
+           "clan_id INTEGER NOT NULL, discord_id INTEGER NOT NULL, inviter_id INTEGER NOT NULL, "
+           "created INTEGER NOT NULL, PRIMARY KEY (clan_id, discord_id))")
+db.execute("CREATE TABLE IF NOT EXISTS matches ("
+           "match_id INTEGER PRIMARY KEY, map TEXT, score1 INTEGER, score2 INTEGER, winner TEXT, created INTEGER)")
+db.execute("CREATE TABLE IF NOT EXISTS match_stats ("
+           "match_id INTEGER NOT NULL, discord_id INTEGER NOT NULL, team INTEGER, kills INTEGER, deaths INTEGER, "
+           "assists INTEGER, adr INTEGER, hs INTEGER, won INTEGER, has_stats INTEGER NOT NULL DEFAULT 1, "
+           "PRIMARY KEY (match_id, discord_id))")
+db.commit()
+ 
+ 
+# ---- сохранение статистики матча (бэкап кланов и матчей: dump_extra / restore_extra ниже, в блоке кланов)
+def save_match(mid, map_name, s1, s2, win, team_rows, players):
+    """Вызывается из post_result: пишет итог матча и статистику каждого игрока."""
+    try:
+        db.execute("INSERT OR REPLACE INTO matches (match_id, map, score1, score2, winner, created) "
+                   "VALUES (?,?,?,?,?,?)", (mid, map_name, s1 or 0, s2 or 0, win or "", int(time.time())))
+        saved = set()
+        for n in (1, 2):
+            won = 1 if win == f"team{n}" else 0
+            for r in team_rows.get(n, []):
+                m = r.get("member")
+                if not m:
+                    continue
+                db.execute("INSERT OR REPLACE INTO match_stats VALUES (?,?,?,?,?,?,?,?,?,1)",
+                           (mid, m.id, n, r["k"], r["d"], r["a"], r["adr"], r["hs"], won))
+                saved.add(m.id)
+        for m, n in players.values():  # игроки без статистики сервера: только факт участия
+            if m.id not in saved:
+                won = 1 if win == f"team{n}" else 0
+                db.execute("INSERT OR REPLACE INTO match_stats VALUES (?,?,?,0,0,0,0,0,?,0)", (mid, m.id, n, won))
+        db.commit()
+        schedule_backup()
+    except Exception:
+        log.exception("Не удалось сохранить статистику матча %s", mid)
+ 
+ 
+def is_admin_user(i: discord.Interaction) -> bool:
+    return isinstance(i.user, discord.Member) and i.user.guild_permissions.administrator
+ 
+ 
+# ---- единый обработчик ошибок слэш-команд (чтобы не было «приложение не отвечает») ----
+@bot.tree.error
+async def on_app_command_error(i: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        msg = "⛔ Недостаточно прав для этой команды."
+    else:
+        log.error("Ошибка команды /%s", getattr(i.command, "qualified_name", "?"), exc_info=error)
+        msg = "❌ Ошибка при выполнении команды."
+    try:
+        if i.response.is_done():
+            await i.followup.send(msg, ephemeral=True)
+        else:
+            await i.response.send_message(msg, ephemeral=True)
+    except discord.HTTPException:
+        pass
 # ----------------------------- ЗАПУСК --------------------------------
 def say(msg: str):
     print(msg, flush=True)
