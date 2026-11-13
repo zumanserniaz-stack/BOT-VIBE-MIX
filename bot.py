@@ -807,20 +807,6 @@ class VetoView(discord.ui.View):
 
 
 # ----------------------------- МАТЧ ----------------------------------
-def ff_cvars() -> dict:
-    """Настройки friendly fire: пули своих не ранят, гранаты и молотов ранят, за убийство тиммейта штраф."""
-    if not GRENADE_FF:
-        return {}
-    return {
-        "mp_friendlyfire": "1",
-        "ff_damage_reduction_bullets": "0",
-        "ff_damage_reduction_grenade": str(FF_GRENADE),
-        "ff_damage_reduction_other": str(FF_OTHER),
-        "mp_playercashawards": "1",
-        "cash_player_killed_teammate": f"-{TK_PENALTY}",
-    }
-
-
 def format_cvars() -> dict:
     """Формат как на FACEIT: MR12 (24 раунда), смена сторон на перерыве между половинами, овертайм.
     В тест-режиме карта короткая: заканчивается сама, поэтому приходят map_result и демо."""
@@ -4568,7 +4554,6 @@ def main():
         f"кик после матча: {'вкл, через ' + str(KICK_DELAY) + ' сек' if KICK_AFTER_MATCH else 'выкл'}")
     say(f"▶ Авто-бан: {'вкл' if AUTOBAN else 'выкл'}")
     say(f"▶ Автостарт: {'вкл' if AUTO_START else 'выкл'}, разминка {WARMUP_SECONDS} сек")
-    say(f"▶ Гранаты ранят своих: {'вкл, штраф за убийство тиммейта $' + str(TK_PENALTY) if GRENADE_FF else 'выкл'}")
     say(f"▶ FACEIT: {'ключ задан' if FACEIT_API_KEY else 'FACEIT_API_KEY не задан (FACEIT-роли выключены)'}")
     say(f"▶ Результат матча: {'картинка + текст (счёт, MVP, ELO, демо)' if RESULT_TEXT else 'только картинка'}, "
         f"кнопка под результатом: {'vibeproject.kz' if SITE_URL else 'выкл'}, сайт: {SITE_URL or 'выкл'}")
