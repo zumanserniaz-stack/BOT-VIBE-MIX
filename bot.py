@@ -117,9 +117,9 @@ CAPTAIN_TIMEOUT = 30         # секунд на выбор капитанов (
 READY_TIMEOUT = int(os.getenv("READY_TIMEOUT", "60"))   # секунд на кнопку «Готов»
 MATCH_MAX_SECONDS = 600 if TEST_MODE else 2 * 3600  # автосброс, если series_end не пришёл
 BREAK_SECONDS = int(os.getenv("BREAK_SECONDS", "90"))  # техпауза как на FACEIT: 1:30, потом матч продолжается
-HALFTIME_ALLTALK = os.getenv("HALFTIME_ALLTALK", "0") == "1"   # 1 = при смене сторон (CT <-> T) включать all talk
+HALFTIME_ALLTALK = os.getenv("HALFTIME_ALLTALK", "1") == "1"   # 1 = при смене сторон (CT <-> T) включать all talk
 HALFTIME_TALK_SECONDS = int(os.getenv("HALFTIME_TALK_SECONDS", "15"))  # сколько секунд all talk работает на смене сторон
-PAUSE_ALLTALK = os.getenv("PAUSE_ALLTALK", "0") == "1"   # 1 = на время паузы включать all talk (общий голосовой/текстовый чат)
+PAUSE_ALLTALK = os.getenv("PAUSE_ALLTALK", "1") == "1"   # 1 = на время паузы включать all talk (общий голосовой/текстовый чат)
 
 # Формат матча как на FACEIT: 24 раунда (MR12), смена сторон на перерыве, овертайм
 MAX_ROUNDS = int(os.getenv("MAX_ROUNDS", "24"))
