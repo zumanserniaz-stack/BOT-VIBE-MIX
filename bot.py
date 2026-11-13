@@ -6,6 +6,9 @@ VIBE MIX FreePick 5x5: очередь -> готовность -> капитан�
 При Steam-верификации бот определяет FACEIT-уровень игрока и выдаёт роль «FACEIT LVL n».
 Результат матча: табло (K / D / K/D каждого игрока) на фоне картинки карты + ELO (+30 / -20).
 
+v59: - Кнопка «Отмена игры 0/2» под карточкой матча: нужно CANCEL_VOTES голосов игроков (админ отменяет сразу).
+       Отмена и /match stop сразу кикают всех игроков с CS2-сервера, без результата и без ELO.
+     - Сброс матча быстрее: сообщения, войсы и перемещение игроков обрабатываются параллельно.
 v58: - Демо и события: после загрузки матча бот пишет в лог ответ сервера на каждую команду matchzy_*;
        если сервер не знает эти команды, в чат матча приходит предупреждение.
      - /demo/<id> ищет файл на диске и объясняет причину, если демо нет.
@@ -18,7 +21,6 @@ v56: - В результате матча: MVP «ник — K/D/A | ADR | HS%»,
        ссылка «Скачать демку» в тексте (кнопка под сообщением тоже остаётся).
      - Плашка сайта (vibeproject.kz) в правом верхнем углу картинки-табло и ссылка на сайт в заголовке результата.
        Адрес сайта: SITE_URL в Render -> Environment (пусто = без плашки).
-     - RCON_PASSWORD в коде больше нет: задайте его в Render -> Environment.
 v55: - В канал результатов уходит табло + короткий текст: только «Победитель (счёт)» и «MVP — ник».
        RESULT_TEXT включён по умолчанию (RESULT_TEXT=0 вернёт только картинку).
 v54: - На смене сторон (перерыв между половинами) включается all talk на HALFTIME_TALK_SECONDS (15 сек), потом выключается.
@@ -26,31 +28,19 @@ v54: - На смене сторон (перерыв между половина�
        с обратным отсчётом; на время паузы включается all talk (sv_alltalk), после паузы настройки возвращаются.
        Длина паузы: BREAK_SECONDS (по умолчанию 90 = 1:30). Выключить all talk: PAUSE_ALLTALK=0.
 v53: - В канал результатов уходит только картинка-табло: без кнопки «Скачать демку» и без текста под картинкой.
-       Вернуть: DEMO_BUTTON=1 (кнопка демо), RESULT_TEXT=1 (текст со статистикой).
 v52: - Как на FACEIT: 24 раунда (MR12), смена сторон на перерыве между половинами, овертайм (настройки идут в конфиге матча).
      - После окончания матча бот через 15 сек автоматически кикает всех игроков с CS2-сервера.
      - MVP: если у сервера нет статистики (все нули), в центре табло показывается игрок победившей команды.
      - Тест-режим: карта заканчивается сама через TEST_MAXROUNDS раундов (по умолчанию 4), чтобы пришли map_result и демо.
 v51: - Токен событий/демо принимается из заголовка Authorization (с Bearer и без) ИЛИ из ?t= в адресе.
-     - matchzy_remote_log_url и matchzy_demo_upload_url теперь с ?t=токен (запасной путь без заголовков).
-     - Ручной сброс матча: бот сначала шлёт get5_endmatch (сервер выгружает демо и последние события), потом пишет результат.
-     - Если событий нет вообще, счёт берётся у сервера через RCON (get5_status).
-     - /fp_diag показывает счётчики HTTP-запросов от сервера (принято / отклонено).
 v50: - GOTV включается автоматически: перед загрузкой матча бот ставит tv_enable 1 и перезагружает карту (changelevel).
-     - Статистика игроков: если в map_result её нет, берётся из последнего round_end, затем из player_death.
-     - Диагностика: счётчик событий MatchZy в /fp_diag и RAW-логи первых round_end / player_death.
 v49: - В центре табло: аватар и ник MVP (игрок с наибольшим числом убийств), надпись «MVP» вместо «ИТОГ».
-     - K/D: статистика по player_death сбрасывается на going_live только один раз.
-     - Демо: включается GOTV (tv_enable), запрос на / пишется в лог, match id берётся и из имени файла.
 v48: - K/D на табло считается надёжно: убийства и смерти берутся из событий player_death.
-     - Убийство тиммейта гранатой/молотовом: штраф TK_PENALTY, в чат сервера уходит сообщение [TK].
-     - На фоне табло результата картинка карты (скачивается автоматически, можно положить свою в папку maps/).
-     - Сообщения в игровой чат сервера на русском отправляются корректно (UTF-8).
 v47: на табло результата у каждого игрока видно убийства (K), смерти (D) и K/D.
 v46: команды /match stop, /match stat, /profile, /mute, /unmute, /clan (create, accept, info, invite,
      kick, leave, list, menu), /clearrole. Статистика матчей, кланы и ELO входят в бэкап.
 """
-print("▶ bot.py v58 загружается...", flush=True)
+print("▶ bot.py v59 загружается...", flush=True)
 import asyncio
 import threading
 from collections import deque
@@ -83,7 +73,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("freepick")
 
 # ----------------------------- НАСТРОЙКИ -----------------------------
-# CS2-сервер. RCON_PASSWORD ОБЯЗАТЕЛЬНО задай в Render -> Environment (в коде пароль не хранится)
+# CS2-сервер. RCON_PASSWORD лучше задать в Render -> Environment
 SERVER_IP = os.getenv("SERVER_IP", "45.86.81.37").strip()
 SERVER_PORT = int(os.getenv("SERVER_PORT", "55031"))
 RCON_PASSWORD = os.getenv("RCON_PASSWORD", "ArniAlash22062008Nurlan")
@@ -104,7 +94,6 @@ QUEUE_VC = int(os.getenv("QUEUE_VC_ID", "1565440992574705734"))
 VERIFIED_ROLE = int(os.getenv("VERIFIED_ROLE_ID", "1565117832251965653"))
 
 # FACEIT: ключ с https://developers.faceit.com (Server side API key). Пусто = FACEIT-роли выключены.
-# Ключ задаётся ТОЛЬКО в Render -> Environment (FACEIT_API_KEY), в коде его не храним.
 FACEIT_API_KEY = os.getenv("FACEIT_API_KEY", "dc718e03-bd86-4430-b54d-f7919c3aaf50").strip()
 # 1 = стартовый ELO в FreePick берётся из FACEIT ELO (только для тех, у кого ещё нет рейтинга)
 FACEIT_START_ELO = os.getenv("FACEIT_START_ELO", "1") == "1"
@@ -122,6 +111,7 @@ HALFTIME_TALK_SECONDS = int(os.getenv("HALFTIME_TALK_SECONDS", "15"))  # ско�
 PAUSE_ALLTALK = os.getenv("PAUSE_ALLTALK", "1") == "1"   # 1 = на время паузы включать all talk (общий голосовой/текстовый чат)
 
 # Формат матча как на FACEIT: 24 раунда (MR12), смена сторон на перерыве, овертайм
+CANCEL_VOTES = int(os.getenv("CANCEL_VOTES", "2"))  # сколько игроков должны нажать «Отмена игры»
 MAX_ROUNDS = int(os.getenv("MAX_ROUNDS", "24"))
 TEST_MAXROUNDS = int(os.getenv("TEST_MAXROUNDS", "4"))  # в тест-режиме карта заканчивается сама через столько раундов
 KICK_AFTER_MATCH = os.getenv("KICK_AFTER_MATCH", "1") == "1"   # 0 = не кикать игроков после матча
@@ -136,7 +126,6 @@ WARMUP_SECONDS = int(os.getenv("WARMUP_SECONDS", "240"))     # разминка 
 RESULTS_CHANNEL = int(os.getenv("RESULTS_CHANNEL_ID", "1565444339084038314"))
 
 # В результате матча: RESULT_TEXT=1 (по умолчанию) = под картинкой текст (счёт, MVP, ELO, демо); 0 = только картинка.
-# DEMO_BUTTON больше не используется: под результатом кнопка сайта (SITE_URL).
 DEMO_BUTTON = os.getenv("DEMO_BUTTON", "1") == "1"
 RESULT_TEXT = os.getenv("RESULT_TEXT", "1") == "1"
 
@@ -144,7 +133,6 @@ RESULT_TEXT = os.getenv("RESULT_TEXT", "1") == "1"
 SITE_URL = os.getenv("SITE_URL", "").strip()
 
 # Бэкап привязок: приватный канал для админов, куда бот кладёт файл с привязками (0 = выключено).
-# Нужен, потому что на Render файл базы стирается при каждом обновлении.
 BACKUP_CHANNEL = int(os.getenv("BACKUP_CHANNEL_ID", "1565489828706000948"))
 # Если подключён Render Disk, укажи DB_PATH=/data/freepick.db
 DB_PATH = os.getenv("DB_PATH", "freepick.db")
@@ -390,6 +378,7 @@ class State:
         self.connected: set[str] = set()               # steamid игроков матча, которые сейчас на сервере
         self.auto_started = False                      # автостарт уже запущен для этого матча
         self.moving = False                            # идёт перемещение игроков в войсы команд (драфт не отменять)
+        self.cancel_votes: set[int] = set()            # кто нажал «Отмена игры»
         self.lock = asyncio.Lock()
 
 
@@ -647,7 +636,8 @@ async def ready_check(channel, players: list[discord.Member]) -> bool:
         await msg.edit(embed=view.embed("Матч отменён", 0xED4245), view=None)
     except discord.HTTPException:
         pass
-    for m in absent:
+
+    async def _kick_from_queue(m):
         if QUEUE_VC and m.voice and m.voice.channel and m.voice.channel.id == QUEUE_VC:
             try:
                 await m.move_to(None)  # убираем из войса очереди
@@ -657,6 +647,8 @@ async def ready_check(channel, players: list[discord.Member]) -> bool:
             await m.send("⏰ Вы не нажали «Готов» и были убраны из очереди. Зайдите снова, когда будете готовы.")
         except discord.HTTPException:
             pass
+
+    await asyncio.gather(*(_kick_from_queue(m) for m in absent), return_exceptions=True)
     async with S.lock:
         S.phase = "queue"
         S.queue = ready_players          # готовые остаются в очереди
@@ -807,6 +799,24 @@ class VetoView(discord.ui.View):
 
 
 # ----------------------------- МАТЧ ----------------------------------
+# Огонь по своим: пули по тиммейтам не проходят, гранаты и молотов ранят. Штраф за убийство тиммейта.
+GRENADE_FF = os.getenv("GRENADE_FF", "1") == "1"
+TK_PENALTY = int(os.getenv("TK_PENALTY", "300"))
+
+
+def ff_cvars() -> dict:
+    if not GRENADE_FF:
+        return {"mp_friendlyfire": "0"}
+    return {
+        "mp_friendlyfire": "1",
+        "ff_damage_reduction_bullets": "0",
+        "ff_damage_reduction_grenade": "1",
+        "ff_damage_reduction_grenade_self": "1",
+        "ff_damage_reduction_other": "1",
+        "cash_player_killed_teammate": str(-TK_PENALTY),
+    }
+
+
 def format_cvars() -> dict:
     """Формат как на FACEIT: MR12 (24 раунда), смена сторон на перерыве между половинами, овертайм.
     В тест-режиме карта короткая: заканчивается сама, поэтому приходят map_result и демо."""
@@ -988,7 +998,8 @@ async def kick_everyone(targets: list, delay: int = KICK_DELAY):
     """После матча кикает всех игроков с сервера (даём несколько секунд посмотреть табло)."""
     if not KICK_AFTER_MATCH or not targets:
         return
-    await asyncio.sleep(delay)
+    if delay:
+        await asyncio.sleep(delay)
     try:
         await asyncio.to_thread(rcon_kick_many, targets)
         log.info("После матча кикнуто игроков: %s", len(targets))
@@ -1214,11 +1225,7 @@ async def clear_voice_access():
         if not ch:
             continue
         if queue_ch and isinstance(ch, discord.VoiceChannel):
-            for m in list(ch.members):
-                try:
-                    await m.move_to(queue_ch)
-                except discord.HTTPException:
-                    pass
+            await asyncio.gather(*(m.move_to(queue_ch) for m in list(ch.members)), return_exceptions=True)
         try:
             await ch.delete(reason="FreePick: матч окончен")
         except discord.HTTPException:
@@ -1313,6 +1320,25 @@ class MatchView(discord.ui.View):
         super().__init__(timeout=None)
         self.add_item(discord.ui.Button(label="Подключиться", url=f"{WEB_BASE_URL}/connect"))
 
+    @discord.ui.button(label=f"Отмена игры 0/{CANCEL_VOTES}", emoji="⛔", style=discord.ButtonStyle.danger)
+    async def cancel(self, i: discord.Interaction, b: discord.ui.Button):
+        if S.phase != "playing":
+            return await i.response.send_message("Матч уже сброшен.", ephemeral=True)
+        is_admin = isinstance(i.user, discord.Member) and i.user.guild_permissions.administrator
+        player_ids = {m.id for m, _ in S.match_players.values()}
+        if i.user.id not in player_ids and not is_admin:
+            return await i.response.send_message("Вы не участвуете в этом матче.", ephemeral=True)
+        if i.user.id in S.cancel_votes:
+            S.cancel_votes.discard(i.user.id)   # повторное нажатие = снять голос
+        else:
+            S.cancel_votes.add(i.user.id)
+        if is_admin or len(S.cancel_votes) >= CANCEL_VOTES:
+            await i.response.send_message("⛔ Игра отменена, все выкинуты с сервера.", ephemeral=True)
+            await cancel_match()
+            return
+        b.label = f"Отмена игры {len(S.cancel_votes)}/{CANCEL_VOTES}"
+        await i.response.edit_message(view=self)
+
     @discord.ui.button(label="Матч закончен", emoji="🏁", style=discord.ButtonStyle.secondary)
     async def finish(self, i: discord.Interaction, b: discord.ui.Button):
         is_admin = isinstance(i.user, discord.Member) and i.user.guild_permissions.administrator
@@ -1323,6 +1349,19 @@ class MatchView(discord.ui.View):
             return await i.response.send_message("Матч уже сброшен.", ephemeral=True)
         await i.response.send_message("🏁 Матч завершён, очередь открывается.", ephemeral=True)
         await reset_to_queue()
+
+
+async def cancel_match():
+    """Отмена игры: без результата и без ELO, всех сразу кикаем с CS2-сервера."""
+    if S.phase != "playing":
+        return
+    if S.match_id:
+        posted_results.add(S.match_id)   # результат не публикуем, ELO не меняем
+    try:
+        await asyncio.to_thread(rcon_raw, "get5_endmatch")
+    except Exception:
+        log.exception("get5_endmatch не удался")
+    await reset_to_queue(kick_delay=0)
 
 
 async def handle_disconnect(steamid: str):
@@ -1698,16 +1737,12 @@ async def track_send(channel, *args, **kwargs) -> discord.Message:
 
 
 async def clear_chat():
-    """Удаляет сообщения драфта и матча из чата."""
+    """Удаляет сообщения драфта и матча из чата (все сразу)."""
     msgs, S.chat_msgs = S.chat_msgs, []
-    for msg in msgs:
-        try:
-            await msg.delete()
-        except discord.HTTPException:
-            pass  # уже удалено или нет прав
+    await asyncio.gather(*(m.delete() for m in msgs), return_exceptions=True)
 
 
-async def reset_to_queue():
+async def reset_to_queue(kick_delay: int = KICK_DELAY):
     # если сервер не прислал результат (ручной сброс, таймер), пишем итог, но только если матч реально стартовал
     if S.match_id and S.phase == "playing" and S.match_id not in posted_results and S.ever_live:
         try:  # завершаем матч на сервере: он выгрузит демо и пришлёт последние события
@@ -1717,19 +1752,18 @@ async def reset_to_queue():
         await asyncio.sleep(3)  # даём серверу прислать последние события
         if S.match_id not in posted_results:  # map_result мог прийти за эти секунды
             await post_fallback_result(S.match_id, dict(S.match_players))
-    # матч окончен: через несколько секунд кикаем всех игроков матча с CS2-сервера
+    # матч окончен: кикаем всех игроков матча с CS2-сервера (сразу при отмене, иначе через KICK_DELAY)
     if S.phase == "playing" and S.match_players:
         targets = [user_ids.get(sid) or sid for sid in S.match_players if sid not in ADMIN_STEAMIDS]
-        asyncio.create_task(kick_everyone(targets))
-    await clear_voice_access()
-    await clear_chat()
-    await close_match_chat()
-    await close_break()
+        asyncio.create_task(kick_everyone(targets, kick_delay))
+    await asyncio.gather(clear_voice_access(), clear_chat(), close_match_chat(), close_break(),
+                         return_exceptions=True)
     S.live = False
     S.ever_live = False
     S.paused = False
     S.absent.clear()
     S.absent_names.clear()
+    S.cancel_votes = set()
     if S.pause_stop:
         S.pause_stop.set()
         S.pause_stop = None
@@ -1932,6 +1966,7 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
         S.live = False
         S.ever_live = False
         S.match_id = match_id
+        S.cancel_votes = set()
         S.connected = set()
         S.auto_started = False
         load_resp = await asyncio.to_thread(load_on_server, match_id, map_name)
@@ -3498,7 +3533,7 @@ async def unban_cmd(i: discord.Interaction, member: discord.User, reason: str = 
 @admin
 async def endmatch_cmd(i: discord.Interaction):
     await i.response.defer(ephemeral=True)
-    await reset_to_queue()
+    await reset_to_queue(kick_delay=0)
     await i.followup.send("Очередь сброшена, временные войсы команд удалены.", ephemeral=True)
 
 
@@ -3895,7 +3930,7 @@ async def match_stop(i: discord.Interaction, publish: bool = False):
             await asyncio.to_thread(rcon_raw, "get5_endmatch")
         except Exception:
             log.exception("Не удалось остановить матч на сервере")
-    await reset_to_queue()
+    await reset_to_queue(kick_delay=0)   # игроков кикаем с сервера сразу
     await i.followup.send("🛑 Драфт отменён, очередь сброшена." if was == "draft"
                           else "🛑 Матч остановлен, очередь сброшена.", ephemeral=True)
 
@@ -4471,73 +4506,7 @@ async def clan_menu(i: discord.Interaction):
 
 bot.tree.add_command(clan_group)
 
-CLAN_MAX = int(os.getenv("CLAN_MAX_MEMBERS", "10"))   # максимум игроков в клане
-CLAN_INVITE_TTL = 3 * 86400                            # приглашение действует 3 дня
- 
-# ---- таблицы (создаются при запуске) ----
-db.execute("CREATE TABLE IF NOT EXISTS clans ("
-           "id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, name_key TEXT NOT NULL UNIQUE, "
-           "tag TEXT NOT NULL, tag_key TEXT NOT NULL UNIQUE, owner_id INTEGER NOT NULL, created INTEGER NOT NULL)")
-db.execute("CREATE TABLE IF NOT EXISTS clan_members ("
-           "discord_id INTEGER PRIMARY KEY, clan_id INTEGER NOT NULL, role TEXT NOT NULL DEFAULT 'member', "
-           "joined INTEGER NOT NULL)")
-db.execute("CREATE TABLE IF NOT EXISTS clan_invites ("
-           "clan_id INTEGER NOT NULL, discord_id INTEGER NOT NULL, inviter_id INTEGER NOT NULL, "
-           "created INTEGER NOT NULL, PRIMARY KEY (clan_id, discord_id))")
-db.execute("CREATE TABLE IF NOT EXISTS matches ("
-           "match_id INTEGER PRIMARY KEY, map TEXT, score1 INTEGER, score2 INTEGER, winner TEXT, created INTEGER)")
-db.execute("CREATE TABLE IF NOT EXISTS match_stats ("
-           "match_id INTEGER NOT NULL, discord_id INTEGER NOT NULL, team INTEGER, kills INTEGER, deaths INTEGER, "
-           "assists INTEGER, adr INTEGER, hs INTEGER, won INTEGER, has_stats INTEGER NOT NULL DEFAULT 1, "
-           "PRIMARY KEY (match_id, discord_id))")
-db.commit()
- 
- 
-# ---- сохранение статистики матча (бэкап кланов и матчей: dump_extra / restore_extra ниже, в блоке кланов)
-def save_match(mid, map_name, s1, s2, win, team_rows, players):
-    """Вызывается из post_result: пишет итог матча и статистику каждого игрока."""
-    try:
-        db.execute("INSERT OR REPLACE INTO matches (match_id, map, score1, score2, winner, created) "
-                   "VALUES (?,?,?,?,?,?)", (mid, map_name, s1 or 0, s2 or 0, win or "", int(time.time())))
-        saved = set()
-        for n in (1, 2):
-            won = 1 if win == f"team{n}" else 0
-            for r in team_rows.get(n, []):
-                m = r.get("member")
-                if not m:
-                    continue
-                db.execute("INSERT OR REPLACE INTO match_stats VALUES (?,?,?,?,?,?,?,?,?,1)",
-                           (mid, m.id, n, r["k"], r["d"], r["a"], r["adr"], r["hs"], won))
-                saved.add(m.id)
-        for m, n in players.values():  # игроки без статистики сервера: только факт участия
-            if m.id not in saved:
-                won = 1 if win == f"team{n}" else 0
-                db.execute("INSERT OR REPLACE INTO match_stats VALUES (?,?,?,0,0,0,0,0,?,0)", (mid, m.id, n, won))
-        db.commit()
-        schedule_backup()
-    except Exception:
-        log.exception("Не удалось сохранить статистику матча %s", mid)
- 
- 
-def is_admin_user(i: discord.Interaction) -> bool:
-    return isinstance(i.user, discord.Member) and i.user.guild_permissions.administrator
- 
- 
-# ---- единый обработчик ошибок слэш-команд (чтобы не было «приложение не отвечает») ----
-@bot.tree.error
-async def on_app_command_error(i: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.CheckFailure):
-        msg = "⛔ Недостаточно прав для этой команды."
-    else:
-        log.error("Ошибка команды /%s", getattr(i.command, "qualified_name", "?"), exc_info=error)
-        msg = "❌ Ошибка при выполнении команды."
-    try:
-        if i.response.is_done():
-            await i.followup.send(msg, ephemeral=True)
-        else:
-            await i.response.send_message(msg, ephemeral=True)
-    except discord.HTTPException:
-        pass
+
 # ----------------------------- ЗАПУСК --------------------------------
 def say(msg: str):
     print(msg, flush=True)
@@ -4551,7 +4520,8 @@ def main():
     say(f"▶ Порт веб-сервера: {WEB_PORT}, WEB_BASE_URL: {WEB_BASE_URL}")
     say(f"▶ TEST_MODE={TEST_MODE}, QUEUE_VC_ID={QUEUE_VC}, GUILD_ID={GUILD_ID}")
     say(f"▶ Формат: {TEST_MAXROUNDS if TEST_MODE else MAX_ROUNDS} раундов, смена сторон на перерыве; "
-        f"кик после матча: {'вкл, через ' + str(KICK_DELAY) + ' сек' if KICK_AFTER_MATCH else 'выкл'}")
+        f"кик после матча: {'вкл, через ' + str(KICK_DELAY) + ' сек' if KICK_AFTER_MATCH else 'выкл'}; "
+        f"голосов для отмены игры: {CANCEL_VOTES}")
     say(f"▶ Авто-бан: {'вкл' if AUTOBAN else 'выкл'}")
     say(f"▶ Автостарт: {'вкл' if AUTO_START else 'выкл'}, разминка {WARMUP_SECONDS} сек")
     say(f"▶ FACEIT: {'ключ задан' if FACEIT_API_KEY else 'FACEIT_API_KEY не задан (FACEIT-роли выключены)'}")
