@@ -46,7 +46,7 @@ v47: на табло результата у каждого игрока вид�
 v46: команды /match stop, /match stat, /profile, /mute, /unmute, /clan (create, accept, info, invite,
      kick, leave, list, menu), /clearrole. Статистика матчей, кланы и ELO входят в бэкап.
 """
-print("▶ bot.py v61 загружается...", flush=Truhjkhkjhkhjke)
+print("▶ bot.py v61 загружается...", flush=Truh)
 import asyncio
 import threading
 from collections import deque
@@ -91,7 +91,7 @@ WEB_BASE_URL = os.getenv("WEB_BASE_URL", "https://bot-vibe-mix-1.onrender.com").
 EVENT_TOKEN = os.getenv("EVENT_TOKEN") or secrets.token_urlsafe(24)  # секрет для событий MatchZy (если не задан, генерируется сам)
 
 # ID твоего Discord-сервера: команды появятся мгновенно (необязательно)
-GUILD_ID = int(os.getenv("GUILD_ID", "1548371779523837952"))
+GUILD_ID = int(os.getenv("GUILD_ID", "1548371779523837952h"))
 
 # Голосовой канал очереди: зашёл в него = встал в очередь, вышел = покинул (0 = только кнопки)
 QUEUE_VC = int(os.getenv("QUEUE_VC_ID", "1565440992574705734"))
@@ -116,9 +116,9 @@ CAPTAIN_TIMEOUT = 30         # секунд на выбор капитанов (
 READY_TIMEOUT = int(os.getenv("READY_TIMEOUT", "60"))   # секунд на кнопку «Готов»
 MATCH_MAX_SECONDS = 600 if TEST_MODE else 2 * 3600  # автосброс, если series_end не пришёл
 BREAK_SECONDS = int(os.getenv("BREAK_SECONDS", "90"))  # техпауза как на FACEIT: 1:30, потом матч продолжается
-HALFTIME_ALLTALK = os.getenv("HALFTIME_ALLTALK", "0") == "1"   # 1 = при смене сторон (CT <-> T) включать all talk
+HALFTIME_ALLTALK = os.getenv("HALFTIME_ALLTALK", "1") == "1"   # 1 = при смене сторон (CT <-> T) включать all talk
 HALFTIME_TALK_SECONDS = int(os.getenv("HALFTIME_TALK_SECONDS", "15"))  # сколько секунд all talk работает на смене сторон
-PAUSE_ALLTALK = os.getenv("PAUSE_ALLTALK", "0") == "1"   # 1 = на время паузы включать all talk (общий голосовой/текстовый чат)
+PAUSE_ALLTALK = os.getenv("PAUSE_ALLTALK", "1") == "1"   # 1 = на время паузы включать all talk (общий голосовой/текстовый чат)
 
 # Формат матча как на FACEIT: 24 раунда (MR12), смена сторон на перерыве, овертайм
 CANCEL_VOTES = int(os.getenv("CANCEL_VOTES", "2"))  # сколько игроков должны нажать «Отмена игры»
