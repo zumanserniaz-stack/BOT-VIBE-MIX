@@ -46,7 +46,7 @@ v47: на табло результата у каждого игрока вид�
 v46: команды /match stop, /match stat, /profile, /mute, /unmute, /clan (create, accept, info, invite,
      kick, leave, list, menu), /clearrole. Статистика матчей, кланы и ELO входят в бэкап.
 """
-print("▶ bot.py v61 загружается...", flush=Truh)
+print("▶ bot.py v61 загружается...", flush=True)
 import asyncio
 import threading
 from collections import deque
@@ -91,7 +91,7 @@ WEB_BASE_URL = os.getenv("WEB_BASE_URL", "https://bot-vibe-mix-1.onrender.com").
 EVENT_TOKEN = os.getenv("EVENT_TOKEN") or secrets.token_urlsafe(24)  # секрет для событий MatchZy (если не задан, генерируется сам)
 
 # ID твоего Discord-сервера: команды появятся мгновенно (необязательно)
-GUILD_ID = int(os.getenv("GUILD_ID", "1548371779523837952h"))
+GUILD_ID = int(os.getenv("GUILD_ID", "1548371779523837952 213113131"))
 
 # Голосовой канал очереди: зашёл в него = встал в очередь, вышел = покинул (0 = только кнопки)
 QUEUE_VC = int(os.getenv("QUEUE_VC_ID", "1565440992574705734"))
