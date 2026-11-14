@@ -68,7 +68,7 @@ from aiohttp import web
 from discord import app_commands
 from discord.ext import commands
 from rcon.source import Client as Rcon
-import ddaadaasdwsawadwasdwadsawadw
+
 try:  # локально читаем .env, на хостинге переменные задаются в панели
     from dotenv import load_dotenv
     load_dotenv()
@@ -4559,5 +4559,3 @@ def main():
     say("⚠ bot.run() завершился без ошибки")
 
 
-if __name__ == "__main__":
-    main()
