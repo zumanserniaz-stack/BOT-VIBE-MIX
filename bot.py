@@ -108,7 +108,7 @@ FACEIT_API_KEY = os.getenv("FACEIT_API_KEY", "dc718e03-bd86-4430-b54d-f7919c3aaf
 # 1 = стартовый ELO в FreePick берётся из FACEIT ELO (только для тех, у кого ещё нет рейтинга)
 FACEIT_START_ELO = os.getenv("FACEIT_START_ELO", "1") == "1"
 
-TEST_MODE = os.getenv("TEST_MODE", "1") == "1"  # 1 = тест: хватает одного игрока, без драфта
+TEST_MODE = os.getenv("TEST_MODE", "0") == "1"  # 1 = тест: хватает одного игрока, без драфта
 TEAM_SIZE = 1 if TEST_MODE else 5
 NEED = 1 if TEST_MODE else TEAM_SIZE * 2
 PICK_TIMEOUT = 30            # секунд на пик/бан, потом выбор случайный
