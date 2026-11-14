@@ -6,6 +6,8 @@ VIBE MIX FreePick 5x5: очередь -> готовность -> капитан�
 При Steam-верификации бот определяет FACEIT-уровень игрока и выдаёт роль «FACEIT LVL n».
 Результат матча: табло (K / D / K/D каждого игрока) на фоне картинки карты + ELO (+30 / -20).
 
+v61: - Во время матча игроки могут свободно заходить в любые войсы: бот больше не возвращает их в войс команды.
+       Старое поведение включается переменной FORCE_TEAM_VC=1 (Render -> Environment).
 v60: - Как у KZLP: капитаны, пики игроков и вето карт идут в ОДНОМ сообщении (панель очереди), оно обновляется
        на каждом шаге (таймер, «Забанено / Осталось», красные кнопки карт).
      - После вето: «Создаю каналы команд и запускаю сервер...», игроки уходят в войсы команд,
@@ -44,7 +46,7 @@ v47: на табло результата у каждого игрока вид�
 v46: команды /match stop, /match stat, /profile, /mute, /unmute, /clan (create, accept, info, invite,
      kick, leave, list, menu), /clearrole. Статистика матчей, кланы и ELO входят в бэкап.
 """
-print("▶ bot.py v60 загружается...", flush=True)
+print("▶ bot.py v61 загружается...", flush=True)
 import asyncio
 import threading
 from collections import deque
@@ -93,6 +95,10 @@ GUILD_ID = int(os.getenv("GUILD_ID", "1548371779523837952"))
 
 # Голосовой канал очереди: зашёл в него = встал в очередь, вышел = покинул (0 = только кнопки)
 QUEUE_VC = int(os.getenv("QUEUE_VC_ID", "1565440992574705734"))
+
+# 1 = во время матча игрока, зашедшего в любой другой войс, бот возвращает в войс его команды;
+# 0 (по умолчанию) = игроки могут свободно ходить по войсам
+FORCE_TEAM_VC = os.getenv("FORCE_TEAM_VC", "0") == "1"
 
 # Роль, которая выдаётся после Steam-верификации (0 = не выдавать)
 VERIFIED_ROLE = int(os.getenv("VERIFIED_ROLE_ID", "1565117832251965653"))
@@ -3657,8 +3663,9 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     if member.bot:
         return
 
-    # Во время матча игрока, зашедшего в любой войс, сразу перекидываем в войс его команды
-    if after.channel and S.phase == "playing":
+    # Во время матча игрока, зашедшего в любой войс, перекидываем в войс его команды
+    # (только если FORCE_TEAM_VC=1; по умолчанию игроки могут свободно ходить по войсам)
+    if FORCE_TEAM_VC and after.channel and S.phase == "playing":
         team_n = next((n for m, n in S.match_players.values() if m.id == member.id), None)
         vc_id = S.team_vcs.get(team_n, 0) if team_n else 0
         if vc_id and after.channel.id != vc_id:
@@ -4517,6 +4524,7 @@ def main():
     say(f"▶ DISCORD_TOKEN: {'задан, длина ' + str(len(token)) if token else 'НЕ ЗАДАН'}")
     say(f"▶ Порт веб-сервера: {WEB_PORT}, WEB_BASE_URL: {WEB_BASE_URL}")
     say(f"▶ TEST_MODE={TEST_MODE}, QUEUE_VC_ID={QUEUE_VC}, GUILD_ID={GUILD_ID}")
+    say(f"▶ Возврат игроков в войс команды во время матча: {'вкл' if FORCE_TEAM_VC else 'выкл (свободное перемещение)'}")
     say(f"▶ Формат: {TEST_MAXROUNDS if TEST_MODE else MAX_ROUNDS} раундов, смена сторон на перерыве; "
         f"кик после матча: {'вкл, через ' + str(KICK_DELAY) + ' сек' if KICK_AFTER_MATCH else 'выкл'}; "
         f"голосов для отмены игры: {CANCEL_VOTES}")
