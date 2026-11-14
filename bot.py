@@ -61,14 +61,14 @@ import sqlite3
 import time
 from datetime import timedelta
 from urllib.parse import urlencode
-ojghj
+
 import aiohttp
 import discord
 from aiohttp import web
 from discord import app_commands
 from discord.ext import commands
 from rcon.source import Client as Rcon
-
+import ddaadaasdwsawadwasdwadsawadw
 try:  # локально читаем .env, на хостинге переменные задаются в панели
     from dotenv import load_dotenv
     load_dotenv()
