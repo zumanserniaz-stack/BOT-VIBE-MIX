@@ -823,7 +823,7 @@ class VetoView(discord.ui.View):
 
 # ----------------------------- МАТЧ ----------------------------------
 # Огонь по своим: пули по тиммейтам не проходят, гранаты и молотов ранят. Штраф за убийство тиммейта.
-GRENADE_FF = os.getenv("GRENADE_FF", "1") == "1"
+GRENADE_FF = os.getenv("GRENADE_FF", "0") == "1"
 TK_PENALTY = int(os.getenv("TK_PENALTY", "300"))
 
 
