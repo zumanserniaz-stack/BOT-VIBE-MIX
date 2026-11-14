@@ -6,6 +6,10 @@ VIBE MIX FreePick 5x5: очередь -> готовность -> капитан�
 При Steam-верификации бот определяет FACEIT-уровень игрока и выдаёт роль «FACEIT LVL n».
 Результат матча: табло (K / D / K/D каждого игрока) на фоне картинки карты + ELO (+30 / -20).
 
+v60: - Как у KZLP: капитаны, пики игроков и вето карт идут в ОДНОМ сообщении (панель очереди), оно обновляется
+       на каждом шаге (таймер, «Забанено / Осталось», красные кнопки карт).
+     - После вето: «Создаю каналы команд и запускаю сервер...», игроки уходят в войсы команд,
+       открывается отдельный чат матча, в котором ТОЛЬКО карточка с connect. Панель возвращается в обычный вид.
 v59: - Кнопка «Отмена игры 0/2» под карточкой матча: нужно CANCEL_VOTES голосов игроков (админ отменяет сразу).
        Отмена и /match stop сразу кикают всех игроков с CS2-сервера, без результата и без ELO.
      - Сброс матча быстрее: сообщения, войсы и перемещение игроков обрабатываются параллельно.
@@ -40,7 +44,7 @@ v47: на табло результата у каждого игрока вид�
 v46: команды /match stop, /match stat, /profile, /mute, /unmute, /clan (create, accept, info, invite,
      kick, leave, list, menu), /clearrole. Статистика матчей, кланы и ELO входят в бэкап.
 """
-print("▶ bot.py v59 загружается...", flush=True)
+print("▶ bot.py v60 загружается...", flush=True)
 import asyncio
 import threading
 from collections import deque
@@ -379,6 +383,7 @@ class State:
         self.auto_started = False                      # автостарт уже запущен для этого матча
         self.moving = False                            # идёт перемещение игроков в войсы команд (драфт не отменять)
         self.cancel_votes: set[int] = set()            # кто нажал «Отмена игры»
+        self.stage = False                             # идёт драфт/запуск: панель обновляет только драфт
         self.lock = asyncio.Lock()
 
 
@@ -538,7 +543,7 @@ def panel_embed() -> discord.Embed:
 
 
 async def refresh_panel():
-    if S.panel:
+    if S.panel and not S.stage:
         try:
             await S.panel.edit(embed=panel_embed(), view=None if QUEUE_VC else QueueView())
         except discord.HTTPException:
@@ -669,18 +674,26 @@ async def ready_check(channel, players: list[discord.Member]) -> bool:
 
 
 # ----------------------------- ПИКИ И ВЕТО ---------------------------
+def ts_left(sec: int) -> str:
+    """Живой таймер Discord: «через N сек»."""
+    return f"<t:{int(time.time()) + sec}:R>"
+
+
 class CaptainView(discord.ui.View):
     """Игроки сами вызываются в капитаны: первые двое нажавших становятся капитанами."""
 
-    def __init__(self, players: list[discord.Member]):
+    def __init__(self, players: list[discord.Member], no: int):
         super().__init__(timeout=CAPTAIN_TIMEOUT)
-        self.players = players
+        self.players, self.no = players, no
         self.caps: list[discord.Member] = []
+        self.end = int(time.time()) + CAPTAIN_TIMEOUT
 
-    def text(self) -> str:
+    def embed(self) -> discord.Embed:
         have = ", ".join(m.mention for m in self.caps) or "пока никого"
-        return (f"👑 **Выбор капитанов.** Нажмите кнопку, чтобы стать капитаном "
-                f"({CAPTAIN_TIMEOUT} сек). Нужно двое.\nКапитаны: {have}")
+        e = discord.Embed(title=f"Очередь — FreePick #{self.no}", color=0x2B2D31)
+        e.description = (f"**Выбор капитанов** — нажмите кнопку, нужно двое.\n"
+                         f"⏳ Закончится <t:{self.end}:R>\n👑 Капитаны: {have}")
+        return e
 
     @discord.ui.button(label="Стать капитаном", emoji="👑", style=discord.ButtonStyle.success)
     async def take(self, i: discord.Interaction, b: discord.ui.Button):
@@ -690,25 +703,20 @@ class CaptainView(discord.ui.View):
         if member in self.caps:
             return await i.response.send_message("Вы уже вызвались капитаном.", ephemeral=True)
         self.caps.append(member)
-        if len(self.caps) >= 2:
-            await i.response.edit_message(content=self.text(), view=None)
+        done = len(self.caps) >= 2
+        await i.response.edit_message(embed=self.embed(), view=None if done else self)
+        if done:
             self.stop()
-        else:
-            await i.response.edit_message(content=self.text(), view=self)
 
 
-async def choose_captains(channel, players: list[discord.Member]) -> list[discord.Member]:
-    view = CaptainView(players)
-    msg = await track_send(channel, view.text(), view=view)
+async def choose_captains(msg: discord.Message, no: int, players: list[discord.Member]) -> list[discord.Member]:
+    view = CaptainView(players, no)
+    await msg.edit(embed=view.embed(), view=view)
     await view.wait()
     caps = view.caps[:2]
     if len(caps) < 2:  # не хватило добровольцев: добираем случайно
         rest = [m for m in players if m not in caps]
         caps += random.sample(rest, 2 - len(caps))
-    try:
-        await msg.edit(content=f"👑 Капитаны: {caps[0].mention} и {caps[1].mention}", view=None)
-    except discord.HTTPException:
-        pass
     return caps
 
 
@@ -723,37 +731,46 @@ def draft_embed(no: int, teams, pool, cap=None, done: bool = False, last: str = 
     """Табло драфта: две команды + свободные игроки."""
     e = discord.Embed(title=f"Очередь — FreePick #{no}", color=0x2B2D31)
     if done:
-        e.description = "# Драфт завершён\nКоманды собраны."
+        e.description = "**Драфт завершён** — команды собраны."
     elif cap:
-        e.description = (f"# Выбор игроков\nХод капитана {cap.mention}: "
-                         f"выберите игрока кнопками ниже ({PICK_TIMEOUT} сек).")
+        e.description = (f"**Выбор игроков** — ходит капитан {cap.mention}\n"
+                         f"⏳ Ход закончится {ts_left(PICK_TIMEOUT)}")
     for t in teams:
-        lines = [f"`{n:02d}` {m.mention}" for n, m in enumerate(t, 1)]
-        e.add_field(name=f"team_{t[0].display_name}"[:256], value="\n".join(lines), inline=True)
+        e.add_field(name=f"team_{t[0].display_name}"[:256],
+                    value="\n".join(f"`{n:02d}` {m.mention}" for n, m in enumerate(t, 1)), inline=True)
     if pool:
-        free = [f"`{n:02d}` {m.mention}" for n, m in enumerate(pool, 1)]
-        e.add_field(name=f"Свободные игроки: {len(pool)}", value="\n".join(free), inline=False)
+        e.add_field(name=f"Свободные игроки: {len(pool)}",
+                    value="\n".join(f"`{n:02d}` {m.mention}" for n, m in enumerate(pool, 1)), inline=False)
     if last:
         e.set_footer(text=last)
     return e
 
 
 def veto_embed(no: int, maps: list, banned: list, cap=None, final: str = "", last: str = "") -> discord.Embed:
-    """Табло вето карт в том же стиле, что и очередь: нумерованный список + последнее действие внизу."""
+    """Табло вето карт: забанено / осталось, ход капитана и таймер."""
     e = discord.Embed(title=f"Очередь — FreePick #{no}", color=0x2B2D31)
     if final:
-        e.description = f"# Карта выбрана\nИграем на **{pretty(final)}**."
+        e.description = f"**Карта выбрана** — играем на **{pretty(final)}**."
     else:
-        e.description = (f"# Вето карт\nХод капитана {cap.mention}: "
-                         f"забаньте карту кнопками ниже ({PICK_TIMEOUT} сек).")
-    e.add_field(name=f"Доступные карты: {len(maps)}",
-                value="\n".join(f"`{n:02d}` {pretty(m)}" for n, m in enumerate(maps, 1)), inline=True)
-    if banned:
-        e.add_field(name=f"Забанены: {len(banned)}",
-                    value="\n".join(f"`{n:02d}` ~~{pretty(m)}~~ · {c.display_name}"
-                                    for n, (m, c) in enumerate(banned, 1))[:1024], inline=True)
+        e.description = (f"**Выбор карт** — надо убрать ещё **{len(maps) - 1}** карт.\n"
+                         f"👤 Ходит капитан {cap.mention}\n⏳ Ход закончится {ts_left(PICK_TIMEOUT)}")
+    e.add_field(name=f"🚫 Забанено: {len(banned)}",
+                value="\n".join(f"✖ ~~{pretty(m)}~~ · {c.display_name}" for m, c in banned)[:1024] or "—",
+                inline=True)
+    e.add_field(name=f"▸ Осталось: {len(maps)} из {len(MAPS)}",
+                value="\n".join(pretty(m) for m in maps), inline=True)
     if last:
         e.set_footer(text=last)
+    return e
+
+
+def launch_embed(no: int, teams, status: str) -> discord.Embed:
+    """Этап «создаю каналы и запускаю сервер»: те же команды + статус."""
+    e = discord.Embed(title=f"Очередь — FreePick #{no}", description=status, color=0x2B2D31)
+    for t in teams:
+        if t:
+            e.add_field(name=f"team_{t[0].display_name}"[:256],
+                        value="\n".join(f"`{n:02d}` {m.mention}" for n, m in enumerate(t, 1)), inline=True)
     return e
 
 
@@ -784,7 +801,7 @@ class VetoView(discord.ui.View):
         super().__init__(timeout=PICK_TIMEOUT)
         self.cap, self.banned = cap, None
         for m in maps:
-            btn = discord.ui.Button(label=pretty(m), style=discord.ButtonStyle.secondary)
+            btn = discord.ui.Button(label=pretty(m), style=discord.ButtonStyle.danger)
             btn.callback = self._make_cb(m)
             self.add_item(btn)
 
@@ -1234,8 +1251,8 @@ async def clear_voice_access():
 
 
 async def open_match_chat(origin, players: list[discord.Member]):
-    """Когда набрано 10 игроков: открывает отдельный чат только для них (драфт и матч идут там).
-    Уведомление о наборе уходит каждому игроку в личные сообщения."""
+    """Когда сервер готов: открывает отдельный чат только для игроков матча (в нём одна карточка с connect).
+    Ссылка на чат уходит каждому игроку в личные сообщения."""
     guild = getattr(origin, "guild", None)
     if not guild:
         return None
@@ -1252,14 +1269,14 @@ async def open_match_chat(origin, players: list[discord.Member]):
             "матч-freepick",
             overwrites=overwrites,
             category=getattr(origin, "category", None),
-            reason="FreePick: набрано полное количество игроков")
+            reason="FreePick: матч готов")
     except discord.HTTPException:
         log.exception("Не удалось создать чат матча (нужно право Manage Channels), используем общий канал")
         return None
     S.match_channel = ch
 
     # ---- уведомление в ЛС каждому игроку ----
-    text = (f"🎯 Набрано {NEED} игроков! Драфт и матч проходят в отдельном чате: "
+    text = (f"🎯 Матч готов! Подключение к серверу в отдельном чате: "
             f"{ch.jump_url}")
     closed = []
     for m in players:
@@ -1272,13 +1289,10 @@ async def open_match_chat(origin, players: list[discord.Member]):
         try:
             await origin.send(
                 " ".join(m.mention for m in closed) +
-                f" ваши ЛС закрыты. Драфт проходит здесь: {ch.mention}",
+                f" ваши ЛС закрыты. Подключение здесь: {ch.mention}",
                 delete_after=30)
         except discord.HTTPException:
             pass
-
-    await track_send(ch, "🎮 " + " ".join(m.mention for m in players) +
-                     "\nЭтот чат только для игроков матча. Он удалится, когда матч закончится.")
     return ch
 
 
@@ -1772,6 +1786,7 @@ async def reset_to_queue(kick_delay: int = KICK_DELAY):
     S.connected = set()
     S.auto_started = False
     S.moving = False
+    S.stage = False  # панель снова обновляется как обычно
     async with S.lock:
         S.phase = "queue"
         S.queue.clear()
@@ -1875,24 +1890,19 @@ async def auto_reset(match_id: int):
         await reset_to_queue()
 
 
-async def draft(channel, players):
+async def draft(msg: discord.Message, players):
+    """Капитаны, пики и вето идут в ОДНОМ сообщении (панель очереди), оно обновляется на каждом шаге."""
     no = next_match_no()
-    caps = await choose_captains(channel, players)  # капитаны вызываются сами
+    caps = await choose_captains(msg, no, players)  # капитаны вызываются сами
     pool = [m for m in players if m not in caps]
     teams = [[caps[0]], [caps[1]]]
 
-    # ---- пики игроков: одно сообщение, которое обновляется после каждого выбора ----
-    turn = 0
-    msg = None
-    last = ""
+    # ---- пики игроков ----
+    turn, last = 0, ""
     while len(pool) > 1:
         cap = caps[turn]
         view = PickView(cap, pool)
-        emb = draft_embed(no, teams, pool, cap, last=last)
-        if msg is None:
-            msg = await track_send(channel, embed=emb, view=view)
-        else:
-            await msg.edit(embed=emb, view=view)
+        await msg.edit(embed=draft_embed(no, teams, pool, cap, last=last), view=view)
         await view.wait()
         picked = view.picked or random.choice(pool)  # не успел: случайный игрок
         pool.remove(picked)
@@ -1902,20 +1912,12 @@ async def draft(channel, players):
     teams[turn].append(pool[0])  # последний игрок достаётся автоматически
     await msg.edit(embed=draft_embed(no, teams, [], done=True, last=last), view=None)
 
-    # ---- вето карт: одно сообщение в стиле очереди, обновляется после каждого бана ----
-    maps = MAPS.copy()
-    banned_list = []
-    turn = 0
-    vmsg = None
-    last = ""
+    # ---- вето карт ----
+    maps, banned_list, turn, last = MAPS.copy(), [], 0, ""
     while len(maps) > 1:
         cap = caps[turn]
         view = VetoView(cap, maps)
-        emb = veto_embed(no, maps, banned_list, cap, last=last)
-        if vmsg is None:
-            vmsg = await track_send(channel, embed=emb, view=view)
-        else:
-            await vmsg.edit(embed=emb, view=view)
+        await msg.edit(embed=veto_embed(no, maps, banned_list, cap, last=last), view=view)
         await view.wait()
         banned = view.banned or random.choice(maps)
         maps.remove(banned)
@@ -1923,37 +1925,35 @@ async def draft(channel, players):
         last = f"{cap.display_name} забанил карту {pretty(banned)}"
         turn ^= 1
     map_name = maps[0]
-    await vmsg.edit(embed=veto_embed(no, maps, banned_list, final=map_name, last=last), view=None)
-    return teams, map_name
+    await msg.edit(embed=veto_embed(no, maps, banned_list, final=map_name, last=last), view=None)
+    return teams, map_name, no
 
 
 async def run_match(channel: discord.abc.Messageable, players: list[discord.Member]):
-    origin = channel  # общий канал очереди: туда пишем ошибки
+    origin = channel  # общий канал очереди
     S.draft_task = asyncio.current_task()  # чтобы драфт можно было отменить, если все вышли из войса
     try:
         S.active_ids = {m.id for m in players}
         if not TEST_MODE and not await ready_check(channel, players):
             return  # не все нажали «Готов»: очередь уже сброшена внутри ready_check
-        chat = await open_match_chat(channel, players)
-        if chat:
-            channel = chat  # драфт, вето и карточка матча идут в отдельном чате
-        else:
-            # чат создать не удалось: сообщаем о наборе в общем канале и в ЛС
-            await track_send(channel, f"🎯 Набрано {NEED} игроков! " +
-                             " ".join(m.mention for m in players))
+
+        # ---- всё табло в ОДНОМ сообщении: панель очереди ----
+        pmsg = S.panel
+        if pmsg is None:
+            pmsg = await origin.send(embed=discord.Embed(title="Очередь — FreePick"))
+            S.panel = pmsg
+        S.stage = True  # пока идёт драфт и запуск, панель обновляет только драфт
         if TEST_MODE:
-            teams = [players[:1], []]
-            map_name = random.choice(MAPS)
-            await track_send(channel, f"🧪 Тестовый режим: {players[0].mention}, карта {pretty(map_name)}")
+            teams, map_name, no = [players[:1], []], random.choice(MAPS), next_match_no()
         else:
-            teams, map_name = await draft(channel, players)
+            teams, map_name, no = await draft(pmsg, players)
 
-        # ---- войсы команд: сразу после деления на две команды (в названиях ники капитанов) ----
+        # ---- этап «создаю каналы команд и запускаю сервер» ----
         S.moving = True
-        if hasattr(channel, "guild") and channel.guild:
-            await move_to_voice(channel.guild, teams)
+        await pmsg.edit(embed=launch_embed(no, teams, "⏳ Создаю каналы команд и запускаю CS2-сервер..."), view=None)
+        if getattr(origin, "guild", None):
+            await move_to_voice(origin.guild, teams)  # войсы команд + перемещение игроков
 
-        # ---- запуск на сервере ----
         match_id = int(time.time())
         S.matches[match_id] = build_match(match_id, teams, map_name)
         S.match_players = {get_steam(m.id): (m, n) for n, t in enumerate(teams, 1) for m in t}
@@ -1969,6 +1969,8 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
         S.cancel_votes = set()
         S.connected = set()
         S.auto_started = False
+
+        await pmsg.edit(embed=launch_embed(no, teams, f"⏳ Поднимаю карту **{pretty(map_name)}**..."), view=None)
         load_resp = await asyncio.to_thread(load_on_server, match_id, map_name)
         log.info("Ответ сервера на loadmatch: %r", (load_resp or "")[:300])
 
@@ -1976,21 +1978,30 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
         loaded, info = await wait_loaded(match_id)
         if not loaded:
             raise RuntimeError(f"сервер не загрузил матч ({info}). Ответ: {(load_resp or '—').strip()[:150]}")
+        cur = ""
         try:  # события и демо: ставим заново после загрузки матча
             cur = await asyncio.to_thread(set_event_cvars)
             log.info("matchzy_remote_log_url после загрузки матча: %r", cur.strip()[:200])
-            if "НЕИЗВЕСТНО" in cur and chat:
-                await chat.send("⚠ CS2-сервер не знает команды MatchZy для событий/демо "
-                                f"(`{cur.split('НЕИЗВЕСТНО:')[1].strip()[:150]}`). "
-                                "Результат и демо автоматически не придут: обновите MatchZy на сервере.",
-                                delete_after=300)
         except Exception:
             log.exception("Не удалось повторно задать адрес событий MatchZy")
 
+        # ---- отдельный чат матча: ТОЛЬКО карточка с connect ----
+        chat = await open_match_chat(origin, players)
+        target = chat or origin
+        if "НЕИЗВЕСТНО" in cur:
+            try:
+                await target.send("⚠ CS2-сервер не знает команды MatchZy для событий/демо "
+                                  f"(`{cur.split('НЕИЗВЕСТНО:')[1].strip()[:150]}`). "
+                                  "Результат и демо автоматически не придут: обновите MatchZy на сервере.",
+                                  delete_after=300)
+            except discord.HTTPException:
+                pass
+
         S.phase = "playing"
         S.moving = False
+        S.stage = False
         S.queue.clear()
-        await refresh_panel()
+        await refresh_panel()  # панель возвращается в обычный вид: «Матч идёт»
         asyncio.create_task(auto_reset(match_id))
         asyncio.create_task(watch_match(match_id))
         asyncio.create_task(warmup_timer(match_id))
@@ -2004,21 +2015,8 @@ async def run_match(channel: discord.abc.Messageable, players: list[discord.Memb
         for n, t in enumerate(teams, 1):
             e.add_field(name=f"Team {n}" + (f" ({t[0].display_name})" if t else ""),
                         value="\n".join(m.mention for m in t) or "—")
-        e.add_field(name="Важно",
-                    value="Заходите с **привязанного Steam-аккаунта**: команда выдаётся автоматически по SteamID. "
-                          "Матч стартует сам, когда все зайдут на сервер. Подробности пришли в личные сообщения.",
-                    inline=False)
-        e.add_field(name="Формат",
-                    value=f"{TEST_MAXROUNDS if TEST_MODE else MAX_ROUNDS} раундов, смена сторон после первой половины. "
-                          "После матча все игроки автоматически кикаются с сервера.",
-                    inline=False)
-        if GRENADE_FF:
-            e.add_field(name="Гранаты и молотов ранят своих",
-                        value=f"Пули по своим не проходят. Убил тиммейта гранатой или молотовом: штраф **-${TK_PENALTY}**.",
-                        inline=False)
         e.add_field(name="Подключение (консоль CS2)", value=f"```{connect}```", inline=False)
-        link_view = MatchView()
-        await track_send(channel, embed=e, view=link_view)
+        await track_send(target, embed=e, view=MatchView())
         asyncio.create_task(notify_players(teams, map_name, match_id))
 
     except Exception as exc:  # любая ошибка: возвращаем систему в очередь
