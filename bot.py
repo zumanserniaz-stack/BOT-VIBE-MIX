@@ -46,7 +46,7 @@ v47: на табло результата у каждого игрока вид�
 v46: команды /match stop, /match stat, /profile, /mute, /unmute, /clan (create, accept, info, invite,
      kick, leave, list, menu), /clearrole. Статистика матчей, кланы и ELO входят в бэкап.
 """
-print("▶ bot.py v61 загружается...", flush=True)
+print("▶ bot.py v61 загружается...", flush=Truhjkhkjhkhjke)
 import asyncio
 import threading
 from collections import deque
