@@ -6,6 +6,8 @@ VIBE MIX FreePick 5x5: очередь -> готовность -> капитан�
 При Steam-верификации бот определяет FACEIT-уровень игрока и выдаёт роль «FACEIT LVL n».
 Результат матча: табло (K / D / K/D каждого игрока) на фоне картинки карты + ELO (+30 / -20).
 
+v62: - Сообщение «Матч найден! Готов» исчезает, как только все 10 игроков нажали «Готов».
+       Дальше по порядку: капитаны -> пики игроков -> вето карт -> войсы команд -> чат матч-freepick с connect.
 v61: - Во время матча игроки могут свободно заходить в любые войсы: бот больше не возвращает их в войс команды.
        Старое поведение включается переменной FORCE_TEAM_VC=1 (Render -> Environment).
 v60: - Как у KZLP: капитаны, пики игроков и вето карт идут в ОДНОМ сообщении (панель очереди), оно обновляется
@@ -46,7 +48,7 @@ v47: на табло результата у каждого игрока вид�
 v46: команды /match stop, /match stat, /profile, /mute, /unmute, /clan (create, accept, info, invite,
      kick, leave, list, menu), /clearrole. Статистика матчей, кланы и ELO входят в бэкап.
 """
-print("▶ bot.py v61 загружается...", flush=True)
+print("▶ bot.py v62 загружается...", flush=True)
 import asyncio
 import threading
 from collections import deque
@@ -638,6 +640,13 @@ async def ready_check(channel, players: list[discord.Member]) -> bool:
                            embed=view.embed(), view=view)
     await view.wait()
     if len(view.ready) == len(players):
+        # все нажали «Готов»: сообщение исчезает, дальше идут капитаны
+        try:
+            await msg.delete()
+        except discord.HTTPException:
+            pass
+        if msg in S.chat_msgs:
+            S.chat_msgs.remove(msg)
         return True
 
     # ---- не все готовы: отмена ----
